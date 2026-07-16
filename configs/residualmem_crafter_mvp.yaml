@@ -1,0 +1,25 @@
+seed: 0
+domain: crafter
+schema_profile: exact
+action_values: 17
+world_model:
+  architecture: gru
+  layers: 2
+  hidden_size: 512
+  learning_rate: 0.0003
+  teacher_forcing_epochs: 50
+  closed_loop_epochs: 10
+codec:
+  format_version: 2
+  segment_length: 64
+  lambda_sweep: [0.0, 0.001, 0.01, 0.1, 1.0]
+evaluation:
+  fixed_seeds: [0, 1, 2]
+  baselines:
+    - store_all_fixed64
+    - independent_typed_state
+    - persistence_exact
+    - gru_exact
+  ablations:
+    - gru_no_action_exact
+    - wm_only

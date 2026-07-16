@@ -3,5 +3,6 @@ dist
 __pycache__/
 *.py[cod]
 *.egg-info
+outputs/
 MUJOCO_LOG.TXT
 ;

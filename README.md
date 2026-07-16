@@ -1,5 +1,47 @@
 # Mastering Diverse Domains through World Models
 
+## ResidualMem v0.2
+
+This fork adds the paper prototype as a separate `residualmem/` package. The
+original DreamerV3 agent, configs, environments, and training entry point remain
+available and unchanged so that later RL integration is still possible.
+
+Create or reproduce the environment:
+
+```sh
+conda env create -f environment.yml
+conda activate ResidualMem
+pip install -e .
+```
+
+The environment has already been created in this workspace. Run the deterministic
+Crafter sanity pipeline (collect, train a small 2-layer GRU, exact/RD encode,
+decode, verify, and plot):
+
+```sh
+conda run -n ResidualMem python -m residualmem sanity \
+  --output outputs/residualmem_sanity
+```
+
+The individual stages are also exposed:
+
+```sh
+python -m residualmem collect-crafter --steps 1000 --seed 0 \
+  --output data/crafter_seed0.npz
+python -m residualmem train-wm --input data/crafter_seed0.npz \
+  --output checkpoints/residualmem_gru.npz
+python -m residualmem encode --input data/crafter_seed0.npz \
+  --checkpoint checkpoints/residualmem_gru.npz --output memory/crafter.rsm
+python -m residualmem decode --input memory/crafter.rsm \
+  --checkpoint checkpoints/residualmem_gru.npz --output data/reconstructed.npz
+```
+
+Use `import-emembench` for official JSONL trajectories with `action_id` and
+`info.{player_pos,inventory,achievements}`. Codec outputs carry schema and
+model hashes, per-segment CRCs and final-state hashes, and a complete byte
+account. Exact mode treats every field as mandatory; `rd_uniform` and
+`rd_task` use the typed rate-distortion selector.
+
 A reimplementation of [DreamerV3][paper], a scalable and general reinforcement
 learning algorithm that masters a wide range of applications with fixed
 hyperparameters.
