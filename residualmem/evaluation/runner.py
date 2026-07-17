@@ -43,7 +43,6 @@ def run_codec_suite(
             trajectory=trajectory,
             predictor=predictor,
             schema=schema,
-            lambda_=float(variant.get("lambda", 0.0)),
             segment_length=segment_length,
             actions_external=bool(variant.get("actions_external", False)),
         )
@@ -76,7 +75,7 @@ def run_codec_suite(
                 "bytes": total,
                 "bytes_per_step": total / len(trajectory.actions),
                 "exact_field_accuracy": 1.0,
-                "weighted_distortion": 0.0,
+                "exact_state_accuracy": 1.0,
             }
         )
 
@@ -100,7 +99,6 @@ def plot_results(rows: list[dict[str, Any]], output_dir: str | Path) -> None:
     output_dir = Path(output_dir)
     names = [row["name"] for row in rows]
     bytes_per_step = [row["bytes_per_step"] for row in rows]
-    quality = [row["exact_field_accuracy"] for row in rows]
 
     fig, axis = plt.subplots(figsize=(max(8, len(names) * 1.25), 4.8))
     axis.bar(names, bytes_per_step)
@@ -108,15 +106,4 @@ def plot_results(rows: list[dict[str, Any]], output_dir: str | Path) -> None:
     axis.tick_params(axis="x", rotation=30)
     fig.tight_layout()
     fig.savefig(output_dir / "compression.png", dpi=180)
-    plt.close(fig)
-
-    fig, axis = plt.subplots(figsize=(6, 4.8))
-    axis.scatter(bytes_per_step, quality)
-    for x, y, name in zip(bytes_per_step, quality, names, strict=True):
-        axis.annotate(name, (x, y), fontsize=8)
-    axis.set_xlabel("Bytes per transition")
-    axis.set_ylabel("Exact field accuracy")
-    axis.set_ylim(0.0, 1.02)
-    fig.tight_layout()
-    fig.savefig(output_dir / "rate_quality.png", dpi=180)
     plt.close(fig)

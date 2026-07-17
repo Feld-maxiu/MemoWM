@@ -8,17 +8,13 @@ from typing import Any, Literal
 
 
 FieldType = Literal["bool", "categorical", "integer", "literal", "vq"]
-FieldPolicy = Literal["must", "weighted"]
 
 
 @dataclasses.dataclass(frozen=True)
 class FieldSpec:
     name: str
     field_type: FieldType
-    policy: FieldPolicy = "must"
-    weight: float = 1.0
     num_values: int | None = None
-    scale: float = 1.0
     optional: bool = False
 
     def __post_init__(self) -> None:
@@ -26,12 +22,6 @@ class FieldSpec:
             raise ValueError("field name must be non-empty")
         if self.field_type not in {"bool", "categorical", "integer", "literal", "vq"}:
             raise ValueError(f"unsupported field type: {self.field_type}")
-        if self.policy not in {"must", "weighted"}:
-            raise ValueError(f"unsupported field policy: {self.policy}")
-        if self.weight < 0:
-            raise ValueError("field weight must be non-negative")
-        if self.scale <= 0:
-            raise ValueError("field scale must be positive")
         if self.field_type in {"categorical", "vq"} and not self.num_values:
             raise ValueError(f"{self.field_type} fields require num_values")
         if self.num_values is not None and self.num_values < 2:
@@ -156,6 +146,10 @@ class Predictor:
     def predict_next(
         self, reconstructed: CanonicalState, action: int, dt: int = 1
     ) -> Prediction:
+        raise NotImplementedError
+
+    def new_session(self) -> "Predictor":
+        """Return an independent predictor with reset recurrent state."""
         raise NotImplementedError
 
     @property

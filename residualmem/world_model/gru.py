@@ -23,7 +23,7 @@ class GRUConfig:
 
 def initialize_params(schema: StateSchema, config: GRUConfig, seed: int = 0):
     if config.layers != 2:
-        raise ValueError("ResidualMem v0.2 implements exactly two GRU layers")
+        raise ValueError("ResidualMem v0.3 implements exactly two GRU layers")
     key = jax.random.PRNGKey(seed)
     keys = iter(jax.random.split(key, 32 + len(schema.fields) * 2))
     hidden = config.hidden_size
@@ -136,6 +136,9 @@ class GRUPredictor(Predictor):
         hidden = self.config.hidden_size
         self.carry = (jnp.zeros((hidden,), jnp.float32), jnp.zeros((hidden,), jnp.float32))
 
+    def new_session(self) -> Predictor:
+        return GRUPredictor(self.params, self.schema, self.config)
+
     def predict_next(
         self, reconstructed: CanonicalState, action: int, dt: int = 1
     ) -> Prediction:
@@ -195,38 +198,17 @@ def save_gru_checkpoint(path: str | Path, params, schema: StateSchema, config: G
     return path
 
 
-def load_gru_checkpoint(
-    path: str | Path,
-    schema: StateSchema,
-    allow_policy_rebind: bool = False,
-) -> GRUPredictor:
+def load_gru_checkpoint(path: str | Path, schema: StateSchema) -> GRUPredictor:
     with np.load(Path(path), allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata"]))
         if metadata["schema_hash"] != schema.hash_hex:
-            stored_schema = metadata.get("schema")
-            compatible = (
-                allow_policy_rebind
-                and stored_schema is not None
-                and _model_schema_signature(stored_schema)
-                == _model_schema_signature(json.loads(schema.canonical_json()))
+            raise ValueError(
+                "checkpoint schema hash mismatch; v0.2/RD checkpoints are not "
+                "compatible with ResidualMem v0.3 exact-only schemas"
             )
-            if not compatible:
-                raise ValueError("checkpoint schema hash mismatch")
         config = GRUConfig(**metadata["config"])
         params = {
             name.replace("__", "/"): data[name]
             for name in data.files if name != "metadata"
         }
     return GRUPredictor(params, schema, config)
-
-
-def _model_schema_signature(schema: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
-    return tuple(
-        (
-            field["name"],
-            field["field_type"],
-            field.get("num_values"),
-            field.get("optional", False),
-        )
-        for field in schema["fields"]
-    )

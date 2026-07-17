@@ -1,6 +1,5 @@
 seed: 0
 domain: crafter
-schema_profile: exact
 action_values: 17
 world_model:
   architecture: gru
@@ -8,13 +7,24 @@ world_model:
   hidden_size: 512
   learning_rate: 0.0003
   teacher_forcing_epochs: 50
-  closed_loop_epochs: 10
-codec:
-  format_version: 2
   segment_length: 64
-  lambda_sweep: [0.0, 0.001, 0.01, 0.1, 1.0]
+codec:
+  format_version: 3
+  segment_length: 64
+  reconstruction: exact
+retrieval:
+  top_k: 8
+  max_expand_steps: 8
+  max_tool_calls: 32
+  structured_fields: [actions, changed_fields, literals, entities, time_range]
+  structured_first: true
+  dense_embeddings_per_segment: 1
+  dense_storage: int8_per_vector_scale
+  embedding_provider: external
+  reader_policy: abstract
 evaluation:
   fixed_seeds: [0, 1, 2]
+  objective: accuracy_cost_curve
   baselines:
     - store_all_fixed64
     - independent_typed_state
@@ -22,4 +32,6 @@ evaluation:
     - gru_exact
   ablations:
     - gru_no_action_exact
-    - wm_only
+    - structured_only
+    - dense_only
+    - eager_full_segment

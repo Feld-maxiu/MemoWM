@@ -1,6 +1,6 @@
 # Mastering Diverse Domains through World Models
 
-## ResidualMem v0.2
+## ResidualMem v0.3
 
 This fork adds the paper prototype as a separate `residualmem/` package. The
 original DreamerV3 agent, configs, environments, and training entry point remain
@@ -15,7 +15,7 @@ pip install -e .
 ```
 
 The environment has already been created in this workspace. Run the deterministic
-Crafter sanity pipeline (collect, train a small 2-layer GRU, exact/RD encode,
+Crafter sanity pipeline (collect, train a small 2-layer GRU, exact encode,
 decode, verify, and plot):
 
 ```sh
@@ -39,8 +39,32 @@ python -m residualmem decode --input memory/crafter.rsm \
 Use `import-emembench` for official JSONL trajectories with `action_id` and
 `info.{player_pos,inventory,achievements}`. Codec outputs carry schema and
 model hashes, per-segment CRCs and final-state hashes, and a complete byte
-account. Exact mode treats every field as mandatory; `rd_uniform` and
-`rd_task` use the typed rate-distortion selector.
+account. Every canonical field is exact by construction; there is no weighted
+or rate-distortion mode in v0.3.
+
+Retrieval is Segment-level. A SQLite event index provides primary recall over
+actions, changed fields, literals, entities, and time ranges. Exactly one dense
+embedding is stored per Segment as semantic fallback. The repository deliberately
+does not install an embedding model or LLM: export deterministic Segment documents,
+embed them externally, then import the resulting matrix.
+
+```sh
+python -m residualmem export-index-docs --input data/crafter_seed0.npz \
+  --output memory/segment_docs.jsonl
+# Produce memory/segment_embeddings.npy with an external embedding provider.
+python -m residualmem build-index --memory memory/crafter.rsm \
+  --trajectory data/crafter_seed0.npz \
+  --embeddings memory/segment_embeddings.npy \
+  --embedding-model-id your-model-version --output memory/crafter.rmi
+python -m residualmem retrieve --memory memory/crafter.rsm \
+  --index memory/crafter.rmi --plan query_plan.json --output candidates.json
+```
+
+`ReaderPolicy` is an abstract policy interface. The engine automatically shows
+the first state of the top Segment using Reader-selected fields. The Reader can
+then `EXPAND` to the next residual (or at most 8 steps), `REVEAL` cached states,
+or `SWITCH` Segment. Answers must cite fields and steps that were actually shown.
+See `ResidualMem_v0.3_exact_progressive.md` for the implementation contract.
 
 A reimplementation of [DreamerV3][paper], a scalable and general reinforcement
 learning algorithm that masters a wide range of applications with fixed

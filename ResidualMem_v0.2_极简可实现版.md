@@ -1,5 +1,7 @@
 # ResidualMem：世界模型条件残差记忆
 
+> 历史设计文档：当前实现已升级到 v0.3 exact progressive memory；v0.2 stream/checkpoint 不兼容。当前契约见 `ResidualMem_v0.3_exact_progressive.md`。
+
 > 技术报告（极简可实现版）  
 > 版本：v0.2  
 > 日期：2026-07-13

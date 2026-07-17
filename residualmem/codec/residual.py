@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
-from ..types import CanonicalState, FieldSpec, Predictor, StateSchema
+from ..types import CanonicalState, Predictor, StateSchema
 from .bits import BitReader, BitWriter
 from .state import field_width
 from .varint import (
@@ -35,12 +34,65 @@ class LiteralDictionary:
             self.values.append(value)
 
 
-def field_distortion(spec: FieldSpec, actual, default) -> float:
-    if actual == default:
-        return 0.0
-    if spec.field_type == "integer":
-        return abs(int(actual) - int(default)) / spec.scale
-    return 1.0
+@dataclass(frozen=True)
+class ResidualRecord:
+    step: int
+    selected: tuple[int, ...]
+    payload: bytes
+    bit_length: int
+
+
+class ResidualCursor:
+    """Lazy, forward-only parser over residual records."""
+
+    def __init__(self, payload: bytes, schema: StateSchema, num_steps: int):
+        self.payload = payload
+        self.schema = schema
+        self.num_steps = num_steps
+        self.remaining, self.offset = decode_uvarint(payload)
+        self.absolute_step = 0
+        self._pending: ResidualRecord | None = None
+
+    def peek(self) -> ResidualRecord | None:
+        if self._pending is None and self.remaining:
+            self._pending = self._read()
+        if self._pending is None and self.offset != len(self.payload):
+            raise ValueError("trailing residual bytes")
+        return self._pending
+
+    def pop(self) -> ResidualRecord | None:
+        record = self.peek()
+        self._pending = None
+        return record
+
+    def _read(self) -> ResidualRecord:
+        delta, self.offset = decode_uvarint(self.payload, self.offset)
+        if delta <= 0:
+            raise ValueError("residual step deltas must be positive")
+        self.absolute_step += delta
+        mask_bytes = (len(self.schema.fields) + 7) // 8
+        mask = self.payload[self.offset: self.offset + mask_bytes]
+        if len(mask) != mask_bytes:
+            raise EOFError("truncated residual mask")
+        self.offset += mask_bytes
+        bit_length, self.offset = decode_uvarint(self.payload, self.offset)
+        byte_length = (bit_length + 7) // 8
+        data = self.payload[self.offset: self.offset + byte_length]
+        if len(data) != byte_length:
+            raise EOFError("truncated residual payload")
+        self.offset += byte_length
+        if not 0 < self.absolute_step < self.num_steps:
+            raise ValueError("invalid residual step")
+        selected = tuple(
+            index for index in range(len(self.schema.fields))
+            if mask[index // 8] & (1 << (index % 8))
+        )
+        if not selected:
+            raise ValueError("residual records must select at least one field")
+        self.remaining -= 1
+        return ResidualRecord(
+            self.absolute_step, selected, data, bit_length
+        )
 
 
 def encode_residuals(
@@ -48,7 +100,6 @@ def encode_residuals(
     actions: tuple[int, ...],
     predictor: Predictor,
     schema: StateSchema,
-    lambda_: float,
 ) -> tuple[bytes, tuple[CanonicalState, ...]]:
     if len(actions) != len(targets) - 1:
         raise ValueError("action/state length mismatch")
@@ -63,47 +114,28 @@ def encode_residuals(
         default = predictor.predict_next(reconstructed, actions[step - 1]).default_state
         schema.validate(default)
         target = targets[step]
-        mandatory: list[int] = []
-        profitable: list[tuple[int, float]] = []
+        selected: list[int] = []
         for index, (spec, actual, predicted) in enumerate(
             zip(schema.fields, target.values, default.values)
         ):
             if actual == predicted:
                 continue
-            payload_bits = _payload_bit_length(spec, actual, predicted, dictionary)
-            if spec.policy == "must":
-                mandatory.append(index)
-            else:
-                gain = spec.weight * field_distortion(spec, actual, predicted)
-                gain -= lambda_ * payload_bits
-                if gain > 0:
-                    profitable.append((index, gain))
-        selected = sorted(set(mandatory) | {index for index, _ in profitable})
+            selected.append(index)
         if selected:
             payload, payload_bits, pending_literals = _encode_selected(
                 selected, target, default, schema, dictionary)
-            shared = (
-                len(encode_uvarint(step - last_record_step)) * 8
-                + mask_bytes * 8
-                + len(encode_uvarint(payload_bits)) * 8
-                + (len(payload) * 8 - payload_bits)
-            )
-            optional_gain = sum(gain for _, gain in profitable)
-            if mandatory or optional_gain > lambda_ * shared:
-                mask = bytearray(mask_bytes)
-                for index in selected:
-                    mask[index // 8] |= 1 << (index % 8)
-                record = bytearray(encode_uvarint(step - last_record_step))
-                record += mask
-                record += encode_uvarint(payload_bits)
-                record += payload
-                records.append(bytes(record))
-                reconstructed = _apply_values(default, selected, target, schema)
-                for value in pending_literals:
-                    dictionary.add(value)
-                last_record_step = step
-            else:
-                reconstructed = default
+            mask = bytearray(mask_bytes)
+            for index in selected:
+                mask[index // 8] |= 1 << (index % 8)
+            record = bytearray(encode_uvarint(step - last_record_step))
+            record += mask
+            record += encode_uvarint(payload_bits)
+            record += payload
+            records.append(bytes(record))
+            reconstructed = _apply_values(default, selected, target, schema)
+            for value in pending_literals:
+                dictionary.add(value)
+            last_record_step = step
         else:
             reconstructed = default
         outputs.append(reconstructed)
@@ -121,32 +153,7 @@ def decode_residuals(
     predictor: Predictor,
     schema: StateSchema,
 ) -> tuple[CanonicalState, ...]:
-    record_count, offset = decode_uvarint(payload)
-    mask_bytes = (len(schema.fields) + 7) // 8
-    records: dict[int, tuple[list[int], bytes, int]] = {}
-    absolute_step = 0
-    for _ in range(record_count):
-        delta, offset = decode_uvarint(payload, offset)
-        absolute_step += delta
-        mask = payload[offset: offset + mask_bytes]
-        if len(mask) != mask_bytes:
-            raise EOFError("truncated residual mask")
-        offset += mask_bytes
-        bit_length, offset = decode_uvarint(payload, offset)
-        byte_length = (bit_length + 7) // 8
-        data = payload[offset: offset + byte_length]
-        if len(data) != byte_length:
-            raise EOFError("truncated residual payload")
-        offset += byte_length
-        selected = [
-            index for index in range(len(schema.fields))
-            if mask[index // 8] & (1 << (index % 8))
-        ]
-        if not 0 < absolute_step < num_steps or absolute_step in records:
-            raise ValueError("invalid or duplicate residual step")
-        records[absolute_step] = (selected, data, bit_length)
-    if offset != len(payload):
-        raise ValueError("trailing residual bytes")
+    cursor = ResidualCursor(payload, schema, num_steps)
     if len(actions) != num_steps - 1:
         raise ValueError("action/state length mismatch")
     predictor.reset()
@@ -155,30 +162,33 @@ def decode_residuals(
     dictionary = LiteralDictionary.from_anchor(anchor, schema)
     for step in range(1, num_steps):
         default = predictor.predict_next(reconstructed, actions[step - 1]).default_state
-        if step in records:
-            selected, data, bit_length = records[step]
-            reconstructed = _decode_selected(
-                selected, data, bit_length, default, schema, dictionary)
+        record = cursor.peek()
+        if record is not None and record.step == step:
+            cursor.pop()
+            reconstructed = decode_residual_record(
+                record, default, schema, dictionary)
         else:
             reconstructed = default
         outputs.append(reconstructed)
+    if cursor.peek() is not None:
+        raise ValueError("residual record exceeds decoded trajectory")
     return tuple(outputs)
 
 
-def _payload_bit_length(spec: FieldSpec, actual, default, dictionary) -> int:
-    if spec.field_type == "bool":
-        return 0
-    if spec.field_type in {"categorical", "vq"}:
-        return field_width(int(spec.num_values) - 1)
-    if spec.field_type == "integer":
-        return len(encode_uvarint(zigzag_encode(int(actual) - int(default)))) * 8
-    if spec.field_type == "literal":
-        index = dictionary.index(actual)
-        if index is not None:
-            return 1 + len(encode_uvarint(index)) * 8
-        raw = actual.encode("utf-8")
-        return 1 + len(encode_uvarint(len(raw))) * 8 + len(raw) * 8
-    raise ValueError(spec.field_type)
+def decode_residual_record(
+    record: ResidualRecord,
+    default: CanonicalState,
+    schema: StateSchema,
+    dictionary: LiteralDictionary,
+) -> CanonicalState:
+    return _decode_selected(
+        record.selected,
+        record.payload,
+        record.bit_length,
+        default,
+        schema,
+        dictionary,
+    )
 
 
 def _encode_selected(selected, target, default, schema, dictionary):

@@ -7,6 +7,8 @@ import pytest
 from residualmem.codec.segment import (
     GLOBAL,
     DecodeError,
+    LEGACY_MAGIC,
+    LegacyFormatError,
     decode_memory,
     encode_memory,
 )
@@ -14,14 +16,14 @@ from residualmem.types import FieldSpec, StateSchema, Trajectory
 from residualmem.world_model.base import PersistencePredictor
 
 
-def _schema(policy: str = "must") -> StateSchema:
+def _schema() -> StateSchema:
     return StateSchema(
-        f"mixed-{policy}",
+        "mixed-v3-exact",
         (
-            FieldSpec("flag", "bool", policy),
-            FieldSpec("kind", "categorical", policy, num_values=5),
-            FieldSpec("count", "integer", policy),
-            FieldSpec("text", "literal", policy),
+            FieldSpec("flag", "bool"),
+            FieldSpec("kind", "categorical", num_values=5),
+            FieldSpec("count", "integer"),
+            FieldSpec("text", "literal"),
         ),
     )
 
@@ -61,18 +63,19 @@ def test_exact_round_trip_across_segment_boundaries(tmp_path: Path):
     assert written.total_bytes == path.stat().st_size
 
 
-def test_rd_stream_remains_decoder_synchronous(tmp_path: Path):
-    schema = _schema("weighted")
+def test_v02_stream_is_explicitly_rejected(tmp_path: Path):
+    schema = _schema()
     source = _trajectory(schema)
     predictor = PersistencePredictor()
-    path = tmp_path / "rd.rsm"
+    path = tmp_path / "legacy.rsm"
 
-    encode_memory(path, source, predictor, schema, lambda_=1e9, segment_length=3)
-    decoded, _ = decode_memory(path, predictor, schema)
+    encode_memory(path, source, predictor, schema, segment_length=3)
+    legacy = bytearray(path.read_bytes())
+    legacy[:8] = LEGACY_MAGIC
+    path.write_bytes(legacy)
 
-    assert len(decoded.states) == len(source.states)
-    assert decoded.actions == source.actions
-    assert decoded.states[0] == source.states[0]
+    with pytest.raises(LegacyFormatError, match="v0.2 streams are incompatible"):
+        decode_memory(path, predictor, schema)
 
 
 def test_corruption_and_versioned_hashes_are_rejected(tmp_path: Path):

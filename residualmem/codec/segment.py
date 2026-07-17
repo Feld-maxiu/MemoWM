@@ -12,8 +12,9 @@ from .residual import decode_residuals, encode_residuals
 from .state import decode_full_state, encode_full_state, field_width
 
 
-MAGIC = b"RSMEMV02"
-FORMAT_VERSION = 2
+MAGIC = b"RSMEMV03"
+LEGACY_MAGIC = b"RSMEMV02"
+FORMAT_VERSION = 3
 GLOBAL = struct.Struct("<8sH32s32s32sHIIQ")
 SEGMENT = struct.Struct("<IQHIIIB32sI")
 INDEX = struct.Struct("<IQIQH")
@@ -21,6 +22,10 @@ FLAG_ACTIONS_EXTERNAL = 1
 
 
 class DecodeError(RuntimeError):
+    pass
+
+
+class LegacyFormatError(DecodeError):
     pass
 
 
@@ -71,7 +76,6 @@ def encode_memory(
     trajectory: Trajectory,
     predictor: Predictor,
     schema: StateSchema,
-    lambda_: float = 0.0,
     segment_length: int = 64,
     adapter_hash: bytes | None = None,
     actions_external: bool = False,
@@ -101,7 +105,7 @@ def encode_memory(
         anchor = encode_full_state(targets[0], schema)
         action_payload = b"" if actions_external else encode_actions(actions, action_values)
         residual, reconstructed = encode_residuals(
-            targets, actions, predictor, schema, lambda_)
+            targets, actions, predictor, schema)
         final_hash = hashlib.sha256(
             encode_full_state(reconstructed[-1], schema)).digest()
         flags = FLAG_ACTIONS_EXTERNAL if actions_external else 0
@@ -155,6 +159,11 @@ def decode_memory(
         magic, version, schema_hash, model_hash, stored_adapter_hash,
         segment_length, _, segment_count, index_offset,
     ) = GLOBAL.unpack_from(data)
+    if magic == LEGACY_MAGIC or version == 2:
+        raise LegacyFormatError(
+            "ResidualMem v0.2 streams are incompatible with the v0.3 "
+            "exact-only schema; re-encode from the canonical trajectory"
+        )
     if magic != MAGIC or version != FORMAT_VERSION:
         raise DecodeError("unsupported ResidualMem format")
     if schema_hash != schema.hash_bytes:
@@ -215,9 +224,7 @@ def decode_memory(
         if hashlib.sha256(encode_full_state(states[-1], schema)).digest() != final_hash:
             raise DecodeError("final state hash mismatch")
         if all_states:
-            # In RD mode the previous segment may end with a lossy prediction,
-            # while this independently decodable segment stores the same time
-            # step as an exact anchor. The anchor is authoritative globally.
+            # Adjacent segments share one exact boundary anchor.
             all_states[-1] = states[0]
             all_states.extend(states[1:])
         else:

@@ -11,6 +11,9 @@ class PersistencePredictor(Predictor):
     def reset(self) -> None:
         pass
 
+    def new_session(self) -> Predictor:
+        return type(self)()
+
     def predict_next(
         self, reconstructed: CanonicalState, action: int, dt: int = 1
     ) -> Prediction:
@@ -37,6 +40,9 @@ class IgnoreActionPredictor(Predictor):
 
     def reset(self) -> None:
         self.predictor.reset()
+
+    def new_session(self) -> Predictor:
+        return type(self)(self.predictor.new_session(), self.noop_action)
 
     def predict_next(
         self, reconstructed: CanonicalState, action: int, dt: int = 1

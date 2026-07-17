@@ -22,7 +22,7 @@ def _info():
 
 
 def test_crafter_oracle_has_stable_40_field_schema():
-    schema = crafter_schema("exact")
+    schema = crafter_schema()
     adapter = CrafterOracleAdapter(schema)
     state = adapter.encode(_info())
 
@@ -37,7 +37,7 @@ def test_emembench_jsonl_import(tmp_path):
     path = tmp_path / "episode.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-    trajectory = load_emembench(path, crafter_schema("exact"))
+    trajectory = load_emembench(path, crafter_schema())
 
     assert trajectory.actions == (4,)
     assert len(trajectory.states) == 2

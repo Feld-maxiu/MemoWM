@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from .types import FieldSpec, StateSchema
 
 
@@ -21,32 +19,17 @@ CRAFTER_ACHIEVEMENTS = (
 )
 
 
-def crafter_schema(
-    profile: str = "exact",
-    task_weights: Mapping[str, float] | None = None,
-) -> StateSchema:
-    if profile not in {"exact", "rd_uniform", "rd_task"}:
-        raise ValueError(f"unknown Crafter schema profile: {profile}")
-    task_weights = dict(task_weights or {})
-    policy = "must" if profile == "exact" else "weighted"
-
-    def weight(name: str) -> float:
-        return 1.0 if profile != "rd_task" else float(task_weights.get(name, 0.05))
-
+def crafter_schema() -> StateSchema:
     fields = [
-        FieldSpec("pos_x", "integer", policy, weight("pos_x"), num_values=64),
-        FieldSpec("pos_y", "integer", policy, weight("pos_y"), num_values=64),
+        FieldSpec("pos_x", "integer", num_values=64),
+        FieldSpec("pos_y", "integer", num_values=64),
     ]
     fields += [
-        FieldSpec(
-            f"inventory/{name}", "integer", policy,
-            weight(f"inventory/{name}"), num_values=10)
+        FieldSpec(f"inventory/{name}", "integer", num_values=10)
         for name in CRAFTER_INVENTORY
     ]
     fields += [
-        FieldSpec(
-            f"achievement/{name}", "bool", policy,
-            weight(f"achievement/{name}"))
+        FieldSpec(f"achievement/{name}", "bool")
         for name in CRAFTER_ACHIEVEMENTS
     ]
-    return StateSchema(f"crafter-v1-{profile}", tuple(fields))
+    return StateSchema("crafter-v3-exact", tuple(fields))

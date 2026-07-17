@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from residualmem.schemas import crafter_schema
+from residualmem.types import StateSchema
 from residualmem.world_model.gru import (
     GRUConfig,
     GRUPredictor,
@@ -13,9 +14,8 @@ from residualmem.world_model.gru import (
 )
 
 
-def test_gru_is_deterministic_and_checkpoint_can_rebind_policy(tmp_path):
-    exact = crafter_schema("exact")
-    rd = crafter_schema("rd_uniform")
+def test_gru_is_deterministic_and_checkpoint_is_schema_strict(tmp_path):
+    exact = crafter_schema()
     config = GRUConfig(hidden_size=8)
     params_a = initialize_params(exact, config, seed=7)
     params_b = initialize_params(exact, config, seed=7)
@@ -26,15 +26,16 @@ def test_gru_is_deterministic_and_checkpoint_can_rebind_policy(tmp_path):
 
     checkpoint = tmp_path / "gru.npz"
     save_gru_checkpoint(checkpoint, params_a, exact, config)
-    rebound = load_gru_checkpoint(checkpoint, rd, allow_policy_rebind=True)
-    assert isinstance(rebound, GRUPredictor)
-    assert rebound.schema == rd
+    loaded = load_gru_checkpoint(checkpoint, exact)
+    assert isinstance(loaded, GRUPredictor)
+    assert loaded.schema == exact
+    other = StateSchema("other-exact", exact.fields)
     with pytest.raises(ValueError, match="schema hash mismatch"):
-        load_gru_checkpoint(checkpoint, rd)
+        load_gru_checkpoint(checkpoint, other)
 
 
 def test_gru_prediction_uses_decoder_visible_inputs_only():
-    schema = crafter_schema("exact")
+    schema = crafter_schema()
     config = GRUConfig(hidden_size=8)
     params = initialize_params(schema, config, seed=11)
     state = schema.make_state([0] * len(schema.fields))
