@@ -37,6 +37,19 @@ from residualmem.world_model import (
 )
 from residualmem.world_model.train import evaluate_gru, train_gru
 
+from residualmem.encoders.structured import StructuredStateEncoder
+from residualmem.latent.types import DomainId, LatentSpec
+from residualmem.world_model.rssm import load_rssm_checkpoint
+from residualmem.world_model.rssm_train import build_config, latentize_trajectory, train_rssm
+from residualmem.codec import (
+    ExactMaskPolicy,
+    LatentMemoryFile,
+    RateDistortionMaskPolicy,
+    decode_latent_memory,
+    encode_latent_memory,
+)
+from residualmem.evaluation.runner import plot_rate_distortion, run_latent_rate_distortion
+
 
 def _json(path: str | Path, value) -> None:
     path = Path(path)
@@ -284,10 +297,114 @@ def _reader_action(value: dict):
     return constructors[kind](**values)
 
 
+def _latent_setup(checkpoint: str):
+    """Load an RSSM checkpoint and rebuild (params, config, domain, latent_schema, encoder)."""
+    params, config, metadata = load_rssm_checkpoint(checkpoint)
+    domain = DomainId(metadata["domain"])
+    latent_schema = LatentSpec(config.num_groups, config.num_categories, token_dim=1).make_schema()
+    encoder = StructuredStateEncoder(
+        crafter_schema(), LatentSpec(config.num_groups, config.num_categories, 1), domain)
+    return params, config, domain, latent_schema, encoder
+
+
+def _mask_policy(args):
+    if getattr(args, "mask", "exact") == "exact":
+        return ExactMaskPolicy()
+    return RateDistortionMaskPolicy(lam=args.lam)
+
+
+def _synthetic_trajectory(schema, seed: int, steps: int):
+    rng = np.random.default_rng(seed)
+    inv = [0] * 16
+    ach = [0] * 22
+    x, y = 10, 10
+    states, actions = [], []
+    for _ in range(steps):
+        states.append(schema.make_state([x, y] + inv + [bool(a) for a in ach]))
+        actions.append(int(rng.integers(0, 17)))
+        x = min(63, max(0, x + int(rng.integers(-1, 2))))
+        y = min(63, max(0, y + int(rng.integers(-1, 2))))
+        if rng.random() < 0.12:
+            inv[int(rng.integers(0, 16))] = min(9, inv[int(rng.integers(0, 16))] + 1)
+        if rng.random() < 0.05:
+            ach[int(rng.integers(0, 22))] = 1
+    states.append(schema.make_state([x, y] + inv + [bool(a) for a in ach]))
+    from residualmem.types import Trajectory
+    return Trajectory(tuple(states), tuple(actions))
+
+
+def cmd_train_rssm(args) -> None:
+    schema = crafter_schema()
+    domain = DomainId(args.domain)
+    encoder = StructuredStateEncoder(schema, LatentSpec(args.groups, args.categories, 1), domain)
+    trajectories = [load_trajectory(path, schema) for path in args.input]
+    config = build_config(
+        encoder, num_groups=args.groups, num_categories=args.categories,
+        hidden_size=args.hidden_size)
+    metrics = train_rssm(
+        trajectories, encoder, domain, config, args.output, seed=args.seed,
+        teacher_epochs=args.teacher_epochs, closed_loop_epochs=args.closed_loop_epochs,
+        segment_length=args.segment_length)
+    print(json.dumps(metrics, indent=2, sort_keys=True))
+
+
+def cmd_encode_latent(args) -> None:
+    params, config, domain, latent_schema, encoder = _latent_setup(args.checkpoint)
+    trajectory = load_trajectory(args.input, crafter_schema())
+    accounting, _ = encode_latent_memory(
+        args.output, trajectory, params, config, encoder, domain, latent_schema,
+        mask_policy=_mask_policy(args), segment_length=args.segment_length)
+    print(json.dumps(accounting.as_dict(), indent=2, sort_keys=True))
+
+
+def cmd_decode_latent(args) -> None:
+    params, config, domain, latent_schema, _ = _latent_setup(args.checkpoint)
+    trajectory, accounting = decode_latent_memory(args.input, params, config, domain, latent_schema)
+    save_trajectory(args.output, trajectory, latent_schema)
+    print(json.dumps(accounting.as_dict(), indent=2, sort_keys=True))
+
+
+def cmd_eval_rate_distortion(args) -> None:
+    params, config, domain, latent_schema, encoder = _latent_setup(args.checkpoint)
+    trajectory = load_trajectory(args.input, crafter_schema())
+    rows = run_latent_rate_distortion(
+        trajectory, params, config, encoder, domain, latent_schema, args.output,
+        lambdas=tuple(args.lambdas), segment_length=args.segment_length)
+    plot_rate_distortion(rows, args.output)
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def cmd_latent_sanity(args) -> None:
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    schema = crafter_schema()
+    domain = DomainId("crafter")
+    trajectory = _synthetic_trajectory(schema, args.seed, args.steps)
+    save_trajectory(output / "synthetic.npz", trajectory, schema)
+    encoder = StructuredStateEncoder(schema, LatentSpec(args.groups, args.categories, 1), domain)
+    config = build_config(encoder, num_groups=args.groups, num_categories=args.categories,
+                          hidden_size=args.hidden_size, embed_size=args.hidden_size,
+                          post_hidden=args.hidden_size, dec_hidden=args.hidden_size)
+    ckpt = output / "rssm.npz"
+    train_metrics = train_rssm(
+        [trajectory], encoder, domain, config, ckpt, seed=args.seed,
+        teacher_epochs=args.epochs, closed_loop_epochs=max(1, args.epochs // 4),
+        segment_length=args.segment_length)
+    params, config2, _ = load_rssm_checkpoint(ckpt)
+    latent_schema = LatentSpec(args.groups, args.categories, 1).make_schema()
+    rows = run_latent_rate_distortion(
+        trajectory, params, config2, encoder, domain, latent_schema, output,
+        lambdas=(1.0, 2.0, 4.0, 8.0), segment_length=args.segment_length)
+    plot_rate_distortion(rows, output)
+    summary = {"train": train_metrics, "rate_distortion": rows}
+    _json(output / "summary.json", summary)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="residualmem",
-        description="ResidualMem v0.3 exact progressive-memory implementation",
+        description="ResidualMem: v0.3 exact + v0.4 latent (technical-report) memory",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -379,6 +496,54 @@ def build_parser() -> argparse.ArgumentParser:
     sanity.add_argument("--epochs", type=int, default=3)
     sanity.add_argument("--segment-length", type=int, default=32)
     sanity.set_defaults(func=cmd_sanity)
+
+    # --- v0.4 latent (technical-report) commands ---
+    train_rssm_p = sub.add_parser("train-rssm")
+    train_rssm_p.add_argument("--input", nargs="+", required=True)
+    train_rssm_p.add_argument("--output", required=True)
+    train_rssm_p.add_argument("--domain", default="crafter")
+    train_rssm_p.add_argument("--groups", type=int, default=16)
+    train_rssm_p.add_argument("--categories", type=int, default=16)
+    train_rssm_p.add_argument("--hidden-size", type=int, default=256)
+    train_rssm_p.add_argument("--teacher-epochs", type=int, default=40)
+    train_rssm_p.add_argument("--closed-loop-epochs", type=int, default=10)
+    train_rssm_p.add_argument("--segment-length", type=int, default=64)
+    train_rssm_p.add_argument("--seed", type=int, default=0)
+    train_rssm_p.set_defaults(func=cmd_train_rssm)
+
+    enc_l = sub.add_parser("encode-latent")
+    enc_l.add_argument("--input", required=True)
+    enc_l.add_argument("--output", required=True)
+    enc_l.add_argument("--checkpoint", required=True)
+    enc_l.add_argument("--mask", default="exact", choices=["exact", "rd"])
+    enc_l.add_argument("--lam", type=float, default=4.0)
+    enc_l.add_argument("--segment-length", type=int, default=64)
+    enc_l.set_defaults(func=cmd_encode_latent)
+
+    dec_l = sub.add_parser("decode-latent")
+    dec_l.add_argument("--input", required=True)
+    dec_l.add_argument("--output", required=True)
+    dec_l.add_argument("--checkpoint", required=True)
+    dec_l.set_defaults(func=cmd_decode_latent)
+
+    eval_rd = sub.add_parser("eval-rate-distortion")
+    eval_rd.add_argument("--input", required=True)
+    eval_rd.add_argument("--checkpoint", required=True)
+    eval_rd.add_argument("--output", required=True)
+    eval_rd.add_argument("--lambdas", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0, 8.0])
+    eval_rd.add_argument("--segment-length", type=int, default=64)
+    eval_rd.set_defaults(func=cmd_eval_rate_distortion)
+
+    latent_sanity = sub.add_parser("latent-sanity")
+    latent_sanity.add_argument("--output", default="outputs/residualmem_latent_sanity")
+    latent_sanity.add_argument("--steps", type=int, default=128)
+    latent_sanity.add_argument("--seed", type=int, default=0)
+    latent_sanity.add_argument("--groups", type=int, default=8)
+    latent_sanity.add_argument("--categories", type=int, default=16)
+    latent_sanity.add_argument("--hidden-size", type=int, default=64)
+    latent_sanity.add_argument("--epochs", type=int, default=8)
+    latent_sanity.add_argument("--segment-length", type=int, default=32)
+    latent_sanity.set_defaults(func=cmd_latent_sanity)
     return parser
 
 

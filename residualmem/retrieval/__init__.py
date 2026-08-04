@@ -7,6 +7,7 @@ from .events import (
 from .index import (
     EmbeddingProvider,
     MemoryIndex,
+    build_latent_memory_index,
     build_memory_index,
     embed_segment_documents,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "EmbeddingProvider",
     "MemoryIndex",
     "SegmentEvents",
+    "build_latent_memory_index",
     "build_memory_index",
     "embed_segment_documents",
     "export_index_documents",

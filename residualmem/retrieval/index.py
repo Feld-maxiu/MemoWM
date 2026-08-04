@@ -8,6 +8,8 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from ..codec.segment import FORMAT_VERSION, GLOBAL, INDEX, MAGIC
+from ..latent.format import FORMAT_VERSION as LATENT_VERSION
+from ..latent.format import MAGIC as LATENT_MAGIC
 from ..query.types import Candidate, QueryPlan
 from ..types import StateSchema
 from .events import SegmentEvents
@@ -39,6 +41,10 @@ def build_memory_index(
     schema: StateSchema,
     embeddings: np.ndarray,
     embedding_model_id: str,
+    *,
+    memory_magic: bytes = MAGIC,
+    memory_version: int = FORMAT_VERSION,
+    memory_schema_hash: bytes | None = None,
 ) -> Path:
     if not embedding_model_id:
         raise ValueError("embedding_model_id must be non-empty")
@@ -49,7 +55,9 @@ def build_memory_index(
         raise ValueError("embeddings must have shape [segment_count, dimension]")
     if not np.isfinite(values).all():
         raise ValueError("embeddings must be finite")
-    _validate_memory_layout(memory_path, events, schema)
+    _validate_memory_layout(
+        memory_path, events, magic=memory_magic, version=memory_version,
+        file_schema_hash=schema.hash_bytes if memory_schema_hash is None else memory_schema_hash)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -323,10 +331,30 @@ def _sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def build_latent_memory_index(
+    path: str | Path,
+    memory_path: str | Path,
+    events: tuple[SegmentEvents, ...],
+    canonical_schema: StateSchema,
+    latent_schema: StateSchema,
+    embeddings: np.ndarray,
+    embedding_model_id: str,
+) -> Path:
+    """Index an RSMEMV04 latent stream. The index is keyed by the *canonical*
+    schema (rendered field names); the file stores the *latent* schema hash."""
+    return build_memory_index(
+        path, memory_path, events, canonical_schema, embeddings, embedding_model_id,
+        memory_magic=LATENT_MAGIC, memory_version=LATENT_VERSION,
+        memory_schema_hash=latent_schema.hash_bytes)
+
+
 def _validate_memory_layout(
     memory_path: str | Path,
     events: tuple[SegmentEvents, ...],
-    schema: StateSchema,
+    *,
+    magic: bytes,
+    version: int,
+    file_schema_hash: bytes,
 ) -> None:
     path = Path(memory_path)
     with path.open("rb") as handle:
@@ -334,8 +362,8 @@ def _validate_memory_layout(
         if len(header) != GLOBAL.size:
             raise ValueError("memory stream has a truncated global header")
         (
-            magic,
-            version,
+            file_magic,
+            file_version,
             schema_hash,
             _,
             _,
@@ -344,9 +372,9 @@ def _validate_memory_layout(
             segment_count,
             index_offset,
         ) = GLOBAL.unpack(header)
-        if magic != MAGIC or version != FORMAT_VERSION:
-            raise ValueError("index building requires a v0.3 memory stream")
-        if schema_hash != schema.hash_bytes:
+        if file_magic != magic or file_version != version:
+            raise ValueError("index building requires a matching memory stream format")
+        if schema_hash != file_schema_hash:
             raise ValueError("memory/schema mismatch while building index")
         if index_offset + segment_count * INDEX.size != path.stat().st_size:
             raise ValueError("memory stream has an invalid index")

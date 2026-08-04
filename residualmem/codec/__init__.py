@@ -13,6 +13,9 @@ from .session import (
     SegmentDecodeSession,
     SegmentIndexRow,
 )
+from .segment_v4 import decode_latent_memory, encode_latent_memory, rssm_stream_hash
+from .send_mask import ExactMaskPolicy, MaskPolicy, RateDistortionMaskPolicy
+from .latent_session import LatentDecodeSession, LatentMemoryFile, LatentSegmentData
 
 __all__ = [
     "BitAccounting", "DecodeError", "LegacyFormatError",
@@ -20,4 +23,7 @@ __all__ = [
     "decode_full_state", "encode_full_state",
     "EvidenceChunk", "EvidenceFrame", "MemoryFile",
     "SegmentDecodeSession", "SegmentIndexRow",
+    "decode_latent_memory", "encode_latent_memory", "rssm_stream_hash",
+    "ExactMaskPolicy", "MaskPolicy", "RateDistortionMaskPolicy",
+    "LatentDecodeSession", "LatentMemoryFile", "LatentSegmentData",
 ]

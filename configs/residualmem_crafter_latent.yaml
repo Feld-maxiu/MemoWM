@@ -1,0 +1,49 @@
+# ResidualMem v0.4 latent (technical-report line) — Crafter structured front-end.
+# The v0.3 exact codec + GRU remain available as baselines (see residualmem_crafter_mvp.yaml).
+# Deliberately NO task-utility gating (report Section 8): the send decision is pure
+# rate-distortion; domain conditioning is kept.
+seed: 0
+domain: crafter
+action_values: 17
+
+front_end:
+  kind: structured_oracle        # Stage 5 swaps to qwen3.5 + perceiver behind the x_t seam
+  schema: crafter-v3-exact
+
+latent:
+  num_groups: 16                 # N
+  num_categories: 16             # C
+  token_dim: 40                  # d_x (== canonical field count for the structured front-end)
+
+world_model:
+  architecture: transformer_rssm  # deterministic GRU core + grouped categorical stochastic state
+  hidden_size: 256
+  embed_size: 128
+  domain_embed: 16
+  kl_beta: 1.0
+  kl_free_bits: 0.1
+  teacher_epochs: 40
+  closed_loop_epochs: 10
+  segment_length: 64
+  value_head: false               # §8 task-utility gating removed
+
+codec:
+  format: RSMEMV04
+  entropy_coder: rANS
+  scale_bits: 16
+  send_mask: rate_distortion       # analytic RD policy; learned p_eta(m|h) is a later option
+  anchor: intra_coded_latent
+  segment_length: 64
+
+evaluation:
+  operating_points: [wm_only, rd_lam8, rd_lam4, rd_lam2, rd_lam1, exact]
+  metrics: [bytes_per_step, memory_rate, exact_field_accuracy, state_distortion]
+  baselines: [store_all_latent, wm_only, exact_latent]
+  memory_rate_denominator: store_all_latent   # report Eq. 47a
+
+retrieval:
+  top_k: 8
+  structured_first: true
+  dense_embeddings_per_segment: 1
+  embedding_provider: external
+  reader_policy: abstract

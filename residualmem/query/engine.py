@@ -4,11 +4,11 @@ import dataclasses
 import json
 import time
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..codec.session import EvidenceChunk, MemoryFile, SegmentDecodeSession
-from ..retrieval.index import MemoryIndex
 from ..types import StateSchema
 from .types import (
     Answer,
@@ -22,6 +22,9 @@ from .types import (
     Reveal,
     Switch,
 )
+
+if TYPE_CHECKING:
+    from ..retrieval.index import MemoryIndex
 
 
 @dataclasses.dataclass(frozen=True)

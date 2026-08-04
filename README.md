@@ -66,6 +66,47 @@ then `EXPAND` to the next residual (or at most 8 steps), `REVEAL` cached states,
 or `SWITCH` Segment. Answers must cite fields and steps that were actually shown.
 See `ResidualMem_v0.3_exact_progressive.md` for the implementation contract.
 
+## ResidualMem v0.4 (latent, technical-report line)
+
+The `residualmem/` package also implements the latent-memory design from
+`技术报告_ResidualMem.md`: a frozen encoder → Perceiver state tokenizer (`x_t`) →
+probabilistic **Transformer-RSSM** (prior/posterior, grouped categorical latent,
+domain conditioning) → **conditional rANS entropy coding with a droppable
+rate-distortion send-mask** → anchors/segments (`RSMEMV04`) → the same retrieval +
+progressive Reader. The v0.3 exact codec and GRU remain as baselines.
+
+Design notes:
+- **No task-utility gating** (report §8): there is no value head / counterfactual
+  utility. The send decision is pure rate-distortion; domain conditioning is kept.
+- The `x_t` front-end is swappable behind one seam: `StructuredStateEncoder`
+  (structured oracle, CPU-only) or `QwenObservationEncoder` (frozen Qwen3.5 from
+  HuggingFace + Perceiver; `transformers`/`torch` load lazily).
+
+Run the CPU sanity (synthesizes a trajectory, trains a small RSSM, encodes/decodes
+the latent stream, and plots a rate-distortion curve — no external assets):
+
+```sh
+python -m residualmem latent-sanity --output outputs/latent_sanity
+```
+
+Structured pipeline commands:
+
+```sh
+python -m residualmem train-rssm --input traj.npz --output rssm.npz \
+  --groups 16 --categories 16 --hidden-size 256
+python -m residualmem encode-latent --input traj.npz --checkpoint rssm.npz \
+  --output mem.rs4 --mask rd --lam 4          # or --mask exact
+python -m residualmem decode-latent --input mem.rs4 --checkpoint rssm.npz --output out.npz
+python -m residualmem eval-rate-distortion --input traj.npz --checkpoint rssm.npz \
+  --output eval/ --lambdas 0.5 1 2 4 8
+```
+
+The multimodal front-end (`QwenObservationEncoder`) swaps in behind the `x_t`
+seam; benchmark adapters (EMemBench / WorldMemArena / LongMemEval-V2) implement
+the `residualmem.benchmarks.BenchmarkExample` interface and are driven by the same
+`QueryEngine`. Tests: `python -m pytest tests/residualmem -q`.
+
+
 A reimplementation of [DreamerV3][paper], a scalable and general reinforcement
 learning algorithm that masters a wide range of applications with fixed
 hyperparameters.
