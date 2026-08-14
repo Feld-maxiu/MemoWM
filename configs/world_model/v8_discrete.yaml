@@ -1,0 +1,48 @@
+protocol: residualmem_v8_discrete_wm_v1
+
+model:
+  num_tasks: 12
+  max_history: 7
+  num_latent_tokens: 64
+  num_subspaces: 32
+  num_categories: 256
+  num_observation_slots: 64
+  code_embedding_dim: 8
+  d_model: 256
+  num_layers: 4
+  num_heads: 8
+  mlp_dim: 1024
+  dropout: 0.1
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  max_payload_bytes: 40
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  max_steps: 20000
+  min_steps: 5000
+  eval_every: 500
+  patience_steps: 2500
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  max_ref: 63
+  payload_bytes: 40
+  select_option_uses_parent: true
+  structural_bill_bits: 11
+  payload_length_bill_bits: 6
+  task_bill_bits_per_episode: 4

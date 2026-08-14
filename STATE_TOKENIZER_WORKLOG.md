@@ -1,346 +1,355 @@
-# State Tokenizer Pilot 工作日志
+# ResidualMem State Tokenizer 工作日志
 
-## 实验约束
-
-- 冻结 Qwen3.5-9B-Base，第 16 层状态，不携带跨时间步 KV cache。
-- 表示只比较 `H → Y64`、`H → Y32`、`Y64 → PCA512`。
-- 如果 64 槽 probe gate 失败，立即停止；不得自动训练 learned queries。
-- 大型产物写入已被 `.gitignore` 覆盖的 `outputs/state_tokenizer/`。
-- 完成后删除下载碎片、未完成 shard、临时 checkpoint 和 PCA 工作矩阵；保留可复现实验所需的数据 manifest、最终表示、PCA artifact、metrics 与日志。
-
-## 2026-08-03：环境审计与启动
-
-- 当前工作目录：`/mnt/data/users/luzheng/workspace/iclr/czs/ResidualMem`。
-- 当前机器：8× NVIDIA RTX PRO 5000 72GB Blackwell；启动时 GPU 0/1 分别约有 67GB/45GB 可用，其余卡已有约 49–52GB 占用。
-- 采用共享只读环境 `/mnt/data/public_tools/miniconda3/envs/qwen-vl`：PyTorch 2.7.1+cu128、Transformers 5.14.1，已确认沙箱外 CUDA 可识别 SM120。
-- MiniWoB 使用已部署的 `../miniwob-plusplus/.venv`、Chrome 151 与匹配的 ChromeDriver。
-- Qwen3.5-9B-Base 已下载并校验为完整 4-shard checkpoint，位于 `outputs/state_tokenizer/models/Qwen3.5-9B-Base/`（约 19GB）。
-- ResidualMem worktree 原本存在大量用户修改和未跟踪的 latent 实现；本实验新增独立 `experiments/state_tokenizer/`，不覆盖这些文件。
-
-## 实现记录
-
-- 新增确定性 64/32 槽布局、adaptive average pooling、DOM 序列化和 probe 标签提取公共模块。
-- 新增可并行 MiniWoB collector：按任务分配 worker、按 episode 划分 60/20/20、保存 screenshot/DOM/instruction 与仅用于 probe 的浏览器属性 sidecar。
-- 新增 Qwen layer-16 early-stop extractor；一次前向同时生成 Y64、Y32 与 H 的固定 mean/max probe 摘要，完整变长 H 不落盘。
-- 新增 GPU 线性 probe、Y64 硬停止 gate、条件式 PCA512 拟合/转换，以及 feature shard 完整性校验。
-- learned queries 不属于当前实现范围。
-
-## 2026-08-03：小样验证
-
-- 单元测试：`tests/state_tokenizer/test_common.py` 共 4 项通过；全部实验脚本通过 `py_compile`。最终环境未安装 pytest，因此使用等价的逐函数 runner 复验 4 项测试。
-- 真实 MiniWoB：`click-checkboxes-v1` 采集 4 个连续状态成功，sidecar 能识别 unchecked → checked 的状态变化。
-- Qwen Base checkpoint 没有 chat template；已改用其原生 `<|vision_start|><|image_pad|><|vision_end|>` 输入协议，并通过 processor token 展开验证。
-- 4 个真实状态端到端提取成功：图像 token 70 个，DOM token 446–453 个，instruction token 9–10 个；序列总长 570–576，无截断。
-- GPU 0 上 early-stop 到第 16 层的稳态提取速度约 1.08 states/s。Transformers 报告缺少 `fla`/`causal-conv1d` 快路径，当前使用官方 torch fallback；本轮不修改共享环境。
-
-## 2026-08-03：正式数据采集与特征抽取
-
-- 使用 4 个独立 Chrome/MiniWoB worker 收集 10,008 个状态；12 个任务各 834 个状态。
-- episode 级划分为 train/validation/test = 6,013/1,996/1,999；共 5,235 个 episode，同一 episode 未跨 split。
-- 合并 manifest SHA256：`1b92a077610f0009870465fb877c0a25bfe1eee9e68c5c2af84062417b1822e9`。
-- 检查所有 screenshot 路径存在，抽检 100 张 PNG 可解码；采集日志无 episode 或 sidecar 异常。
-- GPU 2–7 被既有 6-way SGLang 服务占用（每卡仅余约 20–24GB），未抢占；正式抽取均分到尚有安全显存余量的 GPU 0/1。
-- 两个 extractor 各负责 5,004 条记录；启动后的稳态速度约 5.0 states/s/GPU。
-- 正式抽取耗时约 980 秒；序列长度 282–1,337，图像/DOM/instruction token 范围分别为 70、161–1,210、7–33；0 条截断，数值与索引覆盖审计通过。
-- 首次启动 probe 时发现任务分类头把标签数组宽度误当成类别数，尚未产生指标即触发 CUDA assert；已修正为 `max(label)+1` 并加入类别范围检查，随后重跑成功。
-- Y64 相对 H 的硬门通过：state retention 1.0000、text retention 0.9206、mean retention 0.9603、task accuracy drop 0.0000。
-
-## 2026-08-03：最终 pilot 结果
-
-所有 probe 都使用相同的简单线性头与相同 split。为处理变长 H，参考输入是 image/DOM/instruction 各自 mean+max 拼接的 `6×4096` 摘要；Y64/Y32 也按对应模态槽做相同 mean+max 聚合，因此结果只支持“当前 probe 套件未检测到明显损失”，不等价于无损重建完整 H。
-
-| 表示 | 每状态形状 | task acc | state mAP | BoW mAP | 对参考的 state/text retention | 结果 |
-|---|---:|---:|---:|---:|---:|---|
-| H probe 摘要 | `6×4096` | 1.0000 | 1.0000 | 0.4658 | — | reference |
-| Y64 | `64×4096` | 1.0000 | 1.0000 | 0.4340 | H→Y64: 1.0000 / 0.9206 | pass |
-| Y32 | `32×4096` | 0.9990 | 1.0000 | 0.4778 | Y64→Y32: 1.0000 / 1.1595 | pass |
-| Y64→PCA512 | `64×512` | 0.9985 | 1.0000 | 0.5085 | Y64→PCA: 1.0000 / 1.2804 | pass |
-
-- PCA 使用 5,000 个 train 状态（320,000 个槽向量）拟合，512 维解释方差比为 0.9297。
-- retention 大于 1 来自候选 probe 的测试 AP 高于参考 probe，属于独立优化/正则化差异；只能解读为本 pilot 未测到损失，不能声称压缩增加了信息。
-- 按存储量，BF16 的 Y64/Y32/PCA512 分别约为 512/256/64 KiB 每状态。就本 pilot 而言，`Y64→PCA512` 在最小体积下仍通过全部 gate，适合作为下一阶段 WM 的首选输入；Y32 可保留为更少状态 token 的替代基线。
-
-## 清理与最终审计
-
-- 删除约 1.5GB 可重建的 `probe-inputs/` 缓存、4 份已合并的 worker JSONL、两个 `/tmp` sanity 目录、下载缓存元数据与 Python `__pycache__`。
-- 保留最终 manifest/截图、Qwen checkpoint、H probe 摘要、Y64、Y32、PCA512 表示、PCA artifact、所有结果 JSON 和成功运行日志。
-- 最终审计重新验证 manifest SHA256、10,008 条索引完整覆盖、两个 extraction/PCA done mask、PCA component 形状 `(4096, 512)`，以及三个 gate 均为 pass。
-- 正式采集/抽取/PCA/probe 日志中未发现 traceback、OOM 或 episode 错误。
-
-## 待执行与结果
-
-- [x] collector 单元测试和真实 MiniWoB 小样本。
-- [x] Qwen 多模态第 16 层抽取与 64/32 槽落盘小样。
-- [x] 64 槽 probe gate（通过）。
-- [x] 仅在 gate 通过后：32 槽 probe 与 PCA512（均通过）。
-- [x] 中间产物清理与完成审计。
+当前冻结状态：**v8 / AXTree / `(32,16,16,0)` / 10 万状态**。
+本文件记录「做了什么、为什么、哪些量具骗过我」，不是 API 文档。
 
 ---
 
-## 2026-08-03：v2 Full-H / Slot-Aware 修正实验启动
+## 0. 数值与评测协议（对 A1、A2、temporal WM 强制生效）
 
-### 修正原因
+A1 的重建误差对 matmul 精度的敏感度比 A0 高一个数量级（A0 改善 2%，A1 改善 20%），且同一 checkpoint 在 TF32 下换批次切分有约 1% 波动。这个量级已与后续要测的容量差异可比，因此所有静态验证实验采用下列协议。
 
-- v1 的 `H probe 摘要` 只保留三种模态的 mean/max，不能作为完整 `H_t` oracle；自本节起统一改称 `H_global_summary`，其既有 gate 仅视为历史诊断。
-- v1 probe 在预测前再次把 Y64/Y32 聚合成模态级 mean/max，无法检查局部 slot、slot 顺序或具体元素状态。
-- 静态 role 和 BoW 容易受任务模板与 instruction 泄漏；v2 主 gate 只使用任务内变化的动态状态和随机 textbox value，DOM-only BoW 改为非阻塞诊断。
+| 项 | 规定 | 实现方式 |
+|---|---|---|
+| matmul precision | `highest`（真 fp32，禁用 TF32） | A1 runner 默认，写入结果 `numerics` |
+| model activations | FP32 | 模型内部统一 `jnp.float32` |
+| metric SSE accumulation | FP64 host 累加 | `_host_group_sse`，batch 内与跨 batch 均 FP64 |
+| evaluation batch size | 固定并随结果记录 | `--eval-batch-size` |
+| 评测设备 | 固定单一 device 并记录 | `--platform/--device-index` |
+| 评测切分 | 确定性行选择与批次切分 | task round-robin + 顺序切片 |
 
-### 锁定协议
+FP64 累加使指标与批次切分**完全无关**：`eval-batch-size` 取 64 与取 2 的 MSE 在相对误差 `1e-12` 内一致（由 `test_metric_accumulation_is_batch_split_invariant` 锁定）。
 
-- 从现有 10,008 条 manifest 选择 train/validation/test = 2,000/500/1,000；每个 episode 最多一个状态。
-- 临时提取完整 layer-16 image/DOM/instruction token，使用 ragged BF16 缓存；Y64/Y32/PCA512 复用现有结果。
-- reader 固定为 `input→256 Linear→LayerNorm→单 learned query/一层 4-head cross-attention→Linear heads`。
-- 使用模态内归一化位置 `p=(i+0.5)/N_modality`；Full-H token 与 pooled slot 都落在 `(0,1)`。
-- probe seeds 为 0/1/2。Full-H oracle 不合格则报告 `INCONCLUSIVE_PROBE`；Y64 主 gate 失败则立即停止，禁止自动训练 learned queries。
+任何报告的误差必须同时给出精度、batch size 与 device，缺一不可视为可比。
 
-### 已完成实现与数据审计
-
-- 新增 compact DOM v2 parser 与动态标签：逐元素 checkbox/radio 状态、逐 textbox nonempty/focused、interactive tampered、随机 `state-#####` value。
-- 标签只从实际送入 Qwen 的 DOM 字符串派生，不使用浏览器 sidecar。当前数据不支持的 disabled、动态 dialog、具体 option 与 success/failure 显式标记为 unsupported。
-- 新增 episode-unique subset 选择器及测试；初次真实构建发现部分多步任务的独立 episode 少于等额任务配额，因此改用带 episode 容量上限的任务 water-filling，未放宽 episode 唯一性。
-- 第一版状态代表等概率采样使 `checkbox_0_checked` 在 test 中只有 17 个负例。为避免降低 gate 阈值，已锁定多步 episode 采用 50% 初始态、50% 均匀动作后状态的采样方式，显式平衡未改变/已改变状态。
-- 最终 subset 已固定为 3,500 个互不重复 episode，train/validation/test = 2,000/500/1,000；SHA256 为 `d58aaee36ae9a11b6cdb7b989a6de19ea4663d7cacbeaa19486f6bb376d55983`。
-- 最终 subset 有 7 个满足三 split 正负例阈值的动态标签：`checkbox_0_checked`、`has_random_value`、`interactive_tampered`、`textbox_0_focused`、`textbox_0_nonempty`、`textbox_1_focused`、`textbox_1_nonempty`。其余逐元素标签保留在逐标签表中，但不计入主 gate。
-- 新增 ragged Full-H store/extractor、H→Y64/Y32 BF16 精确对齐检查、统一 slot-aware reader、task-ID/task+step/instruction-only 泄漏 baseline 和三 seed 分阶段 gate 汇总器。
-- 新增 v2 单元测试后共 10 项通过；所有新增脚本通过 `py_compile`。归一化位置和 reader padding invariance 均有独立测试。
-- 正式 GPU 启动前复查：GPU 0/1 分别空闲约 66.8/45.1 GiB；GPU 2–7 各已有约 48–52 GiB 占用，故只将 GPU 0/1 判定为空闲安全卡，不抢占其余服务。
-- 4-state Full-H 检查初次在 CPU pooling 上发现 Y32 BF16 不一致（最大绝对差 0.09375）；定位为 CPU/CUDA reduction 顺序差异。改用与旧缓存生成时相同的 CUDA reduction 后，Y64 与 Y32 均逐位一致，BF16 最大绝对误差均为 0.0。
-- 统一 reader 在 64 个 train 状态上做 overfit sanity：动态状态 AP 与五位随机 value accuracy 均达到 1.0，证明单 query reader、归一化位置、loss 与评测链路能访问并学习 slot 内容。
-- 正式 Full-H 已在 GPU 0/1 双卡启动，各处理 1,750 个状态；启动后稳态约 4.3–4.5 states/s/GPU。
-
-### v2 待执行
-
-- [x] 固定最终 3,500-state subset 与标签覆盖表。
-- [x] 实现并单元验证 ragged Full-H extractor/store。
-- [x] 实现 normalized-position slot-aware reader、泄漏 baselines 与三 seed gate。
-- [x] 4-state Full-H→Y64/Y32 对齐及 reader overfit sanity。
-- [ ] Full-H qualification。
-- [ ] Y64 动态状态/value 主 gate；失败即停。
-- [ ] 仅在 Y64 通过后运行 Y32/PCA512。
-- [ ] 删除 Full-H 临时缓存并完成最终审计。
-
-### 运行时修正
-
-- 首次启动 Full-H/instruction-only probe 时，两个任务尚未完成首个 epoch 就各占用了上百个 CPU 线程。定位到 ragged reader 每次把磁盘 BF16 先展开为 FP32，且 instruction-only 为了取十几个 instruction token 会先读取整个 image/DOM 序列。
-- 中止了这两个尚未产出 checkpoint/metrics 的 seed-0 任务；改为 copy-on-write memmap 的 BF16 零转换 view、按 modality offset 直接切 instruction，并将每个 probe 的 CPU threads 限制为 4。11 项测试复验通过后从 seed 0 重跑。
-- 修正后 Full-H 与 instruction-only 都能在几十秒内完成多个 epoch，GPU 不再因无效 FP32 转换长期空等。该修正不改变任何 token 数值、reader 结构、标签、split 或 gate。
-
-### Full-H 正式提取与资格检验
-
-- 双卡正式提取完成 3,500/3,500 个状态，GPU 0/1 各 1,750 个；墙钟约 384 秒，速率分别为 4.555/4.555 states/s。
-- 两个 shard 共 1,949,352 个 token，临时 BF16 Full-H 逻辑大小约 14.872 GiB。随机抽检 32 个状态，CUDA reduction 后重建的 Y64/Y32 与旧缓存均 BF16 逐位一致，最大绝对误差 0.0。
-- 完成 Full-H、instruction-only、task-ID-only、task+step 四组 reader，每组只重训 probe seeds 0/1/2；Qwen 只提取一次。
-
-| 表示 / baseline | 动态 task-macro AP | 随机 value accuracy | DOM-only BoW AP | 说明 |
-|---|---:|---:|---:|---|
-| Full-H slot-aware | 0.9783 ± 0.0019 | 0.8858 ± 0.0324 | 0.3605 ± 0.0032 | oracle candidate |
-| instruction-only | 0.9609 ± 0.0046 | 0.1947 ± 0.0190 | 0.3156 ± 0.0045 | 最强动态/value 泄漏 baseline |
-| task+step | 0.8250 ± 0.0025 | 0.1869 ± 0.0021 | 0.3096 ± 0.0009 | step 泄漏明显 |
-| task-ID-only | 0.4501 ± 0.0000 | 0.1794 ± 0.0017 | 0.2585 ± 0.0349 | template baseline |
-
-- Full-H 有 7 个可评测动态标签，满足“至少 6 个”的资格要求。
-- 随机 value：Full-H 0.8858，相对最强 leakage baseline 0.1947 提升 0.6911，超过 +0.10 要求。
-- 动态状态：Full-H 0.9783，相对最强 leakage baseline（instruction-only 0.9609）只提升 0.0175，未达到 +0.10 要求。逐标签上 `checkbox_0_checked` 的 Full-H/instruction-only AP 都为 1.0，`has_random_value` 也几乎都为 1.0，说明这些动态 presence/checked 标签仍被 instruction/episode 采样模式强烈泄漏。
-- 因而 Full-H oracle 资格检验结果为 **`INCONCLUSIVE_PROBE`**。这不是 Y64 失败，也不能推出池化损失大；它表示当前动态 probe 无法把页面状态信息与 instruction/采样相关性充分分离。
-- 按预先锁定的 hard-stop 协议，本轮没有运行 Y64、Y32 或 PCA512 的 v2 probe，没有计算 retention，也没有训练 learned queries。DOM-only BoW 始终只是诊断指标，不参与停止判断。
-- 机器可读结果：`outputs/state_tokenizer/metrics/v2/aggregate-qualification.json`；逐标签表：`outputs/state_tokenizer/metrics/v2/per-label-qualification.csv`。
-
-### v2 最终状态
-
-- [x] Full-H qualification 已完成，结果 `INCONCLUSIVE_PROBE`。
-- [x] 依协议在 Y64 前停止，未越过 gate。
-- [x] 删除约 15 GiB 可重建 Full-H、12 个 probe checkpoint 与两个 sanity 临时目录；这些缓存不可直接恢复，但可由保留的 subset、Qwen checkpoint 和脚本重建。
-- [x] 最终审计：11 项测试通过；8 个新增/修改脚本通过 `py_compile`；12 份正式 result JSON 齐全；subset SHA256 复核一致；v2 日志无 traceback/OOM/RuntimeError；聚合状态复核为 `INCONCLUSIVE_PROBE`。
+**环境分裂是硬约束**：抽取管线只有 torch（`MemCompiler`），bottleneck 只有 jax（`ResidualMem`），采集只有 playwright（`browsergym-venv`）。三者互不可导入。跨环境共享的常量必须放在无第三方依赖的模块里（见 §6.1）。
 
 ---
 
-## 2026-08-03：v2.1 Value-only Compression Retention
+## 1. 最终方法
 
-### 修订理由与协议
+Qwen 的输入是**三个模态**，不是只有文本：
 
-- 动态二值 probe 的 leakage 不再阻塞干净的随机五位 value 实验。上一轮 Full-H value accuracy 为 0.8858，而 instruction-only 仅为 0.1947，已经证明 Full-H 能访问页面中的具体随机内容。
-- 新实验只在存在 `state-#####` 的样本上优化五个十分类 value heads；train/validation/test 分别为 590/133/240。动态状态、静态 role、task 与 BoW heads 仍保持同一 reader 定义，但不参与 loss 或 checkpoint 选择。
-- 表示固定为 Full-H、instruction-only、Y64、Y32、PCA512（代码名 `x64`），reader 结构、hidden width、单 query、归一化位置、optimizer、split 和 seeds 0/1/2 完全相同。
-- 主指标沿用此前的五个位置平均 accuracy `macro_position_accuracy`，并新增完整五位字符串全对的 `exact_value_accuracy` 作为更严格诊断。
-- instruction-only 是唯一 leakage baseline。主 retention 同时报告均值比值和 seed-paired 均值/标准差：`(M_compressed-M_instruction)/(M_full_h-M_instruction)`。
+$$
+\underbrace{\text{screenshot } 498\times321}_{\text{vision tokens}}
+\;+\;
+\underbrace{\text{AXTree} \rightarrow \text{compact 线格式}}_{\texttt{<dom>}\ldots\texttt{</dom>}}
+\;+\;
+\underbrace{\text{固定观察提示}}_{\texttt{<instruction>}\ldots}
+$$
 
-### 实现状态
+$$
+\rightarrow \text{Qwen3.5 layer-16 Full-H}
+\rightarrow \text{Static Key64}
+\rightarrow \text{PCA512}
+\rightarrow \text{group×channel normalization}
+$$
 
-- `slot_probe.py` 新增 `--objective value_only`，自动过滤有效 value 样本、只计算 digit CE、只用 validation value accuracy 早停，并记录三个 split 的有效样本数。
-- 新增 `aggregate_value_only.py`，计算 Y64/Y32/PCA512 的 macro-position 与 exact-value leakage-adjusted retention，并输出 JSON/CSV。
-- 新增 retention 单元测试；当前 state-tokenizer 测试总数为 12，全部通过。
-- GPU 预检结果与前一轮一致：GPU 0/1 是仅有的安全卡；GPU 2–7 各有约 48–52 GiB 常驻占用，不抢占。
+`modality_indices` 按标记切出 (image, dom, instruction) 三段隐状态，Static Key64 分别池化：**截图占 32 槽（64 槽的一半）**，AXTree 占 detail 16 + context 16，固定提示占 0（已回收，见 §3）。
 
-### 待执行
+送入 World Model 的标准化状态为 $\bar x_t\in\mathbb R^{64\times512}$。
 
-- [x] value-only reader smoke sanity：Y64、64 个 value 样本、8 epochs，loss 从 2.415 降至 2.166，训练集位置准确率从 0.150 升至 0.250；确认过滤、digit-only loss、早停与 exact-value 指标链路工作正常。
-- [x] 双卡重建临时 Full-H：GPU 0/1 各 1,750 states，墙钟约 381 秒、4.60/4.59 states/s；随机 32-state CUDA 对齐检查中 Y64/Y32 的 BF16 最大误差均为 0.0。
-- [x] 五种表示各 3 seeds value-only probe；每个结果均为 train/validation/test = 590/133/240 个有效 value，最多 60 epochs、patience 8。
-- [x] 汇总绝对 value 指标与 leakage-adjusted retention。
-- [x] 清理临时 Full-H/checkpoint 并完成最终审计：删除约 15 GiB 可重建 Full-H、15 个 probe checkpoint、smoke 目录和 Python cache；保留 15 份 result JSON、聚合 JSON、CSV 与全部日志。
-
-### Value-only 结果
-
-| 表示 | 五位置平均 accuracy | 五位整串 accuracy | `R_value`（均值比值） | seed-paired `R_value` |
-|---|---:|---:|---:|---:|
-| Full-H | 0.8806 ± 0.0206 | 0.6417 ± 0.0579 | 1.0000 | 1.0000 |
-| instruction-only | 0.1828 ± 0.0054 | 0.0000 ± 0.0000 | 0.0000 | 0.0000 |
-| Y64 | 0.6436 ± 0.0064 | 0.3597 ± 0.0064 | **0.6604** | 0.6610 ± 0.0249 |
-| Y32 | 0.6336 ± 0.0146 | 0.3472 ± 0.0024 | **0.6461** | 0.6469 ± 0.0348 |
-| Y64→PCA512 | 0.6978 ± 0.0179 | 0.3681 ± 0.0168 | **0.7381** | 0.7379 ± 0.0072 |
-
-- `R_value` 主值按三 seed 均值代入 `(M_compressed-M_instruction)/(M_full_h-M_instruction)`；同时报告同 seed 配对后比值的均值和样本标准差，两种算法结论一致。
-- 更严格的整串 exact-value retention 分别为 Y64 0.5606、Y32 0.5411、PCA512 0.5736；排序与主指标相同。
-- 结论很明确：64 槽和 32 槽都保留了显著的页面随机 value 信息，但在这个单-query reader 下只保留约 65%–66% 的 leakage-adjusted Full-H 能力，没有达到此前设想的 0.80 retention。
-- PCA512 在 Y64 上表现更好，主 retention 为 0.7381，但仍低于 0.80。它不可能增加原表示的信息；更合理的解释是 PCA 去噪、4096→512 降维改善了有限数据下 reader 的优化/正则化。
-- Y64 与 Y32 差异很小（0.6604 vs 0.6461），当前主要损失更像来自固定分段池化本身，而不是 64→32 的额外槽数下降；PCA 则部分恢复了线性可读性。
-- 机器可读聚合：`outputs/state_tokenizer/metrics/v2/value_only/aggregate-value-only.json`；简表：`outputs/state_tokenizer/metrics/v2/value_only/value-only-summary.csv`。
-- 最终审计：12 项测试通过；8 个 value-only 相关脚本通过 `py_compile`；15 份结果的 protocol、seeds、590/133/240 样本数和 reader 配置一致；三项 retention 从原始 seed metrics 独立复算到 1e-12 一致；subset SHA256 仍为 `d58aaee36ae9a11b6cdb7b989a6de19ea4663d7cacbeaa19486f6bb376d55983`；正式日志无 traceback/OOM/RuntimeError/ValueError。
+符号固定：$x_t$ 原始 Static PCA 状态；$\bar x_t$ 固定标准化状态；$y_t\in\{0..255\}^{64\times32}$ A2 的离散码；$z_t$ **保留给** World Model 的 grouped categorical stochastic latent，不得混用。
 
 ---
 
-## 2026-08-03：v3 Fixed-Prompt Dynamic-State Revalidation
+## 2. 为什么从 compact DOM 换成 AXTree
 
-### 目的与锁定协议
+v7 的语义门控暴露出一个结构性上界，不是调参能解决的。绑定探针总体 0.7935，分解后字面进入 raw 槽时 0.8345、未进入时 0.6873；剩余部分需要 `ref`/`parent` 这类结构信息，而 Static Key64 **按设计**把它们排除在 raw detail 之外。纯 DOM 路线上「指令优先 + 加槽」最多把绑定抬到约 0.834。
 
-- v2 动态状态实验中 instruction-only 的 task-macro AP 达到 0.9609，证明原任务 instruction 对 checked/focused/nonempty 存在严重泄漏；因此旧动态结果不能用于判断池化表示的信息保真度。
-- 本轮不是仅在 probe 端屏蔽 instruction，而是在送入 Qwen 前把全部 3,500 个状态的任务 instruction 统一替换为以下任务无关 observation prompt：`请忠实表示当前页面状态，保留可见文本、输入值、控件类型、选中/聚焦/启用状态及空间关系。`
-- 因 prompt 会改变 Qwen hidden state，本轮重新提取 layer-16 Full-H、Y64、Y32；PCA512 也只在 fixed-prompt 的 2,000 个 train 状态上重新拟合，不复用旧 PCA。
-- probe 仍为同一个 256 hidden、单 learned query、一层 4-head cross-attention reader；位置仍使用模态内归一化坐标。没有为动态状态重新设计更复杂的 probe。
-- loss 与 validation early stopping 只使用 9 个逐元素标签：checkbox 0/1/2 checked、textbox 0/1/2 nonempty、textbox 0/1/2 focused。满足既有三 split 覆盖阈值的 5 个标签构成主 task-macro AP，其余标签仍逐项报告但不混入主值。
-- Full-H、Y64、Y32、PCA512，以及 fixed-prompt-token-only、task-ID-only、task+step 均训练 seeds 0/1/2。压缩 retention 使用不读取页面内容的最强 metadata leakage baseline（task-ID/task+step）校正，并同时保留逐标签绝对 AP 与 prevalence。
+AXTree 把绑定从「跨节点引用」变成「字面相邻」：`checkbox 'Nb'` 是同一行，角色与名字在同一个 span 里。实测（12 任务）：
 
-### 实现与冒烟测试
-
-- 新增固定提示词 manifest builder、Full-H/Y64/Y32 联合 extractor、fixed-prompt PCA fit/transform、动态状态专用 objective 与三 seed 汇总器。
-- fixed-prompt subset 保持 train/validation/test = 2,000/500/1,000、3,500 个 episode 全部唯一；原 subset SHA256 为 `d58aaee36ae9a11b6cdb7b989a6de19ea4663d7cacbeaa19486f6bb376d55983`，fixed-prompt manifest SHA256 为 `2febd4675a3c0b9da9473d82f804c32349197cc3957faca58b2dadbdd85e90c1`，且 `unique_instructions=1`。
-- 相关脚本全部通过 `py_compile`；state-tokenizer 测试增至 15 项并全部通过。
-- 4-state 真实 Qwen 冒烟测试确认固定提示词编码为 29 个 instruction token；从新 Full-H 重新池化的 Y64/Y32 与联合 extractor 输出均 BF16 逐位一致，最大绝对误差为 0.0。
-- GPU 预检显示 GPU 0/1 分别约有 66.8/45.1 GiB 余量；GPU 2–7 各有约 49–52 GiB 常驻占用。本轮只并行使用 GPU 0/1，各负责 1,750 个状态，不抢占其余服务。
-- 运行中确认 fixed-prompt-token-only 不能再解释为“instruction 语义泄漏”：Qwen 是因果模型，位于 image/DOM 之后的 29 个固定 prompt token hidden states 已被前文页面内容上下文化。它作为一个短状态表示继续报告，但不纳入 leakage baseline；真正不看页面内容的 task-ID/task+step 才用于泄漏校正。
-
-### 当前进度
-
-- [x] 固定 observation prompt manifest 与协议审计。
-- [x] 动态状态专用 loss/metric、PCA 与汇总实现。
-- [x] 15 项测试和 4-state Full-H→Y64/Y32 逐位一致性检查。
-- [x] 双卡正式提取 3,500 个 fixed-prompt 状态。
-- [x] 在 fixed-prompt train split 重拟合并变换 PCA512。
-- [x] 七种表示/baseline 各 3 seeds 动态状态 probe。
-- [x] 聚合逐标签 AP、泄漏校正 retention、最终审计与缓存清理。
-
-### 正式运行与结果
-
-- 双卡提取完成 3,500/3,500 个状态；GPU 0/1 各 1,750 个，墙钟分别为 384.08/383.48 秒，速率 4.556/4.563 states/s。固定 prompt 的 instruction 长度在所有状态中均为 29 token。
-- 两个 Full-H shard 合计 2,000,798 个 token，逻辑 BF16 大小 15.265 GiB。随机抽检 32 个正式状态，Full-H 重新池化所得 Y64/Y32 与联合 extractor 保存值均 BF16 逐位一致，最大绝对误差 0.0。
-- PCA512 仅用 fixed-prompt train split 的 2,000 状态（128,000 个 Y64 slot）拟合，累计解释方差为 0.93144；随后成功变换全部 3,500 状态。
-- 七种表示/metadata baseline 各完成 seeds 0/1/2，共 21 个 probe。主指标是 5 个覆盖合格标签的 task-macro AP：`checkbox_0_checked`、`textbox_0_nonempty`、`textbox_1_nonempty`、`textbox_0_focused`、`textbox_1_focused`。
-
-| 表示 / baseline | 动态状态 task-macro AP | 相对 task+step 的 leakage-adjusted retention |
+| | compact DOM | AXTree |
 |---|---:|---:|
-| Full-H | 0.9881 ± 0.0132 | 1.0000 |
-| fixed-prompt token hidden states | 0.9987 ± 0.0013 | 仅作短状态表示诊断 |
-| task-ID-only | 0.4102 ± 0.0000 | metadata baseline |
-| task+step | 0.7651 ± 0.0057 | 最强 metadata leakage baseline |
-| Y64 | **0.9904 ± 0.0036** | **1.0104**（seed-paired 1.0136 ± 0.0672） |
-| Y32 | 0.9798 ± 0.0036 | **0.9627**（seed-paired 0.9659 ± 0.0676） |
-| Y64→PCA512 | 0.9770 ± 0.0056 | **0.9500**（seed-paired 0.9516 ± 0.0470） |
+| 目标→元素解析规则 | 三级回退（`t` 节点 → 共享 parent 的可点击兄弟 → 可点击 parent） | 一条：目标 == 可点击节点的 accessible name |
+| 解析率 | 97.1% | **100%**（116/116、60/60，全部有 bid 且可点击） |
+| token 数（12 任务均值） | 481 | **118**（4.1×） |
 
-- `checkbox_0_checked` 在 Full-H/Y64/Y32/PCA 和 task+step 上 AP 都为 1.0，说明它仍被 episode 采样中的 task+step 完全预测，不能单独作为页面状态读取证据。泄漏校正中该标签的 oracle/candidate margin 都为 0，因此不会人为抬高 retention；主要有效证据来自 4 个 textbox nonempty/focused 标签。
-- 四个 textbox 标签的逐标签趋势一致：Y64 AP 为 0.9927/0.9868/0.9928/0.9799，Y32 为 0.9969/0.9452/0.9967/0.9602，PCA512 为 0.9928/0.9571/0.9895/0.9454；顺序依次为 textbox-0 nonempty、textbox-1 nonempty、textbox-0 focused、textbox-1 focused。
-- Y64 的 AP/retention 略高于 Full-H 不代表增加了信息；这是有限样本、不同输入长度和优化/正则化造成的 reader 可读性差异。合理结论是：在这个单-query reader 和 fixed-prompt 动态状态诊断下，Y64 未检测到相对 Full-H 的可测损失；32 槽和 PCA512 分别保留约 96% 和 95% 的泄漏校正能力。
-- fixed-prompt token hidden states 的高 AP 也不表示任务 instruction 泄漏复发。它们位于 image/DOM 之后，已通过因果 attention 被页面前文上下文化；因此它是一个 29-token 的隐式状态摘要，而不是只含固定字符串语义的 baseline。
+核对过：**没有任何 probe 标签依赖几何**（static 全是 role 存在性，dynamic 全是交互态），而几何+样式占 compact DOM token 的 66.3%，故全部丢弃。
 
-### 最终审计与清理
+### 2.1 复用线格式，池化链不改
 
-- fixed-prompt manifest 复核为 3,500 条、3,500 个 unique episode、`unique_instructions=1`，SHA256=`2febd4675a3c0b9da9473d82f804c32349197cc3957faca58b2dadbdd85e90c1`。
-- 21 份 result JSON 的 protocol、representation、seed、train/validation/test=2,000/500/1,000、单 query reader 配置与 `dynamic_state_only` objective 全部一致；v3 正式日志未发现 traceback、OOM、RuntimeError、ValueError、AssertionError 或 NaN。
-- 新增 metadata leakage 解释测试后，state-tokenizer 测试总数为 16，全部通过；所有 v3 脚本通过 `py_compile`。
-- 已删除约 15.3 GiB 可重建 Full-H token 文件、21 个 probe checkpoint 和 4-state 临时目录；这些缓存不可直接恢复，但可由保留的 fixed-prompt manifest、Qwen checkpoint 与脚本重建。保留 Y64、Y32、PCA512、PCA artifact、21 份 result JSON、聚合 JSON、逐标签 CSV 与全部运行日志。
-- 机器可读聚合：`outputs/state_tokenizer/metrics/v3/fixed_dynamic/aggregate-fixed-dynamic.json`；逐标签表：`outputs/state_tokenizer/metrics/v3/fixed_dynamic/fixed-dynamic-per-label.csv`。
+`parse_dom_spans` 是通用的逐行 `<key=value/>` 解析器。把 AXTree 序列化成同一格式、并把 role 映射到**现有 tag 词表**，则 `key_pooling`、`v2_data`、`static_key_pooling` 全部无需改动：
+
+```
+<ref=21 parent=20 tag=input_checkbox text="Nb" value="true" flags=0,1,0,1/>
+```
+
+`ref` ← browsergym bid；`parent` ← 最近的有 bid 的祖先；`text` ← accessible name；`value` ← textbox 的值或 checkbox 的 checked；`flags` ← `[focused, tampered, 0, is_leaf]`（`v2_data` 硬性要求 4 位）。
+
+两处 AXTree 特有的处理：
+
+- **StaticText 去重**：AXTree 在控件上挂 name，同时又有一个重复该 name 的 StaticText 子节点。二者都保留会让候选翻倍、预算减半。只有当文本未被同级/父级控件的 name 覆盖时才保留（`scroll-text-2`/`copy-paste` 的正文正是靠这条留下的）。
+- **`tampered` 由 Python 侧记录**：BrowserGym 的 `remove_human_display` 主动 `removeEventListener` 掉了设置该位的监听器，MiniWoB 的 `wob_ref` 也因 `getDOMInfo()` 从不被调用而永不赋值。我们自己的动作是页面唯一的交互来源，故在采集侧记录动作过的 bid 即可，精确且无失败模式。
 
 ---
 
-## 2026-08-03：v3.1 Fixed-Prompt Exact Random-Value Revalidation
+## 3. Slot 布局
 
-### 目的与协议
+| 分组 | 槽数 | 处理方式 |
+|---|---:|---|
+| Screenshot | 32 | 按真实 Qwen merged vision grid 二维平均池化；BrowserGym 498×321 → grid `(1,20,32)` → merged `10×16` |
+| DOM-detail | **16** | 保留精确 value、控件 text、option/label text 等 UI literal |
+| DOM-context | 16 | 对完整节点求均值，包含已进入 detail 的 token |
+| Fixed prompt | **0** | 已回收给 detail |
+| 合计 | 64 | 输出 `64×4096` |
 
-- 使用与 v3 动态状态实验完全相同的任务无关 observation prompt，在 Qwen 输入端替换原 task instruction：`请忠实表示当前页面状态，保留可见文本、输入值、控件类型、选中/聚焦/启用状态及空间关系。`
-- 从既有 3,500-state fixed-prompt manifest 精确筛出含 `state-#####` 五位随机 value 的 963 个状态；train/validation/test=590/133/240，963 个 episode 全部唯一，`unique_instructions=1`，subset SHA256=`84bfaa9fb393db105db35a68316aaaf930b33281be1a4c5b761a0987a56a3bce`。
-- 只为这 963 个必要状态临时重建 layer-16 Full-H，避免再次产生完整 3,500-state 的约 15 GiB 缓存；Y64/Y32/PCA512 复用 v3 fixed-prompt 正式表示，其中 PCA512 是此前仅在 fixed-prompt 2,000 个 train 状态上重新拟合的版本。
-- Full-H、Y64、Y32、PCA512 使用完全相同的 256 hidden、单 learned query、一层 4-head cross-attention reader，seeds=0/1/2；loss 和 validation early stopping 只使用五个 digit 十分类交叉熵。
-- 主指标为五个位置平均 accuracy，随机十分类 chance=0.1；严格指标为五位整串全对 accuracy，chance=`10^-5`。retention 统一定义为 `(M_compressed-M_chance)/(M_full_h-M_chance)`，同时报告 `1-retention` 相对损失与绝对 accuracy drop。
-- fixed prompt token hidden states 已被 image/DOM 因果上下文化，因此不作为泄漏 baseline；额外运行 task-ID/task+step 只用于验证 metadata 是否接近随机 chance。
+**prompt 槽为何归零**：它装的是每个状态**逐字节相同**的固定观察提示。跨状态余弦相似度中位 0.214，而 detail 是 0.002，相差两个数量级——这就是「几乎不携带每状态信息」的样子。
 
-### 当前进度
+**detail 槽为何 12→16**：预算是绑定能否成立的瓶颈。`click-checkboxes` 一条指令点名至多 5 个目标、每个 1–5 token，12 槽即使配合指令优先仍漏掉约 19%。
 
-- [x] fixed-prompt value-only subset、protocol 标识与 chance-adjusted 聚合器。
-- [x] 19 项 state-tokenizer 测试及相关脚本 `py_compile`。
-- [x] 双卡提取 963-state 临时 Full-H 并验证 Y64/Y32 对齐。
-- [x] Full-H/Y64/Y32/PCA512 与 metadata baseline 各 3 seeds。
-- [x] 汇总精确 value 损失、最终审计与临时缓存清理。
+> 我曾以「AXTree 把 token 压掉 4.1× 后预算不再是瓶颈」为由推迟这两项改动，**并且用同一个错误假设推迟了两次**。预算按**被选中字面的 token 数**计，与文本总长无关：标签仍是那些 5-token 随机串，数量也没变。实测两项各自贡献 +16.2pp 和 +9.2pp。
 
-### 正式结果
+**图像网格必须显式传**：`rebuild_static_key64 --image-grid-thw 1 20 32`。默认值 `1 20 14` 对应 v7 的 160×210 截图，用错会让 32 个 image 槽静默错位池化（`rebuild` 会校验 `merged_image_hw`，是唯一拦得住它的地方）。
 
-- 双卡临时 Full-H 提取完成 963/963，GPU 0/1 分别处理 482/481 状态，墙钟 106.92/106.42 秒，速率 4.508/4.520 states/s；合计 466,385 个 token，逻辑 BF16 大小 3.558 GiB。
-- 随机抽检 32 个 value 状态，从 Full-H 重建的 Y64/Y32 与 v3 保留表示均 BF16 逐位一致，最大绝对误差 0.0。
-- 六组表示/metadata baseline 各完成 seeds 0/1/2，共 18 个 probe。所有主表示训练 60 epochs 上限、patience 8；每个结果都使用 train/validation/test=590/133/240。
-- 有限 240-state test split 的 digit marginal 并非完美均衡：train 全局多数类 baseline 为 0.1642，按 task 条件为 0.1800，按 task+step 条件为 0.1842；训练得到的 task+step probe 为 0.1819。因此主 retention 使用 `max(task/task+step, theoretical chance)` 的更保守 baseline；同时保留理论 chance=0.1 校正结果。
+---
 
-| 表示 | 五位置平均 accuracy | 五位整串 accuracy | 保守 `R_position` / 相对损失 | 保守 `R_exact` / 相对损失 |
+## 4. Static selector
+
+固定 DOM 语义，不使用 IDF 或数字特殊打分：
+
+- 语义组 `current_state/actions/choices/auxiliary`；
+- 加权轮转 `current_state, actions, current_state, choices, current_state, auxiliary`；
+- **组内**按「文本是否出现在任务指令中」分层（§4.1）；
+- 同一字符 span 重复出现只保留最高优先级候选，最终再做 token-index 去重；
+- `flags/ref/parent/id/classes` 不占用 raw detail；
+- Qwen BPE 长度 `≤8` 的短 span 必须完整保留，预算不足时跳过而非截断；
+- 短 span 处理完后若仍有预算，长 span 顺序池化到剩余槽；
+- invalid slots 补零并保存显式 valid mask。
+
+### 4.1 指令优先
+
+排序只在**组内**进行。跨组轮转是「无论任务问什么，状态都描述了 actions 和 choices」的保证，跨组重排等于拿通用性换任务贴合度。组内重排则是把该组自己的份额花在指令真正点名的控件上。
+
+解码一个真实状态可以直接看到问题：12 个槽里 **3 个花在干扰项 `XKYa` 上**，而 3 个指令目标被挤掉。
+
+计费规则：task instruction 视为 environment-provided side information，对所有模型免费且相同，但 Total Episodic Rate 须单列其成本。
+
+**`--instruction-records` 必须传采集清单**：特征清单里的 `instruction` 是任务无关的固定观察提示（这是 leakage 控制的设计），传错会让候选按错误文本排序而**静默不生效**。
+
+### 4.2 AXTree 曾静默丢掉 52% 的目标
+
+`static_candidates` 的分组规则要求 `text` 挂在 `CHOICE_TAGS`/`ACTION_TAGS` 节点上，或是父节点属于这两类的 `t` 节点。compact DOM 里标签在 `label` 下的 `t` 节点上 → 归入 `choices`；**AXTree 把 name 挂到 `input_checkbox` 自身，没有任何规则接得住 → `group is None`，候选在进入抢槽之前就被整个丢弃**。
+
+`choices` 组候选数从 v7 的 640 变成 **0**。已勾选的 checkbox 因被更早的 `associated_with_checked` 分支救下，故障因此表现为「部分丢失」而非全丢，更难察觉。
+
+修复是一行：`text` 挂在 `CHECKABLE_TAGS` 上时同样归入 `choices`。对 v7 逐项无影响（v7 的 `input_checkbox` 本就没有 `text` 属性）。
+
+---
+
+## 5. 数据（v8）
+
+BrowserGym MiniWoB，12 个任务，10 万状态。
+
+- **任务内容与 Farama 版一致**：BrowserGym 钉在 `7fd85d7`，我们本地在 `eb59fed`，12 个任务 HTML 与 `html/core/` **逐字节无差异**。「非官方移植」指 gym 封装层，不是任务内容。
+- 采集：`--max-steps 7 --random-action-prob 0.5`，脚本级联 + ε 混合策略，与 v7 逐条对齐，使表示差异可归因于观察而非状态分布。实测 scripted 50,181 / random 49,815。
+- 划分：7:2:1 任务分层（70018/20011/9979），每任务 train 比例 0.694–0.705，**零 episode 跨划分、零旧 train 泄漏到 held-out**。
+- 每状态另存 `dom_control`（`flatten_dom_to_str`）与裁剪版 `axtree_raw`（5.3KB/状态，10 万约 0.53GB）。前者使 AXTree-vs-DOM 可在**同一环境内**受控对照；后者使序列化规则的修改变成「重新池化 9 分钟」而非「重采一整轮」。
+
+### 5.1 采集的两个静默失败
+
+**worker 数不得为 5 的倍数。** episode 索引是 `worker_id + k·num_workers`，而 `split_for_episode` 按 `index % 10` 分桶。当 `num_workers` 是 5 的倍数时，每个 worker 只能触及极少数桶，整个 worker——因而整个任务——落进单一划分。下游不会报错，划分文件只是悄悄不再覆盖全部 12 个任务。已加参数校验。
+
+**浏览器消失后会无限空转。** 会话容器重建会清掉 `/tmp` 与 `~/.cache/ms-playwright`。浏览器二进制一旦消失，`env.reset` 永久失败（BrowserGym 的 reset 会先 `self.context.close()`，context 已是 None），而 per-episode 的 `try/except` 把异常吞掉后继续递增索引——**空转 707,739 次，12 个进程满负荷，记录数一条不增**。已加 `--max-consecutive-failures`（默认 20）+ 非零退出码，外层脚本按退出码而非清单文件判断完成。
+
+对策：Chromium 装到 NAS（`browsergym-venv/browsers`），84 个系统 `.so` 固化到 `browsergym-venv/syslibs`，启动脚本设 `PLAYWRIGHT_BROWSERS_PATH` + `LD_LIBRARY_PATH`。采集加 `--resume`：追加模式，按 `(task, episode_index)` 续，**丢弃每个任务的最后一个 episode 重采**（episode 整体 flush，中途被杀会留下不完整的一个）。
+
+> Ubuntu 24.04 的浏览器依赖包名带 `t64` 后缀（`libasound2t64` 等），用旧名会得到 "no installation candidate"。
+
+---
+
+## 6. PCA512 与 Normalization
+
+- PCA 与 normalization **只在 train split 拟合**（`key64_pca fit` 与 `fit_normalization` 均硬性过滤）；
+- PCA：2 万 train 状态，4096 → 512；
+- normalization：group×channel，70,018 train 状态。三个真实组的 scale 分别为 image 0.151–4.054、detail 0.278–6.288、context 0.074–2.166，比值 85.3。
+
+零宽 prompt 组允许存在但 sigma 被钳到下限，是永不被索引的哑值；加载器只对「有槽却无有效数据」的组报错。
+
+### 6.1 layout 被硬编码在五处，全部静默失效过
+
+prompt 槽回收后，`fit_normalization`、`rebuild_static_key64` 的清单、`a0`、`a1`、两个 bottleneck 的默认值**全都继续按 `(32,12,16,4)` 切分**。归一化把 detail 的后 4 个槽当成 prompt 统计，报告了 4890 个「有效 prompt 槽」——而一个异常都没抛。
+
+现在 layout 的单一来源是 `experiments/state_tokenizer/slot_layout.py`（**无第三方依赖**，torch 与 jax 两侧都能 import；`key_pooling` 再导出它以保持既有引用不变）。`residualmem` 不得 import `experiments`，故两侧一致性由 `tests/state_tokenizer/test_slot_layout.py` 断言，该测试刻意不 import torch 或 jax，两个解释器下都能跑。
+
+---
+
+## 7. A1 / A2
+
+架构沿用 A0 论证出的**地址与内容解耦**：
+
+$$K_s=W_K k_s^{slot},\qquad V_{t,s}=W_V\bar x_{t,s}.$$
+
+$k_s^{slot}$ 只依赖 slot index（「从哪里读」），$\bar x_{t,s}$ 只携带当前状态（「读到什么」）；64 个 learned decoder queries 对应 64 个输出 slots。相同 valid mask 下 attention routing 与状态内容无关，invalid keys 被 mask 屏蔽。不使用 group embedding、source-position embedding、输入投影 $W_x$ 或 query self-attention。
+
+训练目标是所有 valid slots、所有 512 通道的自然平均 MSE；group 指标只报告，不做等权 loss。
+
+### 7.1 v8 结果
+
+| | 配置 | 压缩比 | validation R² |
+|---|---|---:|---:|
+| A1 | 16 e-token × 512 | 4.0× | 0.8166 |
+| **A1（在用）** | **64 e-token × 512** | **1.0×** | **0.99891** |
+| **A2** | M=32 子空间，C=256，`--group-weights 1,2,0.5,0.5` | — | **0.8511** |
+
+A2 每状态 16,448 bit（2048 codes × 8 bit + 64 mask bit）。13 项数值门控全过；码本健康：**零坍缩子空间**，活跃类别中位 252/256，perplexity 中位 166.8，dominant share 中位 3.9%。
+
+按组的量化退化 `rho_disc`：**context 50.9 < detail 100.1 < image 217.5**。detail 因 2× 权重被压在 image 的一半以下，加权生效。
+
+**A2 未收敛，是被步数上限截断的**：验证 MSE 单调降到最后一步（step 70000 即最优点），最后 5000 步只降 0.0013，外推再跑一倍步数约到 R² 0.865。无过拟合迹象（验证 MSE 从未回升），码本 perplexity 仍在缓慢上升。
+
+**当前 A1 不是瓶颈**：64×512 → 64×512 是同维自编码器，R²=0.9989 即恒等映射。因此「A1 作为量化前的连续上界」目前是空命题，全部压缩都发生在 A2 的量化。见 §10 待办。
+
+### 7.2 A1 里藏着一个已在 A2 修过的 XLA 缺陷
+
+```python
+@jax.jit
+def loss_and_grad(current, index):
+    return jax.value_and_grad(loss_fn)(
+        current, train.xbar_device[index], train.valid_device[index])   # 闭包取批
+```
+
+`train.xbar_device` 通过闭包进入 jit，使**整个 train 划分成为编译图的操作数**。7,013 个状态时是 0.92GB 可以编译；70,018 个是 9.18GB，XLA 在 `backend_compile` 段错误，**且无任何 Python 层报错**——日志里只有 fault handler 的栈。
+
+修法：批次作为**参数**传入，gather 在 jit 之外（`take_batch`）。A2 早已如此，A1 漏了。
+
+### 7.3 A1 与 A2 的 e-token 数必须匹配
+
+A1 默认 `--num-e-tokens 16`，A2 默认 64。不匹配时 `load_a1_warm_start` 报 `encoder/e_queries has shape (16,512), expected (64,512)`。A2 用 `--init-a1-checkpoint`（不是 `--init-checkpoint`，后者是 A2 自身的续训入口）。
+
+---
+
+## 8. 门控结果（v8 vs v7）
+
+判据由两项**同时**构成：目标**字面存在性**与 target→element **绑定**，只有前者改善而后者不动视为失败——那说明只优化了 bag of words，agent 仍然不知道该点哪个控件。
+
+### 8.1 字面存在性（免模型）
+
+`target_slot_coverage`：指令目标的字符是否被 raw detail 槽完整覆盖。不依赖任何词表或模型。
+
+| 配置 | 覆盖率 |
+|---|---:|
+| v7（compact DOM，12 槽） | 0.7214 |
+| v8 AXTree 初版 | 0.3423 |
+| + `choices` 分组修复 | 0.7032 |
+| + 指令优先 | 0.8655 |
+| **+ 16 槽（回收 prompt）** | **0.9578** |
+
+`click-option` **1668/1668 满分**；`click-checkboxes` 3489/3716。
+
+### 8.2 绑定
+
+`binding_probe`：$P(\text{ref}\mid x_t, T, \text{target literal})$。
+
+| | v7 (DOM) | v8 (AXTree) |
+|---|---:|---:|
+| 条件探针 | 0.7935 ± 0.030 | 0.7476 ± 0.048 |
+| `literal_ablated`（字面清零对照） | 0.6463 | **0.2877** |
+| `random_guess` | 0.1115 | 0.1103 |
+| 相对对照的增量 | +0.147 | **+0.460** |
+| **对照校正后** | 0.416 | **0.646** |
+
+**raw 数字 v8 略低，但这个比较是误导性的。** v7 的探针不给字面输入也能答对 64.6%，说明那 0.7935 里的绝大部分不是绑定能力，而是「从状态本身猜哪些 ref 通常是目标」。v8 去掉字面后掉到 0.2877（接近随机 0.1103），说明其 0.7476 几乎全部来自真正读懂了字面与元素的对应。
+
+`dom_oracle` 按构造恒为 1.0，是**上界与标签合理性检查**，不是 baseline。
+
+### 8.3 重建保真度（frozen probe，探针只在 clean 上训练）
+
+| 指标 | clean | A1 | A2 | R_disc(A2\|A1) |
 |---|---:|---:|---:|---:|
-| Full-H | 0.8917 ± 0.0242 | 0.6569 ± 0.0428 | 1.0000 / 0% | 1.0000 / 0% |
-| task-ID-only | 0.1767 ± 0.0090 | 0.0000 ± 0.0000 | metadata baseline | metadata baseline |
-| task+step | 0.1819 ± 0.0005 | 0.0000 ± 0.0000 | 最强 metadata baseline | metadata baseline |
-| Y64 | 0.6414 ± 0.0092 | **0.3722 ± 0.0127** | **0.6474 / 35.26%** | **0.5666 / 43.34%** |
-| Y32 | 0.6281 ± 0.0133 | 0.3417 ± 0.0042 | **0.6286 / 37.14%** | **0.5201 / 47.99%** |
-| Y64→PCA512 | **0.6856 ± 0.0010** | 0.3514 ± 0.0048 | **0.7096 / 29.04%** | **0.5349 / 46.51%** |
+| **value exact** | 0.9963 | 0.9965 | **0.9357** | 0.9390 |
+| value position | 0.9991 | 0.9992 | 0.9849 | 0.9841 |
+| dynamic AP | 0.9812 | 0.9808 | 0.9655 | 0.9747 |
+| task accuracy | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
 
-- 相对 Full-H 的绝对五位置 accuracy drop：Y64=0.2503、Y32=0.2636、PCA512=0.2061；严格整串 accuracy drop 分别为 0.2847、0.3153、0.3056。
-- 仅用理论随机 chance=0.1 校正时，`R_position` 为 Y64=0.6839、Y32=0.6670、PCA512=0.7396；比保守结果略高，但排序和结论不变。
-- 固定 prompt 结果与旧 task-instruction value-only 结果非常接近：旧 Full-H/Y64/Y32/PCA512 五位置 accuracy 为 0.8806/0.6436/0.6336/0.6978，新结果为 0.8917/0.6414/0.6281/0.6856。由此确认此前观察到的 random value 损失不是 instruction 泄漏造成的。
-- PCA512 在逐位 accuracy 上最好，说明降维/去噪提高了有限数据下单 query reader 的线性可读性；但严格整串 accuracy 为 0.3514，低于 Y64 的 0.3722，因此不能宣称 PCA 保留了更多原始信息。
-- 最终结论：固定分段池化已经造成主要精确 value 损失；64→32 槽只带来较小附加损失。按更保守 metadata 校正，Y64/Y32/PCA512 的逐位能力分别损失约 35%/37%/29%，严格整串能力损失约 43%/48%/47%。
+v7 累计 M32 的 value exact 为 0.7890，v8 为 **0.9357**。
 
-### 最终审计与清理
-
-- 963-state manifest SHA256=`84bfaa9fb393db105db35a68316aaaf930b33281be1a4c5b761a0987a56a3bce`；18 份 result JSON 的 fixed-prompt protocol、representation、seed、split 样本数、reader 配置和 `value_only` objective 全部一致。
-- v3.1 日志未发现 traceback、OOM、RuntimeError、ValueError、AssertionError 或 NaN；19 项 state-tokenizer 测试全部通过。
-- 已删除约 3.56 GiB 可重建临时 Full-H 与 18 个 probe checkpoint；保留 18 份 result JSON、聚合 JSON、CSV、fixed-prompt Y64/Y32/PCA512 与全部日志。
-- 机器可读聚合：`outputs/state_tokenizer/metrics/v3/fixed_value/aggregate-fixed-value.json`；简表：`outputs/state_tokenizer/metrics/v3/fixed_value/fixed-value-summary.csv`。
+**结论：本轮通过。** 字面 0.7214→0.9578，绑定（对照校正）0.416→0.646，两项都改善且无退化项。
 
 ---
 
-## 2026-08-03：v3.2 Fixed-Prompt Token Hidden States 精确 Value
+## 9. 量具失效清单
 
-### 协议与实现
+本节记录**测量本身骗过我**的情形。这类问题比代码 bug 更贵：它们不报错，只给出一个看起来合理的数字。
 
-- 将 fixed observation prompt 的 29 个 contextual hidden states 作为独立压缩表示，使用与 v3.1 完全相同的 963-state manifest、590/133/240 split、单-query reader、value-only loss、seeds 0/1/2 和 Full-H oracle。
-- 新增 `--instruction-only-cache` 紧凑提取模式：Qwen 前向和 layer-16 token 数值不变，但只落盘 29 个 prompt token hidden states，不保存 image/DOM tokens 或重复的 Y64/Y32。
-- 4-state 冒烟测试和 963-state 正式缓存审计均通过；每个状态恰好 29×4096 BF16，三种 modality 长度记为 `[0,0,29]`，现有 `RaggedFullHStore`/instruction-only reader 可直接读取。
-- 相关测试增至 21 项并全部通过；脚本通过 `py_compile`。
+**9.1 `key64-static-detail-ranges` 存的是 token 索引，不是字符偏移。** 拿它切原文得到 `'0'`、`' '`、`'t'` 这类单字符，覆盖率算出 0.0066。必须先经 `dom_token_offsets` 换算。
 
-### 提取与压缩规模
+**9.2 raw literal 槽逐 token 发槽。** 一个多 token 目标（`s6WcI`）横跨数个槽，逐槽比较会把它判成缺席。必须先把覆盖的字符位置并成掩码再判断。曾据此错误宣称「70% 的 detail 槽装碎片」，按 span 合并后实为 7.7%。
 
-- 双卡提取完成 963/963，GPU 0/1 分别处理 482/481 状态，墙钟 97.17/96.53 秒，速率 4.960/4.983 states/s。
-- 共缓存 27,927 个 token，逻辑 BF16 大小 0.213 GiB，即每状态 232 KiB。
-- 同一 value subset 的 Full-H 平均为 484.30 token/状态、约 3.784 MiB/状态；29-token 表示减少 94.01% token/字节，压缩率约 16.70×。它也比 Y64 的 512 KiB/状态更小约 2.21×。
+**9.3 `binding_probe` 的 `MAX_REF = 24` 是按 MiniWoB ref 范围硬编码的。** v7 的 ref 最大 17，BrowserGym 的 bid 到 36，**48.3% 的可点击元素被静默丢弃**，样本从 5384 掉到 2741。探针在残缺候选集上训练，得到 probe 0.5195 / ablated 0.5217——读起来像「绑定完全失效」，实为标签被截断。现已从数据推导 `max_ref`，且截断直接报错。
 
-### 精确随机 Value 结果
+**9.4 `overlap_words` 在 10 万规模下失效。** episode-target 桶（prevalence < 0.05）里 17 个标签 prevalence 恰为 0（autocomplete 的国家名进了 train 词表却没出现在 validation，零正例的 AP 是退化的），其余是 `cancel`/`ok`/`yes`/`and` 这类虚词。**真正的目标标签是每 episode 随机生成的字符串，永远不可能进入在 train 上拟合的词表。** v7 时代 `prevalence < 0.05` 这个启发式能凑效属于偶然（3000 个 validation 状态、词表更小，`bg`/`jt` 碰巧复现）。字面存在性改用 §8.1 的免词表量具。
 
-| 表示 | 五位置平均 accuracy | 五位整串 accuracy | 保守 `R_position` | 理论 chance 校正 `R_position` | `R_exact` |
-|---|---:|---:|---:|---:|---:|
-| Full-H | 0.8917 ± 0.0242 | 0.6569 ± 0.0428 | 1.0000 | 1.0000 | 1.0000 |
-| task+step baseline | 0.1819 ± 0.0005 | 0.0000 | baseline | — | baseline |
-| fixed-prompt 29-token hidden states | **0.1625 ± 0.0051** | **0.0000 ± 0.0000** | **0.0000** | **0.0789** | **0.0000** |
+**9.5 探针的对照组必须与探针一起训练。** `literal_ablated` 是重新训一个字面清零的探针，不是把已训探针的输入置零——后者是分布外扰动，测到的下降分不清是「信息缺失」还是「输入异常」。
 
-- 三个 seed 的逐位 accuracy 分别为 0.1658/0.1650/0.1567；五位整串全对均为 0。
-- 该表示比 Full-H 绝对下降 0.7292 个逐位 accuracy、下降 0.6569 个整串 accuracy。其逐位结果低于 task+step metadata baseline，因此保守 baseline-adjusted raw retention 为 -0.0274，按“无可检测增益”截断为 0；只减理论 digit chance=0.1 时 retention 也仅为 0.0789，即损失 92.11%。
-- 这与 v3 动态状态结果形成清楚对照：同样 29 个 contextual prompt tokens 能很好表达 checked/focused/nonempty 等粗粒度属性，却几乎不保留具体五位随机文本。动态 probe 的高分不能外推为状态表示在精确内容上信息充分。
-- 因此 fixed-prompt token hidden states 不适合作为需要精确 value 的 State Tokenizer；Y64/Y32/PCA512 虽有明显损失，但仍远强于该 29-token 摘要。
+**9.6 目标提取的语法边界。** `choose-list` 的指令是 `"Select Ertha from the list..."`，粗糙正则会把 `from`/`the`/`list` 当成目标；`form-sequence` 的目标是滑块值与序数位置（`"the 3rd checkbox"`），根本不是元素标签。绑定量具只适用于 `click-checkboxes` 与 `click-option`。
 
-### 审计与清理
+**9.7 `dom.find` 会先命中别处子串。** 判断目标是否在文本中必须遍历所有出现位置。曾据此错误宣称「60.5% 的目标缺席」，实为 22.4%。
 
-- 三份 instruction-only result JSON 的 fixed-prompt protocol、seeds、590/133/240 样本数、reader 配置和 value-only objective 均一致；总结果集现为 21 份 JSON。
-- instruction-only 提取和 probe 日志未发现 traceback、OOM、RuntimeError、ValueError、AssertionError 或 NaN。
-- 已删除约 218 MiB 正式紧凑缓存、4-state 冒烟目录和 3 个新增 checkpoint；保留三份 result JSON、更新后的聚合 JSON/CSV 与日志。
+---
+
+## 10. 待办
+
+**A1 是否应当真正压缩。** 当前 64×512 → 64×512 的 A1 是恒等映射，「连续上界」是空命题；整条链的压缩全部由 A2 的量化承担。已有两个数据点（1×→0.9989，4×→0.8166），缺中间点。这个实验决定的不是「换个配置」，而是 **A1 这一阶段在管线里是否站得住**——若 A1@64 确为恒等，则 A2 直接量化归一化后的 PCA 应给出相同结果，那样 A1 就是纯粹的死重。建议同时跑 A2-without-A1 作为对照。
+
+**A2 延长训练。** 当前是被步数截断的下界，非能力上限。是否值得取决于 value exact 0.9357 是否够用。
+
+**同环境 AXTree-vs-DOM 受控对照。** `dom_control` 已在采集时存好，只差一次抽取。这是把「AXTree 更好」从跨环境比较升级为受控消融的唯一途径（v7/v8 的图像模态本就不可比：截图 160×210 vs 498×321）。
+
+**World Model。** $p(y_{t+1}\mid y_{\le t}, u_{\le t})$。注意：终止步的记录也带 `action`（那个导致终止的动作），但其后继状态从未被记录，**构造转移必须按 `(episode_id, step+1)` 存在来 join**，只看 `action` 非空会高估转移数。
+
+---
+
+## 11. 实现与产物
+
+**layout 单一来源**
+
+- `experiments/state_tokenizer/slot_layout.py`（无第三方依赖，两侧共享）
+
+**采集（browsergym-venv）**
+
+- `experiments/state_tokenizer/collect_browsergym.py`（v7 的 `collect_miniwob.py` 保留不动）
+- `scripts_v8_collect.sh`（自愈循环 + 持久化浏览器路径）
+
+**表示（MemCompiler / torch）**
+
+- `common.py`（`compact_axtree`、`axtree_rows`、`derive_probe_labels_axtree`）
+- `key_pooling.py` / `static_key_pooling.py` / `rebuild_static_key64.py`
+- `merge_records.py`（写 `global_index` = 合并清单行号，抽取链的唯一约定）
+- `build_split_721.py`（`--extracted` 现为可选，供全新数据线使用）
+- `fit_normalization.py` / `key64_pca.py`
+- `filler_vocabulary.py`（**放在 tokenizer 侧**，因 `residualmem/encoders/__init__` 会传递引入 jax）
+
+**瓶颈（ResidualMem / jax）**
+
+- `residualmem/world_model/continuous_bottleneck.py` / `categorical_bottleneck.py`
+- `experiments/state_tokenizer/a1_continuous_bottleneck.py` / `a2_categorical_bottleneck.py`
+
+**评测**
+
+- `target_slot_coverage.py`（免词表的字面存在性，§8.1）
+- `binding_probe.py`（target→element 绑定，§8.2）
+- `semantic_eval.py` / `slot_probe.py` / `reconstruct_store.py`
+- `tests/run_tests.py`（pytest 替身；**放在仓库内**，因 `/tmp` 不跨会话存活）
+
+**数据**
+
+```
+outputs/state_tokenizer/v8/
+  records-merged.jsonl      10 万采集记录（含 axtree_raw / dom_control）
+  full-721.jsonl            7:2:1 划分 + global_index + 固定观察提示
+  full-721-v2.jsonl         + v2 probe 标签
+  features/                 78G  extract_qwen 基础特征
+  full-h/                   420G Full-H（**进槽规则定稿前保留**）
+  static_features/          55G  Static Key64 + PCA
+  key64-static-pca.npz / key64-static-pca-normalization.npz
+outputs/a1/v8 + v8.npz
+outputs/a2/v8-m32-gw + v8-m32-gw.npz
+outputs/semantic_eval/v8_gate.json / v8_binding_clean.json / v8_target_raw_coverage_d16.json
+```
+
+保留 Full-H 的理由：本轮三次修改（分组规则、指令优先、layout）**每次都只需重新池化 9 分钟**，而重跑抽取要 1 小时。
+
+**GPU 与 CPU 的选择**：`rebuild_static_key64` 在 CPU 上 0.39 states/s，GPU 上 72.6 states/s（**185×**）。10 万状态从 7 小时降到 9 分钟。
+
+**`kernels` 未安装**：`extract_qwen`/`extract_fixed_prompt` 必须传 `--no-use-kernels`，否则 transformers 5.8.1 直接拒绝启动。

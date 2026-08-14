@@ -1,0 +1,45 @@
+# LEGACY ONLY: v4 RSSM / obsolete (32,12,16,4) layout.
+# Do not use this file for the frozen v8 discrete WM evidence gate. Its only
+# supported v8 entry point is configs/world_model/v8_discrete.yaml.
+status: legacy_v4_do_not_run_for_v8
+seed: 0
+domain: web
+
+action_values: 64
+
+front_end:
+  kind: key64_static_pca
+  protocol: fixed_prompt_key64_static_v2
+  num_tokens: 64
+  token_dim: 512
+  layout: [32, 12, 16, 4]
+  normalization: group_channel_train_v1
+  normalization_artifact: outputs/state_tokenizer/v4/key64-static-pca-normalization.npz
+  pca_artifact: outputs/state_tokenizer/v4/key64-static-pca.npz
+  invalid_slots_after_normalization: zero
+
+latent:
+  num_groups: 32
+  num_categories: 32
+
+world_model:
+  architecture: slot_transformer_rssm
+  hidden_size: 512
+  embed_size: 256
+  post_hidden: 256
+  posterior_heads: 4
+  decoder_hidden: 512
+  kl_beta: 1.0
+  kl_free_bits: 0.1
+  reconstruction_space: xbar
+  reconstruction_group_sizes: [32, 12, 16, 4]
+  reconstruction_group_weights: [0.25, 0.25, 0.25, 0.25]
+  reconstruction_valid_mask: true
+  teacher_epochs: 40
+  closed_loop_epochs: 10
+  segment_length: 64
+
+notation:
+  x_t: raw_key64_static_pca
+  xbar_t: fixed_group_channel_normalized_state
+  z_t: grouped_categorical_stochastic_latent
