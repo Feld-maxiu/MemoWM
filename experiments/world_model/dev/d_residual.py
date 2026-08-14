@@ -22,6 +22,7 @@ channel.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import time
 
@@ -128,11 +129,31 @@ def evaluate(cache, rows, params, loss_fn, batch_size, log_prior):
     }
 
 
+def apply_budget(config, args):
+    """Override the training budget.
+
+    ``build_optimizer`` decays the cosine schedule over ``training.max_steps``,
+    so raising only the loop bound would leave the learning rate annealed to
+    zero at the old horizon and the extra steps would be wasted. The schedule
+    and the loop must move together.
+    """
+    training = dataclasses.replace(
+        config.training,
+        max_steps=args.max_steps,
+        patience_steps=args.patience_steps,
+        eval_every=args.eval_every,
+    )
+    if training.patience_steps % training.eval_every:
+        raise ValueError("patience_steps must be a multiple of eval_every")
+    return dataclasses.replace(config, training=training)
+
+
 def run(args: argparse.Namespace) -> dict:
     jax.config.update("jax_default_matmul_precision", "highest")
     device = jax.devices(args.platform)[args.device_index]
     cache = FrozenCache(args.cache)
     config = load_config(args.config, num_tasks=len(cache.task_names))
+    config = apply_budget(config, args)
     train_rows = cache.indices_for_split("train")
     fit_rows, dev_rows = episode_split(cache, train_rows, args.fit_fraction, args.seed)
 
@@ -164,33 +185,52 @@ def run(args: argparse.Namespace) -> dict:
 
     sampler = DeterministicSampler(fit_rows, config.training.batch_size, args.seed)
     key = jax.random.PRNGKey(args.seed)
+    training = config.training
     history = []
     best = dict(initial)
     best_step = 0
-    for step in range(1, args.steps + 1):
+    since_improvement = 0
+    stop_reason = "max_steps"
+    step = 0
+    for step in range(1, training.max_steps + 1):
         batch = cache.batch(sampler.next())
         device_batch = {name: jnp.asarray(batch[name]) for name in MODEL_KEYS}
         key, subkey = jax.random.split(key)
         params, opt_state = update(
             params, opt_state, device_batch, subkey, log_prior
         )
-        if step % args.eval_every == 0 or step == args.steps:
-            metrics = evaluate(
-                cache, dev_rows, params, eval_loss,
-                config.evaluation.batch_size, log_prior,
-            )
-            metrics["step"] = step
-            metrics["learning_rate"] = float(schedule(step))
-            history.append(metrics)
-            if metrics["code_bits_per_transition"] < best["code_bits_per_transition"]:
-                best, best_step = dict(metrics), step
-            print(json.dumps(metrics, sort_keys=True), flush=True)
+        if step % training.eval_every and step != training.max_steps:
+            continue
+        metrics = evaluate(
+            cache, dev_rows, params, eval_loss,
+            config.evaluation.batch_size, log_prior,
+        )
+        metrics["step"] = step
+        metrics["learning_rate"] = float(schedule(step))
+        history.append(metrics)
+        if metrics["code_bits_per_transition"] < best["code_bits_per_transition"]:
+            best, best_step, since_improvement = dict(metrics), step, 0
+        else:
+            since_improvement += training.eval_every
+        print(json.dumps(metrics, sort_keys=True), flush=True)
+        # A run that ends on max_steps is budget-truncated and its number is an
+        # upper bound, not a converged value.
+        if step >= training.min_steps and since_improvement >= training.patience_steps:
+            stop_reason = "patience"
+            break
 
     return {
         "diagnostic": "source_plus_neural_residual",
         "variant": args.variant,
         "seed": args.seed,
-        "steps": args.steps,
+        "budget": {
+            "max_steps": config.training.max_steps,
+            "patience_steps": config.training.patience_steps,
+            "eval_every": config.training.eval_every,
+            "steps_ran": step,
+            "stop_reason": stop_reason,
+            "budget_truncated": stop_reason == "max_steps",
+        },
         "split": {
             "basis": "train episodes, task-stratified",
             "fit_transitions": int(len(fit_rows)),
@@ -213,7 +253,8 @@ def build_parser() -> argparse.ArgumentParser:
         "state_only", "struct_no_history", "no_history",
     ))
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--max-steps", type=int, default=20000)
+    parser.add_argument("--patience-steps", type=int, default=10000)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
     parser.add_argument("--platform", default="gpu")

@@ -38,7 +38,7 @@ from ..config import load_config
 from ..model import codelength_bits, initialize_params, parameter_count, predict
 from ..train import DeterministicSampler, build_optimizer
 from .artifacts import dev_path, write_dev_json
-from .d_residual import MODEL_KEYS, episode_split
+from .d_residual import MODEL_KEYS, apply_budget, episode_split
 
 HEADS = ("tied", "untied", "tied_copy", "untied_copy")
 
@@ -98,6 +98,7 @@ def run(args: argparse.Namespace) -> dict:
     device = jax.devices(args.platform)[args.device_index]
     cache = FrozenCache(args.cache)
     config = load_config(args.config, num_tasks=len(cache.task_names))
+    config = apply_budget(config, args)
     fit_rows, dev_rows = episode_split(
         cache, cache.indices_for_split("train"), args.fit_fraction, args.seed
     )
@@ -119,30 +120,49 @@ def run(args: argparse.Namespace) -> dict:
 
     sampler = DeterministicSampler(fit_rows, config.training.batch_size, args.seed)
     key = jax.random.PRNGKey(args.seed)
+    training = config.training
     started = time.time()
     history, best, best_step = [], dict(initial), 0
-    for step in range(1, args.steps + 1):
+    since_improvement = 0
+    stop_reason = "max_steps"
+    step = 0
+    for step in range(1, training.max_steps + 1):
         batch = cache.batch(sampler.next())
         device_batch = {name: jnp.asarray(batch[name]) for name in MODEL_KEYS}
         key, subkey = jax.random.split(key)
         params, opt_state = update(params, opt_state, device_batch, subkey)
-        if step % args.eval_every == 0 or step == args.steps:
-            metrics = evaluate(
-                cache, dev_rows, params, eval_loss, config.evaluation.batch_size
-            )
-            metrics["step"] = step
-            metrics["learning_rate"] = float(schedule(step))
-            history.append(metrics)
-            if metrics["code_bits_per_transition"] < best["code_bits_per_transition"]:
-                best, best_step = dict(metrics), step
-            print(json.dumps(metrics, sort_keys=True), flush=True)
+        if step % training.eval_every and step != training.max_steps:
+            continue
+        metrics = evaluate(
+            cache, dev_rows, params, eval_loss, config.evaluation.batch_size
+        )
+        metrics["step"] = step
+        metrics["learning_rate"] = float(schedule(step))
+        history.append(metrics)
+        if metrics["code_bits_per_transition"] < best["code_bits_per_transition"]:
+            best, best_step, since_improvement = dict(metrics), step, 0
+        else:
+            since_improvement += training.eval_every
+        print(json.dumps(metrics, sort_keys=True), flush=True)
+        # A run that ends on max_steps is budget-truncated: its number is an
+        # upper bound, not a converged value.
+        if step >= training.min_steps and since_improvement >= training.patience_steps:
+            stop_reason = "patience"
+            break
 
     return {
         "diagnostic": "head_bakeoff",
         "head": args.head,
         "variant": args.variant,
         "seed": args.seed,
-        "steps": args.steps,
+        "budget": {
+            "max_steps": config.training.max_steps,
+            "patience_steps": config.training.patience_steps,
+            "eval_every": config.training.eval_every,
+            "steps_ran": step,
+            "stop_reason": stop_reason,
+            "budget_truncated": stop_reason == "max_steps",
+        },
         "parameter_count": int(parameter_count(params)),
         "split": {
             "basis": "train episodes, task-stratified",
@@ -165,7 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head", required=True, choices=HEADS)
     parser.add_argument("--variant", default="struct_no_history")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=20000)
+    parser.add_argument("--max-steps", type=int, default=20000)
+    parser.add_argument("--patience-steps", type=int, default=10000)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
     parser.add_argument("--platform", default="gpu")
