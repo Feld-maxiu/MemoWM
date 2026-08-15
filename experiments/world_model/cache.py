@@ -25,6 +25,7 @@ from .schema import (
     CACHE_FORMAT_VERSION,
     MAX_HISTORY,
     MAX_PAYLOAD_BYTES,
+    MAX_TARGET_BYTES,
     NUM_CATEGORIES,
     NUM_LATENT_TOKENS,
     NUM_OBSERVATION_SLOTS,
@@ -84,7 +85,10 @@ def _minimal_records(path: str | Path) -> tuple[list[_Record], dict[str, int]]:
             raise ValueError(f"row {row} has missing or duplicate state_id {state_id!r}")
         seen_states.add(state_id)
         action = raw.get("action")
-        needs_tree = isinstance(action, dict) and action.get("type") == "SELECT_OPTION"
+        # The dom is now read for every action, not just SELECT_OPTION: it is the
+        # only source of the target element's accessible name, which is absent
+        # from action.text for 100% of CLICKs (71.7% of all actions).
+        needs_tree = isinstance(action, dict)
         records.append(_Record(
             global_index=index,
             task=str(raw["task"]),
@@ -144,7 +148,10 @@ def build_transition_archive(
     action_payloads = []
     action_lengths = []
     action_policies = []
+    action_targets = []
+    action_target_lengths = []
     structural_bits = []
+    semantic_bits = []
     full_action_bits = []
     counts: Counter[str] = Counter()
 
@@ -179,6 +186,7 @@ def build_transition_archive(
             padded_actions: list[Action | None] = [None] * pad + prefix_actions
             type_row, tag_row, ref_row = [], [], []
             payload_row, length_row, policy_row = [], [], []
+            target_row, target_length_row = [], []
             for action in padded_actions:
                 if action is None:
                     type_row.append(ACTION_TYPE_IDS["PAD"])
@@ -187,6 +195,8 @@ def build_transition_archive(
                     payload_row.append(np.zeros((MAX_PAYLOAD_BYTES,), np.uint8))
                     length_row.append(0)
                     policy_row.append(255)
+                    target_row.append(np.zeros((MAX_TARGET_BYTES,), np.uint8))
+                    target_length_row.append(0)
                 else:
                     type_row.append(action.type_id)
                     tag_row.append(action.tag_id)
@@ -194,6 +204,8 @@ def build_transition_archive(
                     payload_row.append(action.padded_payload())
                     length_row.append(action.payload_length)
                     policy_row.append(action.policy_id)
+                    target_row.append(action.padded_target())
+                    target_length_row.append(action.target_length)
 
             action_types.append(type_row)
             action_tags.append(tag_row)
@@ -201,6 +213,8 @@ def build_transition_archive(
             action_payloads.append(payload_row)
             action_lengths.append(length_row)
             action_policies.append(policy_row)
+            action_targets.append(target_row)
+            action_target_lengths.append(target_length_row)
             target_indices.append(target.global_index)
             out_task_ids.append(task_ids[current.task])
             out_episode_ids.append(episode_ids[episode_name])
@@ -211,9 +225,12 @@ def build_transition_archive(
             structural_bits.append(
                 action_side_information_bits(current_action, include_payload=False)
             )
-            full_action_bits.append(
-                action_side_information_bits(current_action, include_payload=True)
-            )
+            semantic_bits.append(action_side_information_bits(
+                current_action, include_target=True, include_payload=False
+            ))
+            full_action_bits.append(action_side_information_bits(
+                current_action, include_target=True, include_payload=True
+            ))
 
     actual_counts = {name: int(counts[name]) for name in SPLITS}
     _assert_expected(actual_counts, expected_counts, "transition")
@@ -230,12 +247,16 @@ def build_transition_archive(
         "action_payloads": np.asarray(action_payloads, np.uint8),
         "action_lengths": np.asarray(action_lengths, np.uint8),
         "action_policies": np.asarray(action_policies, np.uint8),
+        "action_targets": np.asarray(action_targets, np.uint8),
+        "action_target_lengths": np.asarray(action_target_lengths, np.uint8),
         "structural_action_bits": np.asarray(structural_bits, np.uint16),
+        "semantic_action_bits": np.asarray(semantic_bits, np.uint16),
         "full_action_bits": np.asarray(full_action_bits, np.uint16),
     }
     expected_shapes = {
         "history_indices": (len(target_indices), MAX_HISTORY),
         "action_payloads": (len(target_indices), MAX_HISTORY, MAX_PAYLOAD_BYTES),
+        "action_targets": (len(target_indices), MAX_HISTORY, MAX_TARGET_BYTES),
     }
     for name, shape in expected_shapes.items():
         if arrays[name].shape != shape:

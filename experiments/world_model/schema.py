@@ -79,6 +79,61 @@ _ROW_RE = re.compile(
     r"tag=(?P<tag>[^\s/>]+)"
 )
 
+# Same rows, but keeping the attribute tail so target semantics can be read out.
+_NODE_RE = re.compile(
+    r"<ref=(-?\d+)\s+parent=(-?\d+)\s+tag=([^\s/>]+)([^>]*)/>"
+)
+_TEXT_RE = re.compile(r'\stext="([^"]*)"')
+
+# The element's own text; else a child's (checkbox/option wrapped in a label);
+# else a sibling input's (autocomplete, where the label is empty and the field
+# carries the caption). Measured recoverability across 599 CLICK/label samples:
+# 76%. The remaining 24% is login-user, whose label text is absent from the
+# serialisation entirely -- label, sibling input and raw AXTree name are all
+# empty -- so it cannot be recovered without regenerating the dom.
+MAX_TARGET_BYTES = 40
+
+
+def parse_dom_nodes(compact: str) -> dict[int, tuple[int, str, str]]:
+    """``ref -> (parent, tag, attribute tail)``."""
+    nodes: dict[int, tuple[int, str, str]] = {}
+    for match in _NODE_RE.finditer(compact or ""):
+        nodes[int(match.group(1))] = (
+            int(match.group(2)), match.group(3), match.group(4)
+        )
+    return nodes
+
+
+def _node_text(attributes: str) -> str:
+    found = _TEXT_RE.search(attributes or "")
+    return found.group(1) if found else ""
+
+
+def extract_target_text(compact: str, ref: int) -> str:
+    """Accessible name of the element acted on -- four-level fallback.
+
+    ``ref`` must already be the ref that was actually acted on (for
+    SELECT_OPTION that is the parent ``select``, not the option).
+    """
+    nodes = parse_dom_nodes(compact)
+    if ref not in nodes:
+        return ""
+    parent, _tag, attributes = nodes[ref]
+    own = _node_text(attributes)
+    if own:
+        return own
+    for child_ref, (child_parent, _t, child_attributes) in nodes.items():
+        if child_parent == ref and child_ref != ref:
+            text = _node_text(child_attributes)
+            if text:
+                return text
+    for sibling_ref, (sibling_parent, tag, sibling_attributes) in nodes.items():
+        if sibling_parent == parent and sibling_ref != ref and tag.startswith("input"):
+            text = _node_text(sibling_attributes)
+            if text:
+                return text
+    return ""
+
 
 @dataclasses.dataclass(frozen=True)
 class Action:
@@ -89,10 +144,23 @@ class Action:
     ref: int
     payload: bytes
     policy_id: int
+    # Which element was acted on. Kept separate from payload -- which says what
+    # was applied to it -- so G_semantic and G_payload stay separable.
+    target: bytes = b""
 
     @property
     def payload_length(self) -> int:
         return len(self.payload)
+
+    @property
+    def target_length(self) -> int:
+        return len(self.target)
+
+    def padded_target(self) -> np.ndarray:
+        output = np.zeros((MAX_TARGET_BYTES,), np.uint8)
+        if self.target:
+            output[: len(self.target)] = np.frombuffer(self.target, np.uint8)
+        return output
 
     def padded_payload(self) -> np.ndarray:
         output = np.zeros((MAX_PAYLOAD_BYTES,), np.uint8)
@@ -167,21 +235,38 @@ def canonicalize_action(
     policy = str(raw.get("policy", ""))
     if policy not in POLICY_IDS:
         raise ValueError(f"unsupported collection policy {policy!r}")
+    # Extracted after the SELECT_OPTION ref has been resolved to its parent
+    # select, so the target describes the control rather than the chosen option.
+    target = extract_target_text(compact_axtree, ref).encode("utf-8")
+    if len(target) > MAX_TARGET_BYTES:
+        target = target[:MAX_TARGET_BYTES]
+        while target and (target[-1] & 0xC0) == 0x80:  # keep valid UTF-8
+            target = target[:-1]
     return Action(
         type_id=ACTION_TYPE_IDS[kind],
         tag_id=TAG_IDS[tag],
         ref=ref,
         payload=payload,
         policy_id=POLICY_IDS[policy],
+        target=target,
     )
 
 
-def action_side_information_bits(action: Action, *, include_payload: bool) -> int:
-    """Fixed audit serialization from the frozen evidence-gate plan."""
-    structural = 2 + 3 + 6  # type, tag, ref
-    if not include_payload:
-        return structural
-    return structural + 6 + 8 * action.payload_length
+def action_side_information_bits(
+    action: Action, *, include_payload: bool, include_target: bool = False
+) -> int:
+    """Fixed audit serialization from the frozen evidence-gate plan.
+
+    ``target`` is billed on the same terms as ``payload``: it is enriched action
+    metadata that must be transmitted, not a free oracle.
+    """
+    structural = 2 + 3 + 6
+    total = structural
+    if include_target:
+        total += 6 + 8 * action.target_length
+    if include_payload:
+        total += 6 + 8 * action.payload_length
+    return total
 
 
 def validate_variant(variant: str, *, allow_dev: bool = False) -> str:
