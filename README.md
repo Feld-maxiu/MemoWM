@@ -204,6 +204,14 @@ PYTHONPATH=. $JX tests/run_tests.py tests/state_tokenizer/test_slot_layout.py
 
 `pkill -f <pattern>` 会匹配到发起它的 shell 自身（退出码 144）。用 `ps aux | grep "[p]attern"` 取 PID 再 kill。
 
+**同一个坑也会咬等待器。** `while pgrep -f 'dev.d_head_bakeoff'; do sleep 60; done`
+永远不会退出 —— 等待器自己的命令行里就含该字符串，`pgrep` 一直匹配得到。曾因此
+留下两个空转 7 小时的 shell。等待自己起的进程结束时一律用括号写法：
+
+```sh
+while ps aux | grep -q "[d]ev\.d_head_bakeoff"; do sleep 60; done
+```
+
 ---
 
 ## 最终配置
