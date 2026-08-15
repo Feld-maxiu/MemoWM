@@ -534,3 +534,71 @@ cosine 到 240k 才退零，best 落在 104k 后被高 LR 拖住。**7700.40 属
 容量收益递减，转做**动作语义重建**（§12 F6/F7）：72% 的数据（全部 CLICK）
 payload 通道为零，`ref` 又非稳定元素身份 —— 这不是加容量能解决的，是信息
 根本没有进入模型。
+
+## 19. 动作语义重建：计划与工作量
+
+### 19.1 要解决的缺陷
+
+`action.text` 对 **100% 的 CLICK 为 None**，而 CLICK 占 71.7% → **72% 的数据
+payload 通道全零**；`ref` 又非稳定元素身份（`click-button` 的 15 个 ref 有 14 个
+跨 episode 指向不同 tag）。这不是加容量能解决的 —— 信息根本没有进入模型。
+成因单一：`cache.py:87,95` 仅在 `type == "SELECT_OPTION"` 时读 `dom`。
+
+### 19.2 信息集严格三分
+
+```
+U_struct  = (type, tag, ref)
+U_target  = U_struct + target_text     「操作的是哪个元素？」
+U_full    = U_target + payload         「对该元素施加了什么内容？」
+
+G_semantic = L_struct − L_target        G_payload = L_target − L_full
+```
+
+语义归属**按语义定，与「哪个字段现成」无关**：
+
+| action | `target_text`（元素身份） | `payload`（施加的内容） |
+|---|---|---|
+| CLICK | 元素 accessible name | 无 |
+| FILL | textbox 的 name / label | 键入的字符串（现 `action.text`） |
+| SELECT_OPTION | **父 `<select>` 控件**的 name / label | 被选中的 option 标签 |
+
+FILL 已有 `action.text` **不等于**它不需要 target 语义（那是 payload）；
+SELECT_OPTION 的 option 文本是 payload 而非 target。
+
+### 19.3 关键优化：不重新编码状态
+
+动作语义只改 action 通道，`codes.npy` / `valid.npy` **逐位不变**。因此新建
+`dev/rebuild_action_cache.py`：直接复制现有 codes/valid/global_indices，只重解析
+`full-721.jsonl` 重建 action 数组。跳过 10 万状态过 A1/A2（需读 55G 特征）这一最贵
+步骤，且**顺带证明 codes 未被改动**。
+
+### 19.4 工作量估计
+
+| 步骤 | 工时 | 机时 |
+|---|---:|---:|
+| 查清 `CLICK/label` 覆盖率分歧 | 0.5h | — |
+| `rebuild_action_cache.py` | 2h | 10min |
+| schema/model：`target_text` 独立字段 + 共享 byte-GRU + concat 160→224 + `semantic_action` | 2h | — |
+| 新 cache 上重跑 baselines（验 source/copy 逐位不变） | 0.2h | 10min |
+| 一致性检查（旧 cache 上 `semantic_action ≡ structural_action`） | 0.5h | 10min |
+| 三格训练（struct / semantic / full，C11 容量、固定 240k） | 0.2h | **4h** |
+| 分析 + 写日志 | 1h | — |
+| **合计** | **≈6.5h** | **≈4.5h** |
+
+先前估「半天」是低估。三个原因：`target_text` 必须与 payload 分离为独立字段
+（工作量远大于「写回 `raw['text']`」）；抽取规则按 action type 分叉、`label` 还要
+走子节点；计费与一致性检查不可省。
+
+### 19.5 开工前必须先解决的分歧
+
+`CLICK/label`（占 9.2%）的 label 文本可恢复率，本项目两次测量结果矛盾：
+一次 **15%**，早先报告 **3667/3667 = 100%**。两种检测逻辑不同。
+
+**必须先查清再动手** —— 若真为 15%，`U_target` 的实际覆盖率将显著低于预期，
+可能需要改抽取策略（例如 label 改用其 `for` 指向控件的文本），
+甚至改变这一步的期望收益评估。
+
+### 19.6 迭代成本已显著上升
+
+C11（8 层）跑满 240k 需 3.5–4 小时，不再是早期 20k 十分钟一轮。因此本轮**一次配齐
+三格再跑**，不做试探式的逐格迭代。
