@@ -850,3 +850,74 @@ payload obs 增益 @neural =  +80.44                  → 净  +32.05
 - `dev/artifacts.py::write_dev_json` 写出即镜像到同步范围外，
   `scripts_snapshot_results.sh` 做批量补救 —— 这是唯一救回结果 JSON 的机制
   （`.gitignore` 排除 `outputs/`，结果**从未真正进入 git**）。
+
+## 15. Stage 2a：预算第三次被低估，history 从「无用」翻转为 +120 bit
+
+### 15.1 做法
+
+同一头型（tied + copy gate）、同一动作（full）、**120,000 步 / patience 15,000**，
+只差有无历史。两格早停均触发（`budget_truncated: false`）。history **不计费**
+（过去的 decoded state 本就在 decoder 端），故 obs 差值即 total 差值。
+
+| 配置 | obs total ↓ | best step | stop |
+|---|---:|---:|---|
+| tied_copy + full 动作，**有历史** | **7782.21** | 97000 | patience |
+| tied_copy + full 动作，无历史 | 7902.83 | 74000 | patience |
+
+### 15.2 结论一：60k 的 2×2 仍然是截断的
+
+同配置（tied_copy + full，无历史）：**60k 得 8111.23，120k 得 7902.83，再降 208.40 bit。**
+
+§13 中「四格早停全部触发，没有一个是截断值」的判断**是错的**。早停确实触发了，
+但 patience 10,000 过短，在 cosine 尚未退完时即判定停滞。这是本项目在预算问题上
+**连续第三次误判**（20k → 60k → 120k，每次都发现前一次仍被截断）。
+
+该误差**不对称**：收敛慢的配置受截断伤害更大，因此每次抬预算都可能改变排序。
+对已有结论的影响：
+
+- **`prior 有害`方向上仍成立** —— prior 那两格收敛早（13k/21k），受截断影响小；
+  neural 那两格收敛晚（46k/49k），受影响大。抬预算只会让 neural 相对 prior 更有利。
+  但 −50.86 / −127.76 这两个数字**低估了 prior 的劣势**。
+- `payload 划算`、`copy gate 有效` 同理：方向稳，幅度不准。
+
+**`full` 这一格 best step 为 97000/120000，离上限仅余 23000，不能断言已到顶。**
+后续应改用「LR 退到底 + 长 patience」的判据，而非继续翻倍试探。
+
+### 15.3 结论二：history 值 +120.63 bit，且完全免费
+
+```
+无历史 7902.83   有历史 7782.21   →  history = +120.63 bit
+```
+
+§12 记录的 `G_hist = −7.06` 是在**无 copy gate、persistence 严重 misspecified、
+20k 截断预算**的模型族里测得的。三个条件同时改变后，history 从「−7 的噪声」变为
+「+120 的真实信号」。
+
+机理与预期一致：一阶 persistence 由 copy gate 结构性接管后，网络不再需要把容量
+耗在重学 copy 结构上，历史状态得以用于预测**残差**。
+
+按预注册判据（`|Δ| < 5–10 bit` 锁 no-history；50–100 bit 则采纳）：**采纳 history**。
+且它不增加任何 side-information 账单，是纯增益。
+
+**教训重述**：`G_hist` 与 `G` 一样是**族内量**，不是 `I(Y_{t+1}; H | Y_t, U, T)`。
+在模型族发生结构性变化后，族内消融结论必须重测，不得沿用。
+
+### 15.4 当前最优
+
+| 系统 | obs total | action bill | +task | 含全部 side-info ↓ |
+|---|---:|---:|---:|---:|
+| **tied+copy gate, full 动作, 有历史** | **7782.21** | 59.39 | 1.57 | **7843.17** |
+| 同上，无历史 | 7902.83 | 59.39 | 1.57 | 7963.80 |
+| source 查表 | 9073.71 | 0.00 | 1.57 | 9075.28 |
+
+```
+净赢 source  +1232.11 bit
+```
+
+对照起点：M1 的 `full` 输给 source 67.45 bit。
+
+### 15.5 界限
+
+- 单种子、train-dev、无 CI；未触碰 formal validation。
+- `full` 格未必到顶（见 15.2）。
+- history 的 +120.63 是在**当前架构**下测得的族内量，同样不可跨族沿用。
