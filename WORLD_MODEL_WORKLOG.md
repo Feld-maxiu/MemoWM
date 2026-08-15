@@ -602,3 +602,48 @@ SELECT_OPTION 的 option 文本是 payload 而非 target。
 
 C11（8 层）跑满 240k 需 3.5–4 小时，不再是早期 20k 十分钟一轮。因此本轮**一次配齐
 三格再跑**，不做试探式的逐格迭代。
+
+## 20. §19.5 的分歧已解决：CLICK/label 可恢复率为 76%
+
+先前两次测量（15% 与 3667/3667=100%）**都错了**，因为都在找错误的结构。
+`label` 节点自身从不带 `text=`，语义位置**因任务而异**：
+
+| 任务 | n | 自身 | 子节点 | 兄弟 input | 无 | 可恢复 |
+|---|---:|---:|---:|---:|---:|---:|
+| login-user | 191 | 0 | 45 | 0 | **146** | **24%** |
+| use-autocomplete-nodelay | 149 | 0 | 40 | 109 | 0 | 100% |
+| click-checkboxes | 132 | 0 | 132 | 0 | 0 | 100% |
+| click-option | 127 | 0 | 127 | 0 | 0 | 100% |
+| **合计** | **599** | 0 | 344 | 109 | 146 | **76%** |
+
+缺口**完全集中在 login-user，且信息本来就不在序列化里**：
+
+```
+<ref=14 parent=0  tag=p/>
+<ref=15 parent=14 tag=label/>        ← 点击目标，无 text
+<ref=16 parent=14 tag=input_text/>   ← 兄弟，同样无 text
+<ref=17 parent=0  tag=p/>
+<ref=18 parent=17 tag=label/>
+<ref=19 parent=17 tag=input_text value="•••"/>
+```
+
+username 与 password 两个字段在 dom 中**字面不可区分**，只能靠 ref 与 parent 位置；
+`axtree_raw` 的 AX name 同样为 0%。这不是抽取规则问题，是 compact AXTree 序列化
+丢失了 label 文本。**若要补上，须回到序列化层重新生成 dom，不在本轮范围内。**
+
+**影响可接受**：缺口为 24% × 9.2% ≈ **全部动作的 2.2%**，且集中于 login-user ——
+恰是模型表现最好的任务（M1 切片 +1734 bit vs source），语义缺失在此处代价最小。
+
+### 20.1 冻结的抽取规则
+
+`target_text` 四级回退，命中即止：
+
+1. 目标节点自身的 `text=`；
+2. 目标节点**子节点**的 `text=`（checkbox/option 类）；
+3. 同 `parent` 的**兄弟 `input*` 节点**的 `text=`（autocomplete 类）；
+4. 否则为空，`target_text` mask 置 0。
+
+SELECT_OPTION 的 target 取**父 `select`** 而非 option（option 文本属 payload）；
+FILL 的 target 取 textbox 的 name/label，payload 仍取 `action.text`。
+
+**开工阻塞已解除。**
