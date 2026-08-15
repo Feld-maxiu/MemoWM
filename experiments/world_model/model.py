@@ -44,6 +44,9 @@ class ModelConfig:
     action_embedding_dim: int = 32
     byte_embedding_dim: int = 16
     payload_hidden_dim: int = 64
+    # Adds the target-element byte channel. Lives in ModelConfig so it reaches
+    # resolved_dict and hence freeze.py's config hash.
+    use_target_channel: bool = False
     max_payload_bytes: int = MAX_PAYLOAD_BYTES
 
     def __post_init__(self):
@@ -84,6 +87,8 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         return subkey
 
     action_width = config.action_embedding_dim * 3 + config.payload_hidden_dim
+    if config.use_target_channel:
+        action_width += config.payload_hidden_dim
     params = {
         "code_embedding": _normal(take(), (
             config.num_latent_tokens,
@@ -116,6 +121,10 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         )),
         "action/gru_b": jnp.zeros((3 * config.payload_hidden_dim,), jnp.float32),
         "action/payload_mask": _normal(take(), (config.payload_hidden_dim,)),
+    }
+    if config.use_target_channel:
+        params["action/target_mask"] = _normal(take(), (config.payload_hidden_dim,))
+    params.update({
         "action/proj_w": _weight(take(), (action_width, config.d_model)),
         "action/proj_b": jnp.zeros((config.d_model,), jnp.float32),
         "action/mask": _normal(take(), (config.d_model,)),
@@ -127,7 +136,7 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         "code_head/b": jnp.zeros((
             config.num_latent_tokens, config.num_subspaces, config.num_categories
         ), jnp.float32),
-    }
+    })
     for layer in range(config.num_layers):
         prefix = f"layer{layer}"
         params.update({
@@ -223,7 +232,26 @@ def _byte_gru(params, payloads, lengths, config: ModelConfig):
     return hidden.reshape(batch_shape + (config.payload_hidden_dim,))
 
 
-def _action_embedding(params, actions, config: ModelConfig, payload_mode: str):
+def _byte_channel(params, byte_ids, lengths, mask_param, mode, shape, config):
+    """Either encode the bytes or substitute the learned MASK for this channel."""
+    if mode == "full":
+        return _byte_gru(params, byte_ids, lengths, config)
+    if mode == "mask":
+        return jnp.broadcast_to(mask_param, shape + (config.payload_hidden_dim,))
+    raise ValueError(mode)
+
+
+def _action_embedding(
+    params, actions, config: ModelConfig, payload_mode: str,
+    target_mode: str = "mask",
+):
+    """Structural fields plus two byte channels sharing one GRU.
+
+    ``target`` says which element was acted on; ``payload`` says what was applied
+    to it. They are separate channels -- and separately maskable -- so that
+    G_semantic and G_payload can be attributed independently. The GRU weights
+    are shared and simply run twice, so the split costs no new parameters.
+    """
     type_ids = jnp.asarray(actions["types"], jnp.int32)
     tag_ids = jnp.asarray(actions["tags"], jnp.int32)
     refs = jnp.asarray(actions["refs"], jnp.int32)
@@ -232,17 +260,18 @@ def _action_embedding(params, actions, config: ModelConfig, payload_mode: str):
         params["action/tag_embedding"][tag_ids],
         params["action/ref_embedding"][refs],
     )
-    if payload_mode == "full":
-        payload = _byte_gru(
-            params, actions["payloads"], actions["lengths"], config
+    payload = _byte_channel(
+        params, actions["payloads"], actions["lengths"],
+        params["action/payload_mask"], payload_mode, type_ids.shape, config,
+    )
+    if "action/target_mask" in params:
+        target = _byte_channel(
+            params, actions["targets"], actions["target_lengths"],
+            params["action/target_mask"], target_mode, type_ids.shape, config,
         )
-    elif payload_mode == "mask":
-        payload = jnp.broadcast_to(
-            params["action/payload_mask"], type_ids.shape + (config.payload_hidden_dim,)
-        )
+        combined = jnp.concatenate((*structural, target, payload), axis=-1)
     else:
-        raise ValueError(payload_mode)
-    combined = jnp.concatenate((*structural, payload), axis=-1)
+        combined = jnp.concatenate((*structural, payload), axis=-1)
     return combined @ params["action/proj_w"] + params["action/proj_b"]
 
 
@@ -297,11 +326,14 @@ def _prepare_inputs(
             (history_codes.shape[0], config.max_history, config.d_model),
         )
     else:
+        structural_only = variant in ("structural_action", "struct_no_history")
         action = _action_embedding(
             params, actions, config,
-            payload_mode="mask" if variant in (
-                "structural_action", "struct_no_history"
+            payload_mode="mask" if (
+                structural_only or variant == "semantic_action"
             ) else "full",
+            # semantic_action = structural + target, payload withheld.
+            target_mode="mask" if structural_only else "full",
         )
     if variant in ("no_history", "struct_no_history"):
         action = jnp.where(

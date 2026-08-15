@@ -661,7 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/world_model/v8_discrete.yaml")
     parser.add_argument("--variant", choices=(
         "t_only", "no_action", "structural_action", "no_history", "full",
-        "state_only", "struct_no_history",
+        "state_only", "struct_no_history", "semantic_action",
     ), required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True)

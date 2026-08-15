@@ -72,6 +72,7 @@ VARIANTS = (
 DEV_VARIANTS = (
     "state_only",
     "struct_no_history",
+    "semantic_action",
 )
 
 _ROW_RE = re.compile(

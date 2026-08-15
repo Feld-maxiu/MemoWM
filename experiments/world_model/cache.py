@@ -527,6 +527,10 @@ class FrozenCache:
             "action_tags": self.transitions["action_tags"][rows],
             "action_refs": self.transitions["action_refs"][rows],
             "action_payloads": self.transitions["action_payloads"][rows],
+            "action_targets": self.transitions["action_targets"][rows]
+            if "action_targets" in self.transitions else None,
+            "action_target_lengths": self.transitions["action_target_lengths"][rows]
+            if "action_target_lengths" in self.transitions else None,
             "action_lengths": self.transitions["action_lengths"][rows],
             "task_ids": self.transitions["task_ids"][rows],
             "target_codes": np.asarray(self.codes[target], np.uint8),
