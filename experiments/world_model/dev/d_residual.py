@@ -130,22 +130,35 @@ def evaluate(cache, rows, params, loss_fn, batch_size, log_prior):
 
 
 def apply_budget(config, args):
-    """Override the training budget.
+    """Override the training budget and (optionally) backbone capacity.
 
     ``build_optimizer`` decays the cosine schedule over ``training.max_steps``,
     so raising only the loop bound would leave the learning rate annealed to
     zero at the old horizon and the extra steps would be wasted. The schedule
     and the loop must move together.
+
+    ``--no-early-stop`` makes every configuration run exactly ``max_steps``.
+    Without it a capacity sweep is not a fixed-budget comparison: cells stop at
+    different steps and see different amounts of data.
     """
+    patience = args.patience_steps
+    if getattr(args, "no_early_stop", False):
+        # Larger than any reachable idle streak, so patience can never fire.
+        patience = args.max_steps + args.eval_every
     training = dataclasses.replace(
         config.training,
         max_steps=args.max_steps,
-        patience_steps=args.patience_steps,
+        patience_steps=patience,
         eval_every=args.eval_every,
     )
     if training.patience_steps % training.eval_every:
         raise ValueError("patience_steps must be a multiple of eval_every")
-    return dataclasses.replace(config, training=training)
+    model = config.model
+    if getattr(args, "num_layers", None):
+        model = dataclasses.replace(model, num_layers=args.num_layers)
+    if getattr(args, "mlp_dim", None):
+        model = dataclasses.replace(model, mlp_dim=args.mlp_dim)
+    return dataclasses.replace(config, training=training, model=model)
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -255,6 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=20000)
     parser.add_argument("--patience-steps", type=int, default=10000)
+    parser.add_argument("--no-early-stop", action="store_true")
+    parser.add_argument("--num-layers", type=int)
+    parser.add_argument("--mlp-dim", type=int)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
     parser.add_argument("--platform", default="gpu")

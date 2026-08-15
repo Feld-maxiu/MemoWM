@@ -164,6 +164,12 @@ def run(args: argparse.Namespace) -> dict:
             "budget_truncated": stop_reason == "max_steps",
         },
         "parameter_count": int(parameter_count(params)),
+        "capacity": {
+            "d_model": config.model.d_model,
+            "num_layers": config.model.num_layers,
+            "mlp_dim": config.model.mlp_dim,
+            "code_embedding_dim": config.model.code_embedding_dim,
+        },
         "split": {
             "basis": "train episodes, task-stratified",
             "fit_transitions": int(len(fit_rows)),
@@ -187,6 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=20000)
     parser.add_argument("--patience-steps", type=int, default=10000)
+    parser.add_argument("--no-early-stop", action="store_true")
+    parser.add_argument("--num-layers", type=int)
+    parser.add_argument("--mlp-dim", type=int)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
     parser.add_argument("--platform", default="gpu")
