@@ -204,6 +204,12 @@ PYTHONPATH=. $JX tests/run_tests.py tests/state_tokenizer/test_slot_layout.py
 
 `pkill -f <pattern>` 会匹配到发起它的 shell 自身（退出码 144）。用 `ps aux | grep "[p]attern"` 取 PID 再 kill。
 
+**括号写法也救不了「在启动脚本里清理同类进程」。** 一条同时包含
+`kill`（按模式匹配）与 `python -m experiments...` 的脚本，其自身命令行必然含有该模式，
+`[d]ev\.` 的括号技巧对此无效 —— 括号只防 grep 匹配 grep 自己，防不住脚本匹配脚本自己。
+曾因此在训练启动前杀掉整条命令链，四小时零产出且日志为空。
+**启动脚本里不要做基于模式的清理**：先单独一条命令确认无残留，再单独一条命令启动。
+
 **同一个坑也会咬等待器。** `while pgrep -f 'dev.d_head_bakeoff'; do sleep 60; done`
 永远不会退出 —— 等待器自己的命令行里就含该字符串，`pgrep` 一直匹配得到。曾因此
 留下两个空转 7 小时的 shell。等待自己起的进程结束时一律用括号写法：

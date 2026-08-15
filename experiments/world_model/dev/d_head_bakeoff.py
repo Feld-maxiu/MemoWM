@@ -38,7 +38,7 @@ from ..config import load_config
 from ..model import codelength_bits, initialize_params, parameter_count, predict
 from ..train import DeterministicSampler, build_optimizer
 from .artifacts import dev_path, write_dev_json
-from .d_residual import MODEL_KEYS, apply_budget, episode_split
+from .d_residual import MODEL_KEYS, OPTIONAL_KEYS, apply_budget, episode_split
 
 HEADS = ("tied", "untied", "tied_copy", "untied_copy")
 
@@ -63,6 +63,8 @@ def make_loss(variant, model_config, *, train: bool):
             "types": batch["action_types"], "tags": batch["action_tags"],
             "refs": batch["action_refs"], "payloads": batch["action_payloads"],
             "lengths": batch["action_lengths"],
+            "targets": batch.get("action_targets"),
+            "target_lengths": batch.get("action_target_lengths"),
         }
         mask_logits, code_logits = predict(
             params, batch["history_codes"], batch["history_valid"], actions,
@@ -81,6 +83,10 @@ def evaluate(cache, rows, params, loss_fn, batch_size):
     for start in range(0, len(rows), batch_size):
         batch = cache.batch(rows[start:start + batch_size])
         device = {name: jnp.asarray(batch[name]) for name in MODEL_KEYS}
+        device.update({
+            name: jnp.asarray(batch[name]) for name in OPTIONAL_KEYS
+            if batch.get(name) is not None
+        })
         _loss, rates = loss_fn(params, device, jax.random.PRNGKey(0))
         code += float(np.asarray(rates["code_bits"], np.float64).sum())
         mask += float(np.asarray(rates["mask_bits"], np.float64).sum())
@@ -129,6 +135,10 @@ def run(args: argparse.Namespace) -> dict:
     for step in range(1, training.max_steps + 1):
         batch = cache.batch(sampler.next())
         device_batch = {name: jnp.asarray(batch[name]) for name in MODEL_KEYS}
+        device_batch.update({
+            name: jnp.asarray(batch[name]) for name in OPTIONAL_KEYS
+            if batch.get(name) is not None
+        })
         key, subkey = jax.random.split(key)
         params, opt_state = update(params, opt_state, device_batch, subkey)
         if step % training.eval_every and step != training.max_steps:
@@ -195,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patience-steps", type=int, default=10000)
     parser.add_argument("--no-early-stop", action="store_true")
     parser.add_argument("--num-layers", type=int)
+    parser.add_argument("--use-target-channel", action="store_true")
     parser.add_argument("--mlp-dim", type=int)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)

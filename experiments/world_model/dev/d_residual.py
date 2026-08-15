@@ -45,6 +45,8 @@ MODEL_KEYS = (
     "action_types", "action_tags", "action_refs", "action_payloads",
     "action_lengths", "task_ids", "target_codes", "target_valid",
 )
+# Present only in caches rebuilt with action semantics.
+OPTIONAL_KEYS = ("action_targets", "action_target_lengths")
 
 
 def episode_split(cache: FrozenCache, rows: np.ndarray, fraction: float, seed: int):
@@ -96,6 +98,8 @@ def make_loss(variant, model_config, *, train: bool):
             "types": batch["action_types"], "tags": batch["action_tags"],
             "refs": batch["action_refs"], "payloads": batch["action_payloads"],
             "lengths": batch["action_lengths"],
+            "targets": batch.get("action_targets"),
+            "target_lengths": batch.get("action_target_lengths"),
         }
         prior = gather_prior(log_prior, batch["task_ids"], batch["history_codes"])
         mask_logits, code_logits = predict(
@@ -117,6 +121,10 @@ def evaluate(cache, rows, params, loss_fn, batch_size, log_prior):
         selected = rows[start:start + batch_size]
         batch = cache.batch(selected)
         device = {name: jnp.asarray(batch[name]) for name in MODEL_KEYS}
+        device.update({
+            name: jnp.asarray(batch[name]) for name in OPTIONAL_KEYS
+            if batch.get(name) is not None
+        })
         _loss, rates = loss_fn(params, device, jax.random.PRNGKey(0), log_prior)
         code += float(np.asarray(rates["code_bits"], np.float64).sum())
         mask += float(np.asarray(rates["mask_bits"], np.float64).sum())
@@ -158,6 +166,8 @@ def apply_budget(config, args):
         model = dataclasses.replace(model, num_layers=args.num_layers)
     if getattr(args, "mlp_dim", None):
         model = dataclasses.replace(model, mlp_dim=args.mlp_dim)
+    if getattr(args, "use_target_channel", False):
+        model = dataclasses.replace(model, use_target_channel=True)
     return dataclasses.replace(config, training=training, model=model)
 
 
@@ -208,6 +218,10 @@ def run(args: argparse.Namespace) -> dict:
     for step in range(1, training.max_steps + 1):
         batch = cache.batch(sampler.next())
         device_batch = {name: jnp.asarray(batch[name]) for name in MODEL_KEYS}
+        device_batch.update({
+            name: jnp.asarray(batch[name]) for name in OPTIONAL_KEYS
+            if batch.get(name) is not None
+        })
         key, subkey = jax.random.split(key)
         params, opt_state = update(
             params, opt_state, device_batch, subkey, log_prior
@@ -270,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patience-steps", type=int, default=10000)
     parser.add_argument("--no-early-stop", action="store_true")
     parser.add_argument("--num-layers", type=int)
+    parser.add_argument("--use-target-channel", action="store_true")
     parser.add_argument("--mlp-dim", type=int)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
