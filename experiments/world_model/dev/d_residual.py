@@ -159,6 +159,10 @@ def apply_budget(config, args):
         patience_steps=patience,
         eval_every=args.eval_every,
     )
+    if getattr(args, "learning_rate", None) is not None:
+        training = dataclasses.replace(training, learning_rate=args.learning_rate)
+    if getattr(args, "weight_decay", None) is not None:
+        training = dataclasses.replace(training, weight_decay=args.weight_decay)
     if training.patience_steps % training.eval_every:
         raise ValueError("patience_steps must be a multiple of eval_every")
     model = config.model
@@ -166,6 +170,8 @@ def apply_budget(config, args):
         model = dataclasses.replace(model, num_layers=args.num_layers)
     if getattr(args, "mlp_dim", None):
         model = dataclasses.replace(model, mlp_dim=args.mlp_dim)
+    if getattr(args, "dropout", None) is not None:
+        model = dataclasses.replace(model, dropout=args.dropout)
     if getattr(args, "use_target_channel", False):
         model = dataclasses.replace(model, use_target_channel=True)
     return dataclasses.replace(config, training=training, model=model)
@@ -254,9 +260,18 @@ def run(args: argparse.Namespace) -> dict:
             "max_steps": config.training.max_steps,
             "patience_steps": config.training.patience_steps,
             "eval_every": config.training.eval_every,
+            "learning_rate": config.training.learning_rate,
+            "weight_decay": config.training.weight_decay,
             "steps_ran": step,
             "stop_reason": stop_reason,
             "budget_truncated": stop_reason == "max_steps",
+        },
+        "capacity": {
+            "d_model": config.model.d_model,
+            "num_layers": config.model.num_layers,
+            "mlp_dim": config.model.mlp_dim,
+            "code_embedding_dim": config.model.code_embedding_dim,
+            "dropout": config.model.dropout,
         },
         "split": {
             "basis": "train episodes, task-stratified",
@@ -277,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache", default="outputs/world_model/v8/cache")
     parser.add_argument("--config", default="configs/world_model/v8_discrete.yaml")
     parser.add_argument("--variant", required=True, choices=(
-        "state_only", "struct_no_history", "no_history",
+        "state_only", "struct_no_history", "no_history", "full",
     ))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=20000)
@@ -286,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-layers", type=int)
     parser.add_argument("--use-target-channel", action="store_true")
     parser.add_argument("--mlp-dim", type=int)
+    parser.add_argument("--dropout", type=float)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
     parser.add_argument("--platform", default="gpu")

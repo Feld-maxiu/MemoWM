@@ -169,6 +169,8 @@ def run(args: argparse.Namespace) -> dict:
             "max_steps": config.training.max_steps,
             "patience_steps": config.training.patience_steps,
             "eval_every": config.training.eval_every,
+            "learning_rate": config.training.learning_rate,
+            "weight_decay": config.training.weight_decay,
             "steps_ran": step,
             "stop_reason": stop_reason,
             "budget_truncated": stop_reason == "max_steps",
@@ -179,6 +181,7 @@ def run(args: argparse.Namespace) -> dict:
             "num_layers": config.model.num_layers,
             "mlp_dim": config.model.mlp_dim,
             "code_embedding_dim": config.model.code_embedding_dim,
+            "dropout": config.model.dropout,
         },
         "split": {
             "basis": "train episodes, task-stratified",
@@ -207,6 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-layers", type=int)
     parser.add_argument("--use-target-channel", action="store_true")
     parser.add_argument("--mlp-dim", type=int)
+    parser.add_argument("--dropout", type=float)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
     parser.add_argument("--platform", default="gpu")
