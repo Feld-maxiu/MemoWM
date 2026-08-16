@@ -38,7 +38,7 @@ from ..config import load_config
 from ..model import codelength_bits, initialize_params, parameter_count, predict
 from ..train import DeterministicSampler, build_optimizer
 from .artifacts import dev_path, write_dev_json
-from .d_residual import MODEL_KEYS, OPTIONAL_KEYS, apply_budget, episode_split
+from .d_residual import MODEL_KEYS, OPTIONAL_KEYS, apply_budget, episode_split, subsample_fit
 
 HEADS = ("tied", "untied", "tied_copy", "untied_copy")
 
@@ -108,6 +108,10 @@ def run(args: argparse.Namespace) -> dict:
     fit_rows, dev_rows = episode_split(
         cache, cache.indices_for_split("train"), args.fit_fraction, args.seed
     )
+    # Data-scaling curve: shrink fit, hold dev fixed, so points differ only by
+    # how much training data was available -- not by what they are scored on.
+    full_fit = len(fit_rows)
+    fit_rows = subsample_fit(cache, fit_rows, args.fit_subsample, args.seed)
 
     params = apply_head(initialize_params(config.model, args.seed), args.head)
     params = jax.device_put(params, device)
@@ -187,6 +191,10 @@ def run(args: argparse.Namespace) -> dict:
             "basis": "train episodes, task-stratified",
             "fit_transitions": int(len(fit_rows)),
             "dev_transitions": int(len(dev_rows)),
+            "fit_subsample": args.fit_subsample,
+            "fit_transitions_at_full": int(full_fit),
+            "epochs": len(fit_rows) and
+                      config.training.max_steps * config.training.batch_size / len(fit_rows),
             "formal_validation_touched": False,
         },
         "wall_seconds": time.time() - started,
@@ -215,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--eval-every", type=int, default=1000)
     parser.add_argument("--fit-fraction", type=float, default=0.8)
+    parser.add_argument("--fit-subsample", type=float, default=1.0)
     parser.add_argument("--platform", default="gpu")
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--output", required=True)

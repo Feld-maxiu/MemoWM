@@ -64,6 +64,35 @@ def episode_split(cache: FrozenCache, rows: np.ndarray, fraction: float, seed: i
     return rows[~mask], rows[mask]
 
 
+def subsample_fit(cache: FrozenCache, fit_rows: np.ndarray, fraction: float, seed: int):
+    """Keep a task-stratified fraction of the FIT episodes; dev is untouched.
+
+    The subsets are **nested**: the per-task permutation depends only on
+    ``seed``, and each fraction takes a prefix of it, so the 25% set is a subset
+    of the 50% set. A data-scaling curve built from non-nested draws would
+    confound "how much data" with "which episodes were drawn", and at these
+    sizes that confound is comparable to the effect being measured.
+
+    Whole episodes move together, matching ``episode_split`` -- splitting inside
+    an episode would leak a state into its own history.
+    """
+    if fraction >= 1.0:
+        return fit_rows
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("fit_subsample must lie in (0,1]")
+    rng = np.random.default_rng(seed)
+    episodes = cache.transitions["episode_ids"][fit_rows]
+    tasks = cache.transitions["task_ids"][fit_rows]
+    keep: set[int] = set()
+    for task in np.unique(tasks):
+        unique = np.unique(episodes[tasks == task])
+        shuffled = rng.permutation(unique)
+        take = max(1, int(round(len(shuffled) * fraction)))
+        keep.update(shuffled[:take].tolist())
+    mask = np.isin(episodes, np.fromiter(keep, np.int64, len(keep)))
+    return fit_rows[mask]
+
+
 def build_log_prior(cache: FrozenCache, fit_rows: np.ndarray, block: int = 256):
     """Device-resident ``log K`` -> (num_tasks, POSITIONS, 256, 256) float32."""
     num_tasks = len(cache.task_names)
