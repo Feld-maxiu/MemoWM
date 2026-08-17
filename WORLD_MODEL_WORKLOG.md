@@ -42,6 +42,7 @@
 | history | **采纳**（不显著但**不计费**） | §22.3 修正了 §17.1 的理由 |
 | 噪声底 | **~110 bit**（非 §11 的 2.85），且**不可靠估计量消除** | §22.2 + §23.2 |
 | **数据** | **确为约束**：右端边际 +297.42，是 source 对照的 4.02× | §24.1–§24.2 |
+| **评测口径** | validation 是 **replication**（已被看过），test 是唯一干净终点 | §2（§24.5 曾写错，已更正） |
 
 **阅读顺序**：§1–§6 是仍然有效的定义与协议；**§24 是当前结论**，§22–§23 次之
 （其中 §22.1/§23.1 的容量结论已被 §24.3 推翻）；中间各节多已被取代，
@@ -85,6 +86,23 @@ WM 输出 `mask_logits[B,64]` 与 `code_logits[B,64,32,256]`，目标为
 
 **test 始终关闭**：loader 默认拒绝返回 test rows，需匹配 cache 哈希的
 test-freeze manifest 才能解锁。**本项目至今未生成该 manifest，未查看任何 test 指标。**
+
+**validation 不是干净的 confirmatory split，必须按 replication 使用。** 它已被
+多次观测：§3 的三个统计基线（marginal 10,635.35 / copy 9,564.59 / source 8,990.72）、
+§11 的 M1 复现（9058.17 vs 新栈 9055.33）、§12 的 A1 分解（20k 步）、
+以及 task/step/policy 诊断，全部在 validation 上做过。
+
+因此三个 split 的地位是：
+
+| split | 地位 |
+|---|---|
+| train 内部 80/20 dev | 架构搜索用，已被大量使用（§11–§24 全部在此） |
+| **validation** | **replication / continuity benchmark**；已被看过，非 pristine |
+| **test** | **唯一仍然干净的 confirmatory endpoint**，从未解锁 |
+
+**后果**：任何「首次正式 held-out 检验」的说法只能指向 test，不能指向 validation。
+若最终需要一个真正意义上的 confirmatory 结果，正确顺序是
+**冻结一切 → 3 seeds → validation 一次性评测 → 无论结果好坏不再改动 → 解锁 test 一次**。
 
 ### 2.1 动作的表示与计费
 
@@ -859,7 +877,13 @@ best step 分别在 180,000 与 204,000 步，在 30% 处（72k）远未到达�
 | 容量 × 正则化 | +163.13 | 单种子，交互本身 ~4σ，最优格本身 1.4–2.5σ |
 | 全部 train（免费） | ≈ +196 | 幂律外推 1.25×，无需采集 |
 
-对 train-dev 的 source 基线 9073.71，当前最优低 **1,749.09 bit**。validation 仍未触碰。
+对 train-dev 的 source 基线 9073.71，当前最优低 **1,749.09 bit**。
+
+> **本节初稿写「validation 仍未触碰」，该说法是错的，已更正。** 正确表述是：
+> **§11–§24 的架构搜索全程未看 validation**（全部在 train 内部 80/20 上完成）——
+> 但 validation 本身在更早的基线、M1 复现与 A1 诊断阶段**已被反复观测**，
+> 因此它是 replication split 而非 pristine confirmatory split。详见 §2。
+> 真正未被触碰的只有 **test**。
 
 未启动的候选（按证据缺口排序）：
 
