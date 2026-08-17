@@ -47,6 +47,13 @@ class ModelConfig:
     # Adds the target-element byte channel. Lives in ModelConfig so it reaches
     # resolved_dict and hence freeze.py's config hash.
     use_target_channel: bool = False
+    # Explicit persistence mixture p(c') = pi*1[c'=c] + (1-pi)*q(c'). A tied
+    # rank-8 head cannot express the identity kernel the copy baseline needs,
+    # so the term is supplied structurally rather than learned. Lives in
+    # ModelConfig for the same reason as use_target_channel: formal runs need
+    # it inside resolved_dict, and statistics.py compares parameter_shapes
+    # across runs, so it cannot be injected after initialisation.
+    use_copy_gate: bool = False
     max_payload_bytes: int = MAX_PAYLOAD_BYTES
 
     def __post_init__(self):
@@ -155,6 +162,19 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         })
     params["final_norm_scale"] = jnp.ones((config.d_model,), jnp.float32)
     params["final_norm_bias"] = jnp.zeros((config.d_model,), jnp.float32)
+    # Deliberately last, and deliberately without a ``take()`` call: the copy
+    # gate must not perturb the PRNG stream, so that every other parameter is
+    # bit-identical to a run with the gate off at the same seed. Zeros give
+    # ``copy_logit = 0`` -> a 50/50 mixture at step 0, which is exactly the
+    # function dev/d_head_bakeoff.py trained from.
+    if config.use_copy_gate:
+        params["copy_head/w"] = jnp.zeros((
+            config.num_latent_tokens, config.num_subspaces,
+            config.code_embedding_dim,
+        ), jnp.float32)
+        params["copy_head/b"] = jnp.zeros((
+            config.num_latent_tokens, config.num_subspaces
+        ), jnp.float32)
     return params
 
 

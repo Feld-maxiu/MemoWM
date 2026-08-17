@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -124,3 +126,88 @@ def test_all_five_variants_have_finite_gradients_with_one_parameter_tree():
         assert all(np.isfinite(np.asarray(value)).all()
                    for value in jax.tree_util.tree_leaves(grads))
 
+
+
+def test_copy_gate_is_inert_when_disabled_and_exact_when_enabled():
+    """The gate must not perturb any other parameter.
+
+    ``statistics.py`` compares ``parameter_shapes`` across runs, so the gate has
+    to be created inside ``initialize_params`` rather than injected afterwards.
+    Creating it must not consume PRNG state, otherwise every other parameter
+    would shift and a gated run could no longer be compared against an ungated
+    one at the same seed.
+    """
+    config = _config()
+    gated = dataclasses.replace(config, use_copy_gate=True)
+    plain_params = initialize_params(config, 0)
+    gated_params = initialize_params(gated, 0)
+
+    assert set(gated_params) - set(plain_params) == {"copy_head/w", "copy_head/b"}
+    assert not set(plain_params) - set(gated_params)
+    tokens, subspaces = config.num_latent_tokens, config.num_subspaces
+    assert gated_params["copy_head/w"].shape == (
+        tokens, subspaces, config.code_embedding_dim
+    )
+    assert gated_params["copy_head/b"].shape == (tokens, subspaces)
+    # Zero init => copy_logit 0 => 50/50 mixture at step 0.
+    assert not np.any(np.asarray(gated_params["copy_head/w"]))
+    assert not np.any(np.asarray(gated_params["copy_head/b"]))
+    for name, value in plain_params.items():
+        assert np.array_equal(np.asarray(value), np.asarray(gated_params[name])), name
+
+
+def test_copy_gate_matches_the_head_the_bakeoff_trained():
+    """Formal init must equal the dev harness's post-hoc injection, bit for bit.
+
+    Every architecture number in worklog sections 12 and 24 was measured through
+    ``dev/d_head_bakeoff.py::apply_head``. If ``train.py`` started from a
+    different function those numbers would not carry over to the formal run.
+    """
+    from experiments.world_model.dev.d_head_bakeoff import apply_head
+
+    config = _config()
+    formal = initialize_params(dataclasses.replace(config, use_copy_gate=True), 0)
+    injected = apply_head(initialize_params(config, 0), "tied_copy")
+    assert set(formal) == set(injected)
+    for name, value in formal.items():
+        assert np.array_equal(np.asarray(value), np.asarray(injected[name])), name
+
+
+def test_copy_gate_returns_normalised_logits_with_finite_gradients():
+    """Mixing in the log domain must leave the result already normalised.
+
+    ``codelength_bits`` applies ``log_softmax``; it is only idempotent here if
+    the gate emits a normalised distribution. The identity branch uses -1e30
+    rather than -inf so that ``logaddexp`` keeps a finite gradient path.
+    """
+    config = dataclasses.replace(_config(), use_copy_gate=True)
+    params = initialize_params(config, 0)
+    codes, valid, present, actions = _inputs(config)
+    tasks = np.zeros(codes.shape[0], np.int32)
+
+    _mask_logits, code_logits = predict(
+        params, codes, valid, actions, tasks, "full", config,
+        history_present=present, train=False,
+    )
+    total = jax.scipy.special.logsumexp(code_logits, axis=-1)
+    assert float(jnp.abs(total).max()) < 1e-6
+    assert bool(jnp.isfinite(code_logits).all())
+
+    def loss(values):
+        mask_logits, logits = predict(
+            values, codes, valid, actions, tasks, "full", config,
+            history_present=present, train=False,
+        )
+        # Targets equal the source codes, so the identity branch carries real
+        # mass and the -1e30 path is actually exercised.
+        targets = np.zeros(
+            (codes.shape[0], config.num_latent_tokens, config.num_subspaces),
+            np.int32,
+        )
+        rates = codelength_bits(mask_logits, logits, valid[:, -1], targets)
+        return jnp.mean(rates["total_bits"])
+
+    grads = jax.grad(loss)(params)
+    assert all(np.isfinite(np.asarray(value)).all()
+               for value in jax.tree_util.tree_leaves(grads))
+    assert float(jnp.abs(grads["copy_head/w"]).max()) > 0.0
