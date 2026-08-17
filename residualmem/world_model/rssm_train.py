@@ -29,8 +29,14 @@ from .latent_predictor import LatentPredictor
 def build_config(encoder, num_groups: int, num_categories: int, **overrides) -> R.RSSMConfig:
     """Construct an RSSMConfig whose ``x_dim`` matches the encoder's token target."""
     x_dim = encoder.spec.token_dim * encoder.spec.num_tokens
+    defaults = {
+        "state_num_tokens": encoder.spec.num_tokens,
+        "state_token_dim": encoder.spec.token_dim,
+        "slot_posterior": encoder.spec.num_tokens > 1,
+    }
+    defaults.update(overrides)
     return R.RSSMConfig(
-        num_groups=num_groups, num_categories=num_categories, x_dim=x_dim, **overrides)
+        num_groups=num_groups, num_categories=num_categories, x_dim=x_dim, **defaults)
 
 
 def _segment_examples(trajectory: Trajectory, encoder, segment_length: int):
@@ -41,6 +47,22 @@ def _segment_examples(trajectory: Trajectory, encoder, segment_length: int):
         stop = min(start + segment_length, len(actions))
         examples.append((
             x_all[start:stop + 1].astype(np.float32),
+            actions[start:stop],
+        ))
+    return examples
+
+
+def _segment_slot_examples(trajectory: Trajectory, encoder, segment_length: int):
+    encoded = [encoder.encode(state) for state in trajectory.states]
+    xbar_all = np.stack([tokens.flat() for tokens in encoded]).astype(np.float32)
+    valid_all = np.stack([tokens.valid for tokens in encoded]).astype(np.bool_)
+    actions = np.asarray(trajectory.actions, np.int32)
+    examples = []
+    for start in range(0, len(actions), segment_length):
+        stop = min(start + segment_length, len(actions))
+        examples.append((
+            xbar_all[start:stop + 1],
+            valid_all[start:stop + 1],
             actions[start:stop],
         ))
     return examples
@@ -68,8 +90,14 @@ def train_rssm(
     latent_schema = _latent_schema(config)
     domain_idx = domain.index
 
-    examples = [ex for traj in trajectories
-                for ex in _segment_examples(traj, encoder, segment_length)]
+    examples = [
+        ex for traj in trajectories
+        for ex in (
+            _segment_slot_examples(traj, encoder, segment_length)
+            if config.slot_posterior
+            else _segment_examples(traj, encoder, segment_length)
+        )
+    ]
     if not examples:
         raise ValueError("training needs at least one transition")
 
@@ -77,11 +105,18 @@ def train_rssm(
     optimizer = optax.chain(optax.clip_by_global_norm(100.0), optax.adam(learning_rate))
     opt_state = optimizer.init(params)
 
-    def loss_fn(p, x, actions, key, closed_loop):
-        return R.rssm_loss(p, x, actions, domain_idx, config, key, closed_loop)
+    def loss_fn(p, xbar, valid, actions, key, closed_loop):
+        return R.rssm_loss(
+            p, xbar, actions, domain_idx, config, key,
+            closed_loop, valid,
+        )
 
-    grad_tf = jax.jit(jax.value_and_grad(lambda p, x, a, k: loss_fn(p, x, a, k, False)))
-    grad_cl = jax.jit(jax.value_and_grad(lambda p, x, a, k: loss_fn(p, x, a, k, True)))
+    grad_tf = jax.jit(jax.value_and_grad(
+        lambda p, xbar, m, a, k: loss_fn(p, xbar, m, a, k, False)
+    ))
+    grad_cl = jax.jit(jax.value_and_grad(
+        lambda p, xbar, m, a, k: loss_fn(p, xbar, m, a, k, True)
+    ))
 
     base = jax.random.PRNGKey(seed)
     rng = np.random.default_rng(seed)
@@ -91,10 +126,21 @@ def train_rssm(
                                 ("cl", closed_loop_epochs, grad_cl)):
         for _ in range(epochs):
             for index in rng.permutation(len(examples)):
-                x, actions = examples[index]
+                example = examples[index]
+                if config.slot_posterior:
+                    xbar, valid, actions = example
+                else:
+                    xbar, actions = example
+                    valid = np.ones((len(xbar), config.state_num_tokens), np.bool_)
                 key = jax.random.fold_in(base, counter)
                 counter += 1
-                loss, grads = grad(params, jnp.asarray(x), jnp.asarray(actions), key)
+                loss, grads = grad(
+                    params,
+                    jnp.asarray(xbar),
+                    jnp.asarray(valid),
+                    jnp.asarray(actions),
+                    key,
+                )
                 updates, opt_state = optimizer.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
                 losses.append(float(loss))
@@ -117,13 +163,34 @@ def evaluate_rssm(params, config: R.RSSMConfig, encoder, trajectories, domain: D
     recon_sq = 0.0
     recon_count = 0
     for traj in trajectories:
-        for x, actions in _segment_examples(traj, encoder, segment_length):
-            x = jnp.asarray(x)
+        examples = (
+            _segment_slot_examples(traj, encoder, segment_length)
+            if config.slot_posterior
+            else _segment_examples(traj, encoder, segment_length)
+        )
+        for example in examples:
+            if config.slot_posterior:
+                xbar, valid, actions = example
+            else:
+                xbar, actions = example
+                valid = np.ones((len(xbar), config.state_num_tokens), np.bool_)
+            xbar_j = jnp.asarray(xbar)
+            valid_j = jnp.asarray(valid)
             actions_j = jnp.asarray(actions)
-            codes, xhat = R.posterior_rollout(params, x, actions_j, domain_idx, config)
+            codes, xbar_hat = R.posterior_rollout(
+                params, xbar_j, actions_j, domain_idx, config, valid_j
+            )
             codes = np.asarray(codes)
-            recon_sq += float(np.sum((np.asarray(xhat) - np.asarray(x)) ** 2))
-            recon_count += int(np.asarray(x).size)
+            squared = (
+                np.asarray(xbar_hat).reshape(
+                    len(xbar), config.state_num_tokens, config.state_token_dim
+                )
+                - np.asarray(xbar).reshape(
+                    len(xbar), config.state_num_tokens, config.state_token_dim
+                )
+            ) ** 2
+            recon_sq += float(np.sum(squared * valid[..., None]))
+            recon_count += int(valid.sum()) * config.state_token_dim
             # prior predictive accuracy along the exact codec path
             predictor.reset()
             prev = latent_schema.make_state([int(v) for v in codes[0]])
@@ -148,10 +215,14 @@ def latentize_trajectory(params, config: R.RSSMConfig, encoder, trajectory: Traj
     Stage-1 validation encodes this with one segment (segment_length >= T). The
     Stage-2 latent codec latentizes per segment internally instead."""
     latent_schema = _latent_schema(config)
-    x = np.stack([encoder.encode(state).flat() for state in trajectory.states]).astype(np.float32)
+    encoded = [encoder.encode(state) for state in trajectory.states]
+    xbar = np.stack([tokens.flat() for tokens in encoded]).astype(np.float32)
+    valid = np.stack([tokens.valid for tokens in encoded]).astype(np.bool_)
     actions = np.asarray(trajectory.actions, np.int32)
-    codes = np.asarray(
-        R.latentize_codes(params, jnp.asarray(x), jnp.asarray(actions), domain.index, config))
+    codes = np.asarray(R.latentize_codes(
+        params, jnp.asarray(xbar), jnp.asarray(actions), domain.index, config,
+        jnp.asarray(valid),
+    ))
     states = tuple(latent_schema.make_state([int(v) for v in row]) for row in codes)
     return Trajectory(states, tuple(int(a) for a in actions),
                       episode_id=trajectory.episode_id,

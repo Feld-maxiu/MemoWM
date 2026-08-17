@@ -13,6 +13,12 @@
 
 ResidualMem采用“冻结的Qwen3.5多模态观察编码器、统一概率latent world model、条件残差codec、任务效用门控、外部残差存储和状态修正解码器”的总体架构。训练目标采用任务相关的率失真准则，在状态重建、未来任务表现与实际记忆码长之间进行优化。该项目拟验证三个核心命题：第一，相同任务性能下，条件残差记忆比全量存储、摘要和surprise-gated memory使用更少存储；第二，随着世界模型预测能力增强，达到固定任务性能所需的外部记忆容量下降；第三，仅依赖预测误差会保存随机噪声，而结合未来任务效用能够得到更有效的记忆。
 
+> **实现状态（2026-08-12）**：v8 离散 World Model 证据门的 M0/M1 已完成。
+> full seed 0 在 validation 上达到 9,058.17 bits/transition，优于 copy-aware
+> 基线 9,564.59，但未优于更严格的 source-conditioned Markov 8,990.72。
+> 因而实验按预注册协议停止，未进入消融、闭环、test 或条件残差 codec；本报告
+> 以下系统设计仍是待验证方案，不能解读为端到端 ResidualMem 已成立。
+
 ---
 
 ## 1. 研究动机
@@ -337,6 +343,19 @@ $$
 
 ResidualMem可以对不同子空间采用不同失真权重，但不能只优化一个可自由漂移的learned latent。
 
+对于最终固定长度PCA状态，符号严格区分为：$x_t$表示原始PCA状态，$\bar x_t$表示只用训练划分统计得到的固定group×channel标准化状态，$z_t$只表示后续WM的分组categorical随机latent。令$m_{t,s}$为slot有效性，则：
+
+$$
+\bar x_{t,s,j}
+=
+m_{t,s}
+\frac{x_{t,s,j}-\mu_{g(s),j}}
+{\max(\sigma_{g(s),j},\sigma_{\min})}.
+\tag{9b}
+$$
+
+标准化后必须再次乘$m_{t,s}$，确保原始零padding不会因减均值变成非零向量。$\mu$与$\sigma$只能由训练划分的valid slots估计，训练、评测与部署使用同一冻结artifact；不得对单个状态独立LayerNorm并作为重建target。
+
 为了避免最后一层hidden state过度面向语言生成，可以融合视觉塔输出与中间多模态层：
 
 $$
@@ -402,21 +421,23 @@ p_\theta(z_t\mid \tilde h_t).
 \tag{12}
 $$
 
-看到真实观察编码$x_t$后，后验模型给出：
+看到真实的标准化观察状态$\bar x_t$后，后验通过mask-aware slot attention给出：
 
 $$
 q_t
 =
-q_\phi(z_t\mid \tilde h_t,x_t).
+q_\phi(z_t\mid \tilde h_t,\bar x_t,m_t).
 \tag{13}
 $$
 
-状态解码器恢复观察状态：
+invalid slots在attention logits中被屏蔽，且$\bar x_t$中的invalid位置保持精确零。状态解码器重建标准化状态：
 
 $$
-\hat x_t=D_\omega(\tilde h_t,z_t).
+\hat{\bar x}_t=D_\omega(\tilde h_t,z_t).
 \tag{14}
 $$
+
+重建损失只在valid slots上计算，并可先在image/detail/context/prompt各组内求masked mean，再按固定组权重聚合。需要回到原PCA空间时，使用冻结的$\mu,\sigma$对$\hat{\bar x}_t$做可逆反标准化并再次应用$m_t$。
 
 ### 6.2 离散概率latent
 

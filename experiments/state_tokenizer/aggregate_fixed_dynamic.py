@@ -16,6 +16,9 @@ SEEDS = (0, 1, 2)
 REPRESENTATIONS = (
     "full_h", "instruction_only", "task_only", "task_step", "y64", "y32", "x64"
 )
+OPTIONAL_COMPRESSED = (
+    "key64", "key64_pca", "key64_static", "key64_static_pca",
+)
 # Fixed prompt token states are causally contextualized by the preceding image/DOM.
 # They are therefore a compact page representation, not an instruction-semantics
 # leakage baseline.  Only metadata that never reads page contents is used below.
@@ -122,13 +125,23 @@ def main() -> None:
     parser.add_argument("--results", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    raw = {name: load_results(Path(args.results), name) for name in REPRESENTATIONS}
+    results_root = Path(args.results)
+    representations = list(REPRESENTATIONS)
+    compression_names = ["y64", "y32", "x64"]
+    for name in OPTIONAL_COMPRESSED:
+        paths = [results_root / f"result-{name}-seed{seed}.json" for seed in SEEDS]
+        if all(path.exists() for path in paths):
+            representations.append(name)
+            compression_names.append(name)
+        elif any(path.exists() for path in paths):
+            raise FileNotFoundError(f"incomplete optional representation: {name}")
+    raw = {name: load_results(results_root, name) for name in representations}
     summaries = {name: summarize(results) for name, results in raw.items()}
     leakage = strongest_leakage(summaries)
     leakage_name = leakage["representation"]
     compression = {
         name: retention(raw[name], raw["full_h"], raw[leakage_name])
-        for name in ("y64", "y32", "x64")
+        for name in compression_names
     }
     per_label_leakage = {
         label: strongest_leakage(summaries, label)
@@ -158,7 +171,7 @@ def main() -> None:
         writer = csv.writer(handle)
         writer.writerow(["label", "representation", "task_prevalence", "AP_mean", "AP_std"])
         for label in DYNAMIC_STATE_LABELS:
-            for name in REPRESENTATIONS:
+            for name in representations:
                 item = summaries[name]["labels"][label]
                 writer.writerow([
                     label, name, item["task_prevalence"],
@@ -169,7 +182,7 @@ def main() -> None:
         "output": str(output / "aggregate-fixed-dynamic.json"),
         "state_ap": {
             name: summaries[name]["state_task_macro_average_precision"]["mean"]
-            for name in REPRESENTATIONS
+            for name in representations
         },
         "strongest_leakage": leakage,
         "retention": {name: item["ratio_of_means"] for name, item in compression.items()},

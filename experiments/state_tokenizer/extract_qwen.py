@@ -56,14 +56,18 @@ def _prompt(dom: str, instruction: str) -> str:
     )
 
 
+def _input_text(processor, dom: str, instruction: str) -> str:
+    return (
+        f"{processor.vision_start_token}{processor.image_token}"
+        f"{processor.vision_end_token}\n{_prompt(dom, instruction)}"
+    )
+
+
 def _process_once(processor, image: Image.Image, dom: str, instruction: str):
     # Qwen3.5-9B-Base intentionally ships without a chat template.  Supply the
     # native multimodal sentinel sequence directly; Qwen3VLProcessor expands
     # the single image token to the exact number required by image_grid_thw.
-    text = (
-        f"{processor.vision_start_token}{processor.image_token}"
-        f"{processor.vision_end_token}\n{_prompt(dom, instruction)}"
-    )
+    text = _input_text(processor, dom, instruction)
     return processor(
         images=[image],
         text=[text],
@@ -125,6 +129,38 @@ def modality_indices(processor, model, input_ids: torch.Tensor) -> tuple[torch.T
         torch.arange(dom_start, dom_end, dtype=torch.long, device=device),
         torch.arange(instruction_start, instruction_end, dtype=torch.long, device=device),
     )
+
+
+def aligned_dom_token_offsets(
+    processor,
+    model,
+    text: str,
+    dom: str,
+    processed_ids: torch.Tensor,
+    processed_dom_indices: torch.Tensor,
+) -> list[tuple[int, int]]:
+    """Map processed DOM hidden positions to exact offsets in the raw DOM string."""
+    if text.count(dom) != 1:
+        raise ValueError("expected compact DOM to occur exactly once in Qwen input text")
+    dom_start = text.index(dom)
+    standalone = processor.tokenizer(
+        text,
+        add_special_tokens=True,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    )
+    standalone_dom = modality_indices(processor, model, standalone["input_ids"])[1]
+    processed_values = processed_ids[0].index_select(
+        0, processed_dom_indices.to(processed_ids.device)
+    ).cpu()
+    standalone_values = standalone["input_ids"][0].index_select(0, standalone_dom).cpu()
+    if not torch.equal(processed_values, standalone_values):
+        raise ValueError("standalone and multimodal processor DOM token IDs differ")
+    offsets = standalone["offset_mapping"][0].index_select(0, standalone_dom)
+    return [
+        (int(start) - dom_start, int(stop) - dom_start)
+        for start, stop in offsets.tolist()
+    ]
 
 
 def adaptive_pool_torch(values: torch.Tensor, slots: int) -> torch.Tensor:

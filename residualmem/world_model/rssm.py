@@ -10,8 +10,8 @@ the v0.3 line kept the Transformer optional.
 Notation (report Eqs. 11-15):
     h_t   deterministic state    h_t = f_theta(h_{t-1}, z_{t-1}, u_{t-1}, d)
     p_t   prior    p_theta(z_t | h_t)              -- used by the codec at decode time
-    q_t   posterior q_phi(z_t | h_t, x_t)          -- produces the realized code z_t^+
-    x_hat decoder  D_omega(h_t, z_t)               -- reconstructs the token target x_t
+    q_t   posterior q_phi(z_t | h_t, xbar_t, m_t) -- produces categorical code z_t
+    xbar_hat decoder D_omega(h_t, z_t)             -- reconstructs normalized xbar_t
 z_t is N groups of C categories. Only the decoder-side state advances the next
 step; the codec never lets an unsent posterior code bypass the transition.
 """
@@ -43,6 +43,33 @@ class RSSMConfig:
     kl_beta: float = 1.0
     kl_free_bits: float = 0.1    # nats per group
     recon_weight: float = 1.0
+    slot_posterior: bool = False
+    state_num_tokens: int = 1
+    state_token_dim: int = 40
+    posterior_heads: int = 4
+    recon_group_sizes: tuple[int, ...] = ()
+    recon_group_weights: tuple[float, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "recon_group_sizes", tuple(self.recon_group_sizes))
+        object.__setattr__(self, "recon_group_weights", tuple(self.recon_group_weights))
+        if self.state_num_tokens * self.state_token_dim != self.x_dim:
+            raise ValueError("state_num_tokens * state_token_dim must equal x_dim")
+        if self.slot_posterior:
+            if self.posterior_heads < 1 or self.post_hidden % self.posterior_heads:
+                raise ValueError("post_hidden must be divisible by posterior_heads")
+            if self.state_num_tokens < 2:
+                raise ValueError("slot posterior requires at least two state tokens")
+        if self.recon_group_sizes:
+            if sum(self.recon_group_sizes) != self.state_num_tokens:
+                raise ValueError("reconstruction group sizes must sum to state_num_tokens")
+            if self.recon_group_weights:
+                if len(self.recon_group_weights) != len(self.recon_group_sizes):
+                    raise ValueError("reconstruction group weights must match group sizes")
+                if any(weight < 0 for weight in self.recon_group_weights):
+                    raise ValueError("reconstruction group weights must be non-negative")
+                if sum(self.recon_group_weights) <= 0:
+                    raise ValueError("reconstruction group weights must sum positive")
 
     @property
     def latent_dim(self) -> int:
@@ -82,6 +109,12 @@ def initialize_params(config: RSSMConfig, seed: int = 0) -> dict[str, jax.Array]
         "dec/w2": weight((config.dec_hidden, config.x_dim), scale=0.01),
         "dec/b2": jnp.zeros((config.x_dim,), jnp.float32),
     }
+    if config.slot_posterior:
+        params["xenc/w"] = weight((config.state_token_dim, config.post_hidden))
+        params["post_q/w"] = weight((config.hidden_size, config.post_hidden))
+        params["post_k/w"] = weight((config.post_hidden, config.post_hidden))
+        params["post_v/w"] = weight((config.post_hidden, config.post_hidden))
+        params["post_attn_out/w"] = weight((config.post_hidden, config.post_hidden))
     return params
 
 
@@ -126,8 +159,39 @@ def prior_logits(params, h, config: RSSMConfig):
     return flat.reshape(flat.shape[:-1] + (config.num_groups, config.num_categories))
 
 
-def posterior_logits(params, h, x_flat, config: RSSMConfig):
-    xh = jax.nn.silu(x_flat @ params["xenc/w"] + params["xenc/b"])
+def posterior_logits(
+    params, h, xbar_flat, config: RSSMConfig, valid_mask=None,
+):
+    """q_phi(z_t | h_t, xbar_t, m_t); z_t is reserved for categorical codes."""
+    if config.slot_posterior:
+        tokens = xbar_flat.reshape(
+            xbar_flat.shape[:-1] + (config.state_num_tokens, config.state_token_dim)
+        )
+        if valid_mask is None:
+            valid_mask = jnp.ones(tokens.shape[:-1], jnp.bool_)
+        valid_mask = jnp.asarray(valid_mask, jnp.bool_)
+        if valid_mask.shape != tokens.shape[:-1]:
+            raise ValueError(
+                f"valid mask shape {valid_mask.shape} does not match tokens {tokens.shape[:-1]}"
+            )
+        xh = jax.nn.silu(tokens @ params["xenc/w"] + params["xenc/b"])
+        heads = config.posterior_heads
+        head_dim = config.post_hidden // heads
+        query = (h @ params["post_q/w"]).reshape(h.shape[:-1] + (heads, head_dim))
+        keys = (xh @ params["post_k/w"]).reshape(
+            xh.shape[:-1] + (heads, head_dim)
+        )
+        values = (xh @ params["post_v/w"]).reshape(
+            xh.shape[:-1] + (heads, head_dim)
+        )
+        logits = jnp.einsum("...hd,...khd->...hk", query, keys) / np.sqrt(head_dim)
+        logits = jnp.where(valid_mask[..., None, :], logits, -1e30)
+        weights = jax.nn.softmax(logits, axis=-1)
+        attended = jnp.einsum("...hk,...khd->...hd", weights, values)
+        attended = attended.reshape(h.shape[:-1] + (config.post_hidden,))
+        xh = attended @ params["post_attn_out/w"]
+    else:
+        xh = jax.nn.silu(xbar_flat @ params["xenc/w"] + params["xenc/b"])
     flat = jnp.concatenate([h, xh], -1) @ params["post/w"] + params["post/b"]
     return flat.reshape(flat.shape[:-1] + (config.num_groups, config.num_categories))
 
@@ -135,6 +199,38 @@ def posterior_logits(params, h, x_flat, config: RSSMConfig):
 def decode_tokens(params, h, zemb, config: RSSMConfig):
     hidden = jax.nn.silu(jnp.concatenate([h, zemb], -1) @ params["dec/w1"] + params["dec/b1"])
     return hidden @ params["dec/w2"] + params["dec/b2"]
+
+
+def reconstruction_loss(xbar_hat, xbar_t, valid_mask, config: RSSMConfig):
+    """Masked reconstruction in normalized xbar space, optionally group-balanced."""
+    if not config.slot_posterior:
+        return jnp.mean(jnp.square(xbar_hat - xbar_t))
+    predicted = xbar_hat.reshape((config.state_num_tokens, config.state_token_dim))
+    target = xbar_t.reshape((config.state_num_tokens, config.state_token_dim))
+    valid = jnp.asarray(valid_mask, jnp.float32)
+    squared = jnp.square(predicted - target)
+    if not config.recon_group_sizes:
+        return jnp.sum(squared * valid[:, None]) / jnp.maximum(
+            valid.sum() * config.state_token_dim, 1.0
+        )
+    group_losses = []
+    start = 0
+    for size in config.recon_group_sizes:
+        stop = start + size
+        group_valid = valid[start:stop]
+        group_losses.append(
+            jnp.sum(squared[start:stop] * group_valid[:, None])
+            / jnp.maximum(group_valid.sum() * config.state_token_dim, 1.0)
+        )
+        start = stop
+    losses = jnp.stack(group_losses)
+    if config.recon_group_weights:
+        weights = jnp.asarray(config.recon_group_weights, jnp.float32)
+        weights = weights / weights.sum()
+    else:
+        counts = jnp.asarray(config.recon_group_sizes, jnp.float32)
+        weights = counts / counts.sum()
+    return jnp.sum(losses * weights)
 
 
 def st_sample(logits, key):
@@ -159,11 +255,21 @@ def kl_grouped(q_logits, p_logits, free_bits):
 # --------------------------------------------------------------- sequence (train)
 
 
-def rssm_sequence(params, x_seq, actions, domain_idx, config: RSSMConfig, key,
-                  closed_loop: bool = False):
+def rssm_sequence(
+    params, xbar_seq, actions, domain_idx, config: RSSMConfig, key,
+    closed_loop: bool = False, valid_seq=None,
+):
     """Scan one trajectory; return (recon_loss, kl_loss). Advances teacher-forced
     with the posterior sample, or (closed_loop) with the prior mode."""
-    T = x_seq.shape[0]
+    T = xbar_seq.shape[0]
+    if valid_seq is None:
+        valid_seq = jnp.ones((T, config.state_num_tokens), jnp.bool_)
+    else:
+        valid_seq = jnp.asarray(valid_seq, jnp.bool_)
+        if valid_seq.shape != (T, config.state_num_tokens):
+            raise ValueError(
+                f"valid_seq must be {(T, config.state_num_tokens)}; got {valid_seq.shape}"
+            )
     h0 = jnp.zeros((config.hidden_size,), jnp.float32)
     z0 = jnp.zeros((config.embed_size,), jnp.float32)
     prev_actions = jnp.concatenate([jnp.zeros((1,), jnp.int32), actions.astype(jnp.int32)])
@@ -172,15 +278,20 @@ def rssm_sequence(params, x_seq, actions, domain_idx, config: RSSMConfig, key,
 
     def step(carry, xs):
         h_prev, zemb_prev = carry
-        x_t, a_prev, first, k = xs
+        xbar_t, valid_t, a_prev, first, k = xs
+        if config.slot_posterior:
+            xbar_t = (
+                xbar_t.reshape((config.state_num_tokens, config.state_token_dim))
+                * valid_t[:, None]
+            ).reshape((config.x_dim,))
         h_trans = transition(params, h_prev, zemb_prev, a_prev, 1.0, domain_idx, config)
         h = jnp.where(first > 0.5, jnp.zeros_like(h_trans), h_trans)
         plog = prior_logits(params, h, config)
-        qlog = posterior_logits(params, h, x_t, config)
+        qlog = posterior_logits(params, h, xbar_t, config, valid_t)
         onehot, codes = st_sample(qlog, k)
         zemb_post = embed_onehot(params, onehot, config)
-        xhat = decode_tokens(params, h, zemb_post, config)
-        recon = jnp.mean(jnp.square(xhat - x_t))
+        xbar_hat = decode_tokens(params, h, zemb_post, config)
+        recon = reconstruction_loss(xbar_hat, xbar_t, valid_t, config)
         kl = kl_grouped(qlog, plog, config.kl_free_bits)
         if closed_loop:
             prior_codes = jnp.argmax(plog, -1)
@@ -190,22 +301,30 @@ def rssm_sequence(params, x_seq, actions, domain_idx, config: RSSMConfig, key,
         return (h, zemb_next), (recon, kl)
 
     _, (recon, kl) = jax.lax.scan(
-        step, (h0, z0), (x_seq, prev_actions, is_first, keys))
+        step, (h0, z0), (xbar_seq, valid_seq, prev_actions, is_first, keys))
     return jnp.mean(recon), jnp.mean(kl)
 
 
-def rssm_loss(params, x_seq, actions, domain_idx, config: RSSMConfig, key,
-              closed_loop: bool = False):
-    recon, kl = rssm_sequence(params, x_seq, actions, domain_idx, config, key, closed_loop)
+def rssm_loss(
+    params, xbar_seq, actions, domain_idx, config: RSSMConfig, key,
+    closed_loop: bool = False, valid_seq=None,
+):
+    recon, kl = rssm_sequence(
+        params, xbar_seq, actions, domain_idx, config, key,
+        closed_loop, valid_seq,
+    )
     return config.recon_weight * recon + config.kl_beta * kl
 
 
-def latentize_codes(params, x_seq, actions, domain_idx, config: RSSMConfig):
-    """Deterministic posterior encode -> realized latent codes z^+ (T, N).
-
-    Advances with the argmax posterior code (== decoder-side state in exact mode),
-    so the codec's LatentPredictor reproduces every ``h_t`` exactly."""
-    T = x_seq.shape[0]
+def latentize_codes(
+    params, xbar_seq, actions, domain_idx, config: RSSMConfig, valid_seq=None,
+):
+    """Deterministic posterior encode -> categorical codes z_t (T, N)."""
+    T = xbar_seq.shape[0]
+    valid_seq = (
+        jnp.ones((T, config.state_num_tokens), jnp.bool_)
+        if valid_seq is None else jnp.asarray(valid_seq, jnp.bool_)
+    )
     h0 = jnp.zeros((config.hidden_size,), jnp.float32)
     z0 = jnp.zeros((config.embed_size,), jnp.float32)
     prev_actions = jnp.concatenate([jnp.zeros((1,), jnp.int32), actions.astype(jnp.int32)])
@@ -213,24 +332,34 @@ def latentize_codes(params, x_seq, actions, domain_idx, config: RSSMConfig):
 
     def step(carry, xs):
         h_prev, zemb_prev = carry
-        x_t, a_prev, first = xs
+        xbar_t, valid_t, a_prev, first = xs
+        if config.slot_posterior:
+            xbar_t = (
+                xbar_t.reshape((config.state_num_tokens, config.state_token_dim))
+                * valid_t[:, None]
+            ).reshape((config.x_dim,))
         h_trans = transition(params, h_prev, zemb_prev, a_prev, 1.0, domain_idx, config)
         h = jnp.where(first > 0.5, jnp.zeros_like(h_trans), h_trans)
-        qlog = posterior_logits(params, h, x_t, config)
+        qlog = posterior_logits(params, h, xbar_t, config, valid_t)
         codes = jnp.argmax(qlog, -1)
         zemb = embed_codes(params, codes, config)
         return (h, zemb), codes
 
-    _, codes = jax.lax.scan(step, (h0, z0), (x_seq, prev_actions, is_first))
+    _, codes = jax.lax.scan(
+        step, (h0, z0), (xbar_seq, valid_seq, prev_actions, is_first)
+    )
     return codes
 
 
-def posterior_rollout(params, x_seq, actions, domain_idx, config: RSSMConfig):
-    """Deterministic encode returning (codes z^+ (T, N), x_hat (T, x_dim)).
-
-    Used for evaluation: ``x_hat`` is the reconstruction distortion target and
-    ``codes`` are what the exact codec would store."""
-    T = x_seq.shape[0]
+def posterior_rollout(
+    params, xbar_seq, actions, domain_idx, config: RSSMConfig, valid_seq=None,
+):
+    """Return categorical z_t codes and reconstructed normalized xbar_t."""
+    T = xbar_seq.shape[0]
+    valid_seq = (
+        jnp.ones((T, config.state_num_tokens), jnp.bool_)
+        if valid_seq is None else jnp.asarray(valid_seq, jnp.bool_)
+    )
     h0 = jnp.zeros((config.hidden_size,), jnp.float32)
     z0 = jnp.zeros((config.embed_size,), jnp.float32)
     prev_actions = jnp.concatenate([jnp.zeros((1,), jnp.int32), actions.astype(jnp.int32)])
@@ -238,17 +367,24 @@ def posterior_rollout(params, x_seq, actions, domain_idx, config: RSSMConfig):
 
     def step(carry, xs):
         h_prev, zemb_prev = carry
-        x_t, a_prev, first = xs
+        xbar_t, valid_t, a_prev, first = xs
+        if config.slot_posterior:
+            xbar_t = (
+                xbar_t.reshape((config.state_num_tokens, config.state_token_dim))
+                * valid_t[:, None]
+            ).reshape((config.x_dim,))
         h_trans = transition(params, h_prev, zemb_prev, a_prev, 1.0, domain_idx, config)
         h = jnp.where(first > 0.5, jnp.zeros_like(h_trans), h_trans)
-        qlog = posterior_logits(params, h, x_t, config)
+        qlog = posterior_logits(params, h, xbar_t, config, valid_t)
         codes = jnp.argmax(qlog, -1)
         zemb = embed_codes(params, codes, config)
-        xhat = decode_tokens(params, h, zemb, config)
-        return (h, zemb), (codes, xhat)
+        xbar_hat = decode_tokens(params, h, zemb, config)
+        return (h, zemb), (codes, xbar_hat)
 
-    _, (codes, xhat) = jax.lax.scan(step, (h0, z0), (x_seq, prev_actions, is_first))
-    return codes, xhat
+    _, (codes, xbar_hat) = jax.lax.scan(
+        step, (h0, z0), (xbar_seq, valid_seq, prev_actions, is_first)
+    )
+    return codes, xbar_hat
 
 
 # --------------------------------------------------------------------- checkpoint

@@ -49,10 +49,49 @@ def _safe_sidecar(env) -> list[dict]:
         return []
 
 
+INTERACTIVE_TAGS = {
+    "input_checkbox", "input_radio", "input_text", "input_password", "textarea",
+    "button", "a", "label", "input_button", "input_submit", "option", "select",
+}
+TYPING_TAGS = {"input_text", "input_password", "textarea"}
+
+
+def _random_action(env, observation: dict, rng: np.random.Generator):
+    """Uniformly sample one legal action over the page's interactive elements.
+
+    The scripted policy is a deterministic priority cascade, so ``u_t`` is very
+    nearly a function of ``y_t`` -- which makes "does the action carry
+    information beyond the state?" unanswerable no matter how much data is
+    collected. Sampling uniformly over legal actions breaks that dependence.
+    """
+    elements = [
+        element for element in observation.get("dom_elements", ())
+        if element.get("tag") in INTERACTIVE_TAGS
+    ]
+    if not elements:
+        return None, None
+    element = elements[int(rng.integers(len(elements)))]
+    ref = int(normalize_scalar(element["ref"]))
+    if element.get("tag") in TYPING_TAGS:
+        text = f"state-{int(rng.integers(0, 100000)):05d}"
+        return (
+            env.unwrapped.create_action(
+                ActionTypes.FOCUS_ELEMENT_AND_TYPE_TEXT, ref=ref, text=text
+            ),
+            {"type": "FOCUS_ELEMENT_AND_TYPE_TEXT", "ref": ref, "text": text,
+             "tag": element.get("tag"), "policy": "random"},
+        )
+    return (
+        env.unwrapped.create_action(ActionTypes.CLICK_ELEMENT, ref=ref),
+        {"type": "CLICK_ELEMENT", "ref": ref, "text": None,
+         "tag": element.get("tag"), "policy": "random"},
+    )
+
+
 def _make_action(env, observation: dict, rng: np.random.Generator, step: int):
     elements = list(observation.get("dom_elements", ()))
     if not elements:
-        return None
+        return None, None
 
     def shuffled(candidates):
         candidates = list(candidates)
@@ -65,8 +104,11 @@ def _make_action(env, observation: dict, rng: np.random.Generator, step: int):
         and not bool(normalize_scalar(element.get("value")))
     ]
     if unchecked:
-        return env.unwrapped.create_action(
-            ActionTypes.CLICK_ELEMENT, ref=int(normalize_scalar(unchecked[0]["ref"]))
+        ref = int(normalize_scalar(unchecked[0]["ref"]))
+        return (
+            env.unwrapped.create_action(ActionTypes.CLICK_ELEMENT, ref=ref),
+            {"type": "CLICK_ELEMENT", "ref": ref, "text": None,
+             "tag": unchecked[0].get("tag"), "policy": "scripted"},
         )
 
     textboxes = shuffled(
@@ -74,16 +116,23 @@ def _make_action(env, observation: dict, rng: np.random.Generator, step: int):
         if element.get("tag") in {"input_text", "textarea", "input_password"}
     )
     if textboxes and step == 0:
-        return env.unwrapped.create_action(
-            ActionTypes.FOCUS_ELEMENT_AND_TYPE_TEXT,
-            ref=int(normalize_scalar(textboxes[0]["ref"])),
-            text=f"state-{int(rng.integers(0, 100000)):05d}",
+        ref = int(normalize_scalar(textboxes[0]["ref"]))
+        text = f"state-{int(rng.integers(0, 100000)):05d}"
+        return (
+            env.unwrapped.create_action(
+                ActionTypes.FOCUS_ELEMENT_AND_TYPE_TEXT, ref=ref, text=text
+            ),
+            {"type": "FOCUS_ELEMENT_AND_TYPE_TEXT", "ref": ref, "text": text,
+             "tag": textboxes[0].get("tag"), "policy": "scripted"},
         )
 
     options = shuffled(element for element in elements if element.get("tag") == "option")
     if options:
-        return env.unwrapped.create_action(
-            ActionTypes.CLICK_ELEMENT, ref=int(normalize_scalar(options[0]["ref"]))
+        ref = int(normalize_scalar(options[0]["ref"]))
+        return (
+            env.unwrapped.create_action(ActionTypes.CLICK_ELEMENT, ref=ref),
+            {"type": "CLICK_ELEMENT", "ref": ref, "text": None,
+             "tag": options[0].get("tag"), "policy": "scripted"},
         )
 
     clickable_tags = {"button", "a", "label", "input_button", "input_submit", "div"}
@@ -93,10 +142,28 @@ def _make_action(env, observation: dict, rng: np.random.Generator, step: int):
         and (element.get("text") or element.get("tag") != "div")
     )
     if clickable:
-        return env.unwrapped.create_action(
-            ActionTypes.CLICK_ELEMENT, ref=int(normalize_scalar(clickable[0]["ref"]))
+        ref = int(normalize_scalar(clickable[0]["ref"]))
+        return (
+            env.unwrapped.create_action(ActionTypes.CLICK_ELEMENT, ref=ref),
+            {"type": "CLICK_ELEMENT", "ref": ref, "text": None,
+             "tag": clickable[0].get("tag"), "policy": "scripted"},
         )
-    return None
+    return None, None
+
+
+def _choose_action(env, observation, rng, step, random_prob: float):
+    """Scripted cascade with probability ``1 - random_prob``, else a random action.
+
+    Pure exploration would maximise action entropy but terminate multi-step tasks
+    early (a wrong click ends form-sequence), starving exactly the deep states the
+    history question needs. Mixing keeps trajectory depth while still making half
+    the transitions interventional.
+    """
+    if random_prob > 0.0 and float(rng.random()) < random_prob:
+        action, described = _random_action(env, observation, rng)
+        if action is not None:
+            return action, described
+    return _make_action(env, observation, rng, step)
 
 
 def _save_state(
@@ -161,19 +228,23 @@ def collect(args: argparse.Namespace) -> dict:
             try:
                 while task_total < per_task:
                     seed = args.seed + task_index * 1_000_000 + episode_index
+                    episode: list[dict] = []
                     try:
                         observation, _ = env.reset(
                             seed=seed, options={"record_screenshots": True, "data_mode": "train"}
                         )
                         rng = np.random.default_rng(seed)
+                        # The action is only known after its state has been built,
+                        # so the episode is buffered and flushed once complete:
+                        # record[t]["action"] is what led to record[t+1].
                         for step in range(args.max_steps + 1):
                             record = _save_state(
                                 output, task, task_index, episode_index, step,
                                 observation, _safe_sidecar(env),
                             )
                             if record is not None:
-                                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                                handle.flush()
+                                record["action"] = None
+                                episode.append(record)
                                 split = record["split"]
                                 counts[split] += 1
                                 task_total += 1
@@ -185,20 +256,31 @@ def collect(args: argparse.Namespace) -> dict:
                                     )
                                 if task_total >= per_task:
                                     break
-                            action = _make_action(env, observation, rng, step)
+                            action, described = _choose_action(
+                                env, observation, rng, step, args.random_action_prob
+                            )
                             if action is None:
                                 break
+                            if record is not None:
+                                record["action"] = described
                             observation, _, terminated, truncated, _ = env.step(action)
                             if terminated or truncated:
                                 break
                     except Exception:
                         logging.exception("Episode failed: task=%s episode=%d", task, episode_index)
+                    finally:
+                        for item in episode:
+                            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                        handle.flush()
                     episode_index += args.num_workers
             finally:
                 env.close()
             task_counts[task] = task_total
     summary = {
         "worker_id": args.worker_id,
+        "random_action_prob": args.random_action_prob,
+        "max_steps": args.max_steps,
+        "seed": args.seed,
         "num_workers": args.num_workers,
         "records": total,
         "split_counts": counts,
@@ -216,6 +298,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-id", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=3)
+    parser.add_argument("--random-action-prob", type=float, default=0.0,
+                        help="probability of replacing the scripted action with a "
+                             "uniform draw over the page's legal actions. 0 "
+                             "reproduces the v4/v5 collection exactly; the scripted "
+                             "policy is near-deterministic given the observation, so "
+                             "a positive value is what makes the action carry "
+                             "information beyond the state")
     parser.add_argument("--wait-ms", type=float, default=150.0)
     parser.add_argument("--refresh-freq", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
@@ -225,6 +314,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 0 <= args.worker_id < args.num_workers:
         parser.error("worker-id must be in [0, num-workers)")
+    if not 0.0 <= args.random_action_prob <= 1.0:
+        parser.error("random-action-prob must be in [0, 1]")
     return args
 
 

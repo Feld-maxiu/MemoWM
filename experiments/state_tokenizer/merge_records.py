@@ -24,11 +24,19 @@ def main() -> None:
     split_counts = {"train": 0, "validation": 0, "test": 0}
     task_counts: dict[str, int] = {}
     with output.open("w", encoding="utf-8") as handle:
-        for record in records:
+        for index, record in enumerate(records):
             state_id = record["state_id"]
             if state_id in seen:
                 raise ValueError(f"duplicate state_id: {state_id}")
             seen.add(state_id)
+            # ``global_index`` is the row position in this file, which is exactly
+            # what the extraction chain assumes: extract_qwen shards with
+            # ``arange(rank, len(records), world_size)`` over this manifest, and
+            # extract_full_h / rebuild_static_key64 look features up by it. Writing
+            # it here keeps the manifest self-contained; build_split_721 assigns it
+            # too, but only for the incremental case where an earlier extraction's
+            # indices have to be preserved.
+            record["global_index"] = index
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             split_counts[record["split"]] += 1
             task_counts[record["task"]] = task_counts.get(record["task"], 0) + 1

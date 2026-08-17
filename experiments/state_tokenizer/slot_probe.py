@@ -26,7 +26,8 @@ from .v2_data import DYNAMIC_LABELS, STATIC_LABELS
 
 
 REPRESENTATIONS = (
-    "full_h", "instruction_only", "y64", "y32", "x64", "task_only", "task_step"
+    "full_h", "instruction_only", "y64", "y32", "x64", "key64", "key64_pca",
+    "key64_static", "key64_static_pca", "task_only", "task_step",
 )
 OBJECTIVES = ("full", "value_only", "dynamic_state_only")
 DYNAMIC_STATE_LABELS = (
@@ -590,7 +591,11 @@ def train(args: argparse.Namespace) -> dict:
             "reader_queries": 1,
             "reader_cross_attention_layers": 1,
             "reader_attention_heads": 4,
-            "normalized_position": "(i+0.5)/N_modality",
+            "position_contract": (
+                "explicit source-aware positions with valid mask"
+                if args.representation.startswith("key64")
+                else "(i+0.5)/N_modality"
+            ),
             "cpu_threads": args.cpu_threads,
             "objective": args.objective,
             "train_examples": int(len(train_rows)),

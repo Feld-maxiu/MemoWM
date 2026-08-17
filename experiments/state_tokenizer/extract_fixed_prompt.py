@@ -16,16 +16,22 @@ from .common import SLOT_LAYOUTS, iter_jsonl, write_json
 from .extract_full_h import _open_array
 from .extract_qwen import (
     _StopAtLayer,
+    _input_text,
     _load_model,
     adaptive_pool_torch,
+    aligned_dom_token_offsets,
     bf16_bits,
     modality_indices,
     prepare_inputs,
 )
+from .key_pooling import DETAIL_SLOTS, KEY64_LAYOUT, build_key64
 from .ragged_store import global_modality_lengths
 
 
-def _prepare(processor, model, record: dict, records_path: Path, max_length: int):
+def _prepare(
+    processor, model, record: dict, records_path: Path, max_length: int,
+    *, need_dom_offsets: bool = True,
+):
     image_path = records_path.resolve().parent / record["screenshot"]
     with Image.open(image_path) as handle:
         inputs, truncated, _, _ = prepare_inputs(
@@ -34,7 +40,13 @@ def _prepare(processor, model, record: dict, records_path: Path, max_length: int
     if truncated:
         raise ValueError(f"fixed-prompt record was truncated: {record['state_id']}")
     indices = modality_indices(processor, model, inputs["input_ids"])
-    return inputs, indices
+    dom_offsets = None
+    if need_dom_offsets:
+        text = _input_text(processor, record["dom"], record["instruction"])
+        dom_offsets = aligned_dom_token_offsets(
+            processor, model, text, record["dom"], inputs["input_ids"], indices[1]
+        )
+    return inputs, indices, dom_offsets
 
 
 def cache_modality_lengths(
@@ -65,8 +77,9 @@ def extract(args: argparse.Namespace) -> dict:
     global_indices = np.asarray([subset[row]["global_index"] for row in subset_rows], np.int64)
 
     processor, model = _load_model(args.model, device, args.use_kernels)
-    first_inputs, first_indices = _prepare(
-        processor, model, subset[int(subset_rows[0])], records_path, args.max_length
+    first_inputs, first_indices, first_dom_offsets = _prepare(
+        processor, model, subset[int(subset_rows[0])], records_path, args.max_length,
+        need_dom_offsets=not args.instruction_only_cache,
     )
     first_lengths = np.asarray([len(index) for index in first_indices], np.int32)
     source_count = sum(1 for _ in iter_jsonl(args.source_records))
@@ -94,13 +107,49 @@ def extract(args: argparse.Namespace) -> dict:
         output / "tokens-bf16.npy", np.uint16, (int(offsets[-1]), 4096), args.resume
     )
     y64 = y32 = None
+    key64 = key64_valid = key64_positions = key64_detail_source = None
+    key64_audit = key64_overflow = key64_done = None
     if not args.instruction_only_cache:
+        key_bundle = [
+            output / "key64-bf16.npy", output / "key64-valid.npy",
+            output / "key64-positions.npy", output / "key64-detail-source.npy",
+            output / "key64-audit.npy", output / "key64-overflow.npy",
+            output / "key64-done.npy",
+        ]
+        key_bundle_complete = all(path.exists() for path in key_bundle)
+        if args.resume and any(path.exists() for path in key_bundle) and not key_bundle_complete:
+            raise RuntimeError(f"incomplete key64 resume bundle in {output}")
         y64 = _open_array(
             output / "y64-bf16.npy", np.uint16, (len(subset_rows), 64, 4096), args.resume
         )
         y32 = _open_array(
             output / "y32-bf16.npy", np.uint16, (len(subset_rows), 32, 4096), args.resume
         )
+        key64 = _open_array(
+            output / "key64-bf16.npy", np.uint16, (len(subset_rows), 64, 4096), args.resume
+        )
+        key64_valid = _open_array(
+            output / "key64-valid.npy", np.bool_, (len(subset_rows), 64), args.resume
+        )
+        key64_positions = _open_array(
+            output / "key64-positions.npy", np.float32, (len(subset_rows), 64), args.resume
+        )
+        key64_detail_source = _open_array(
+            output / "key64-detail-source.npy", np.int32,
+            (len(subset_rows), DETAIL_SLOTS), args.resume,
+        )
+        key64_audit = _open_array(
+            output / "key64-audit.npy", np.int32, (len(subset_rows), 6), args.resume
+        )
+        key64_overflow = _open_array(
+            output / "key64-overflow.npy", np.bool_, (len(subset_rows),), args.resume
+        )
+        key64_done = _open_array(
+            output / "key64-done.npy", np.bool_, (len(subset_rows),), args.resume
+        )
+        if not args.resume or not key_bundle_complete:
+            key64_done[:] = False
+            key64_done.flush()
     done = _open_array(output / "done.npy", np.bool_, (len(subset_rows),), args.resume)
     if not args.resume:
         done[:] = False
@@ -118,16 +167,23 @@ def extract(args: argparse.Namespace) -> dict:
 
     handle = layers[args.layer - 1].register_forward_hook(hook)
     started = time.time()
-    completed = int(np.asarray(done).sum())
+    completion = np.asarray(done, np.bool_)
+    if key64_done is not None:
+        completion = completion & np.asarray(key64_done, np.bool_)
+    completed = int(completion.sum())
     try:
         for local, subset_row in enumerate(subset_rows):
-            if bool(done[local]):
+            if bool(done[local]) and (key64_done is None or bool(key64_done[local])):
                 continue
             record = subset[int(subset_row)]
             if local == 0:
-                inputs, indices = first_inputs, first_indices
+                inputs, indices, dom_offsets = first_inputs, first_indices, first_dom_offsets
             else:
-                inputs, indices = _prepare(processor, model, record, records_path, args.max_length)
+                inputs, indices, dom_offsets = _prepare(
+                    processor, model, record, records_path, args.max_length,
+                    need_dom_offsets=not args.instruction_only_cache,
+                )
+            image_grid_thw = inputs["image_grid_thw"][0].tolist()
             inputs = inputs.to(device)
             indices = tuple(index.to(device) for index in indices)
             capture.clear()
@@ -136,7 +192,7 @@ def extract(args: argparse.Namespace) -> dict:
                     model.model(**inputs, use_cache=False, output_hidden_states=False)
             except _StopAtLayer:
                 pass
-            hidden = capture.get("hidden")
+            hidden = capture.pop("hidden", None)
             if hidden is None:
                 raise RuntimeError(f"layer hook did not fire for {record['state_id']}")
             parts = [hidden[0].index_select(0, index) for index in indices]
@@ -148,6 +204,7 @@ def extract(args: argparse.Namespace) -> dict:
                 )
             flat = parts[2] if args.instruction_only_cache else torch.cat(parts, dim=0)
             pooled = {}
+            key_output = None
             if not args.instruction_only_cache:
                 pooled = {
                     total: torch.cat([
@@ -156,25 +213,54 @@ def extract(args: argparse.Namespace) -> dict:
                     ])
                     for total, layout in SLOT_LAYOUTS.items()
                 }
+                key_output = build_key64(
+                    parts[0], parts[1], parts[2],
+                    dom=record["dom"],
+                    dom_token_offsets=dom_offsets,
+                    image_grid_thw=image_grid_thw,
+                    spatial_merge_size=int(model.config.vision_config.spatial_merge_size),
+                )
             start, stop = int(offsets[local]), int(offsets[local + 1])
             tokens[start:stop] = bf16_bits(flat)
             if y64 is not None and y32 is not None:
+                if key_output is None:
+                    raise RuntimeError("key64 output was not produced")
                 y64[local] = bf16_bits(pooled[64])
                 y32[local] = bf16_bits(pooled[32])
+                key64[local] = bf16_bits(key_output.tokens)
+                key64_valid[local] = key_output.valid.cpu().numpy()
+                key64_positions[local] = key_output.positions.cpu().numpy()
+                key64_detail_source[local] = key_output.detail_source.cpu().numpy()
+                key64_audit[local] = np.asarray([
+                    key_output.audit["candidate_spans"],
+                    key_output.audit["selected_spans"],
+                    key_output.audit["selected_tokens"],
+                    key_output.audit["dom_nodes"],
+                    key_output.audit["context_nodes"],
+                    key_output.audit["separator_dom_tokens"],
+                ], np.int32)
+                key64_overflow[local] = key_output.audit["detail_overflow"]
+                key64_done[local] = True
             done[local] = True
             completed += 1
             if completed % args.flush_every == 0 or completed == len(subset_rows):
-                arrays = [tokens, done]
+                arrays = [tokens]
                 if y64 is not None and y32 is not None:
-                    arrays.extend((y64, y32))
+                    arrays.extend((
+                        y64, y32, key64, key64_valid, key64_positions,
+                        key64_detail_source, key64_audit, key64_overflow,
+                    ))
                 for array in arrays:
                     array.flush()
+                if key64_done is not None:
+                    key64_done.flush()
+                done.flush()
                 elapsed = time.time() - started
                 logging.info(
                     "rank=%d completed=%d/%d rate=%.3f states/s",
                     args.rank, completed, len(subset_rows), completed / max(elapsed, 1e-6),
                 )
-            del inputs, hidden, flat, parts, pooled
+            del inputs, hidden, flat, parts, pooled, key_output
     finally:
         handle.remove()
     elapsed = time.time() - started
@@ -197,6 +283,24 @@ def extract(args: argparse.Namespace) -> dict:
         "early_stop": args.early_stop,
         "use_kernels": args.use_kernels,
     }
+    if key64_audit is not None:
+        audit_values = np.asarray(key64_audit)
+        valid_values = np.asarray(key64_valid)
+        grid = [int(value) for value in first_inputs["image_grid_thw"][0].tolist()]
+        merge = int(model.config.vision_config.spatial_merge_size)
+        merged_hw = [grid[1] // merge, grid[2] // merge]
+        summary["key64"] = {
+            "protocol": "fixed_prompt_key64_v1",
+            "layout": list(KEY64_LAYOUT),
+            "merged_image_hw": merged_hw,
+            "pooled_image_hw": [8, 4] if merged_hw[0] >= merged_hw[1] else [4, 8],
+            "detail_overflow_count": int(np.asarray(key64_overflow).sum()),
+            "detail_valid_min": int(valid_values[:, 32:44].sum(axis=1).min()),
+            "detail_valid_max": int(valid_values[:, 32:44].sum(axis=1).max()),
+            "context_valid_min": int(valid_values[:, 44:60].sum(axis=1).min()),
+            "context_valid_max": int(valid_values[:, 44:60].sum(axis=1).max()),
+            "separator_dom_tokens": int(audit_values[:, 5].sum()),
+        }
     write_json(output / "fixed-prompt-summary.json", summary)
     return summary
 

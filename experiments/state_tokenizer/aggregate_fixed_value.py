@@ -16,6 +16,9 @@ REPRESENTATIONS = (
     "full_h", "instruction_only", "task_only", "task_step", "y64", "y32", "x64"
 )
 COMPRESSED = ("instruction_only", "y64", "y32", "x64")
+OPTIONAL_COMPRESSED = (
+    "key64", "key64_pca", "key64_static", "key64_static_pca",
+)
 METADATA_BASELINES = ("task_only", "task_step")
 CHANCE = {
     "macro_position_accuracy": 0.1,
@@ -140,14 +143,24 @@ def main() -> None:
     parser.add_argument("--results", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    raw = {name: load_results(Path(args.results), name) for name in REPRESENTATIONS}
+    results_root = Path(args.results)
+    representations = list(REPRESENTATIONS)
+    compressed = list(COMPRESSED)
+    for name in OPTIONAL_COMPRESSED:
+        paths = [results_root / f"result-{name}-seed{seed}.json" for seed in SEEDS]
+        if all(path.exists() for path in paths):
+            representations.append(name)
+            compressed.append(name)
+        elif any(path.exists() for path in paths):
+            raise FileNotFoundError(f"incomplete optional representation: {name}")
+    raw = {name: load_results(results_root, name) for name in representations}
     summaries = {name: summarize(results) for name, results in raw.items()}
     chance_compression = {
         name: {
             metric_name: chance_adjusted_retention(raw[name], raw["full_h"], metric_name)
             for metric_name in CHANCE
         }
-        for name in COMPRESSED
+        for name in compressed
     }
     metadata = {
         metric_name: strongest_metadata(raw, metric_name)
@@ -161,7 +174,7 @@ def main() -> None:
             )
             for metric_name in CHANCE
         }
-        for name in COMPRESSED
+        for name in compressed
     }
     report = {
         "protocol": "slot_aware_v3_fixed_prompt_value_retention",
@@ -185,7 +198,7 @@ def main() -> None:
             "position_relative_loss", "exact_retention", "exact_relative_loss",
             "chance_position_retention", "chance_exact_retention",
         ])
-        for name in REPRESENTATIONS:
+        for name in representations:
             item = compression.get(name, {})
             writer.writerow([
                 name,
@@ -208,23 +221,23 @@ def main() -> None:
         "output": str(output / "aggregate-fixed-value.json"),
         "position_accuracy": {
             name: summaries[name]["macro_position_accuracy"]["mean"]
-            for name in REPRESENTATIONS
+            for name in representations
         },
         "exact_accuracy": {
             name: summaries[name]["exact_value_accuracy"]["mean"]
-            for name in REPRESENTATIONS
+            for name in representations
         },
         "position_retention": {
             name: compression[name]["macro_position_accuracy"]["ratio_of_means"]
-            for name in COMPRESSED
+            for name in compressed
         },
         "exact_retention": {
             name: compression[name]["exact_value_accuracy"]["ratio_of_means"]
-            for name in COMPRESSED
+            for name in compressed
         },
         "chance_position_retention": {
             name: chance_compression[name]["macro_position_accuracy"]["ratio_of_means"]
-            for name in COMPRESSED
+            for name in compressed
         },
         "metadata_baselines": metadata,
     }, indent=2, sort_keys=True))

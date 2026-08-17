@@ -135,29 +135,104 @@ class FixedRepresentationStore:
         "y64": ("y64-bf16.npy", 64, 4096, (40, 20, 4)),
         "y32": ("y32-bf16.npy", 32, 4096, (20, 10, 2)),
         "x64": ("x64-pca-bf16.npy", 64, 512, (40, 20, 4)),
+        "key64": ("key64-bf16.npy", 64, 4096, (32, 28, 4)),
+        "key64_pca": ("key64-pca-bf16.npy", 64, 512, (32, 28, 4)),
+        "key64_static": ("key64-static-bf16.npy", 64, 4096, (32, 28, 4)),
+        "key64_static_pca": ("key64-static-pca-bf16.npy", 64, 512, (32, 28, 4)),
+    }
+    EXPLICIT_METADATA = {"key64", "key64_pca", "key64_static", "key64_static_pca"}
+    METADATA_PREFIX = {
+        "key64": "key64",
+        "key64_pca": "key64",
+        "key64_static": "key64-static",
+        "key64_static_pca": "key64-static",
+    }
+    COMPLETION_FILE = {
+        "key64_pca": "key64-pca-done.npy",
+        "key64_static_pca": "key64-static-pca-done.npy",
     }
 
     def __init__(self, root: str | Path, representation: str):
         if representation not in self.SPECS:
             raise ValueError(representation)
         self.filename, self.slots, self.width, self.layout = self.SPECS[representation]
+        self.explicit_metadata = representation in self.EXPLICIT_METADATA
+        self.metadata_prefix = self.METADATA_PREFIX.get(representation)
         self.locations = {}
         self.arrays = {}
         for shard in discover_shards(root):
-            if not (shard.path / self.filename).exists():
-                raise FileNotFoundError(shard.path / self.filename)
+            required = [shard.path / self.filename]
+            if self.explicit_metadata:
+                required.extend((
+                    shard.path / f"{self.metadata_prefix}-valid.npy",
+                    shard.path / f"{self.metadata_prefix}-positions.npy",
+                ))
+            completion_name = self.COMPLETION_FILE.get(representation)
+            if completion_name:
+                required.append(shard.path / completion_name)
+            for path in required:
+                if not path.exists():
+                    raise FileNotFoundError(path)
+            tokens = np.load(shard.path / self.filename, mmap_mode="r")
+            expected_shape = (len(shard.indices), self.slots, self.width)
+            if tokens.shape != expected_shape or tokens.dtype != np.uint16:
+                raise ValueError(
+                    f"invalid representation array {shard.path / self.filename}: "
+                    f"{tokens.shape} {tokens.dtype}, expected {expected_shape} uint16"
+                )
+            if self.explicit_metadata:
+                valid = np.load(
+                    shard.path / f"{self.metadata_prefix}-valid.npy", mmap_mode="r"
+                )
+                positions = np.load(
+                    shard.path / f"{self.metadata_prefix}-positions.npy", mmap_mode="r"
+                )
+                if valid.shape != expected_shape[:2] or valid.dtype != np.bool_:
+                    raise ValueError(f"invalid validity metadata in {shard.path}")
+                if positions.shape != expected_shape[:2] or positions.dtype != np.float32:
+                    raise ValueError(f"invalid position metadata in {shard.path}")
+                finite_valid = np.asarray(positions)[np.asarray(valid)]
+                if not np.isfinite(finite_valid).all() or not bool(
+                    ((finite_valid > 0) & (finite_valid < 1)).all()
+                ):
+                    raise ValueError(f"invalid valid-slot positions in {shard.path}")
+            if completion_name:
+                completion = np.load(shard.path / completion_name, mmap_mode="r")
+                if (
+                    completion.shape != (len(shard.indices),)
+                    or completion.dtype != np.bool_
+                    or not bool(np.asarray(completion).all())
+                ):
+                    raise ValueError(f"incomplete PCA representation in {shard.path}")
             for local, global_index in enumerate(shard.indices):
                 self.locations[int(global_index)] = (shard.path, local)
 
-    def get(self, global_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def get(self, global_index: int):
         path, local = self.locations[int(global_index)]
         if path not in self.arrays:
-            self.arrays[path] = np.load(path / self.filename, mmap_mode="c")
-        tokens = bf16_tensor_view(self.arrays[path][local])
+            arrays = {"tokens": np.load(path / self.filename, mmap_mode="c")}
+            if self.explicit_metadata:
+                arrays["valid"] = np.load(
+                    path / f"{self.metadata_prefix}-valid.npy", mmap_mode="r"
+                )
+                arrays["positions"] = np.load(
+                    path / f"{self.metadata_prefix}-positions.npy", mmap_mode="r"
+                )
+            self.arrays[path] = arrays
+        arrays = self.arrays[path]
+        tokens = bf16_tensor_view(arrays["tokens"][local])
         modality_ids = torch.cat([
             torch.full((slots,), modality, dtype=torch.long)
             for modality, slots in enumerate(self.layout)
         ])
+        if self.explicit_metadata:
+            positions = torch.from_numpy(
+                np.asarray(arrays["positions"][local], np.float32).copy()
+            )
+            valid = torch.from_numpy(
+                np.asarray(arrays["valid"][local], np.bool_).copy()
+            )
+            return tokens, modality_ids, positions, valid
         return tokens, modality_ids
 
 
@@ -174,23 +249,36 @@ def normalized_modality_positions(modality_ids: torch.Tensor) -> torch.Tensor:
 
 
 def pad_token_batch(
-    examples: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    examples: Sequence[tuple[torch.Tensor, ...]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not examples:
         raise ValueError("cannot pad an empty batch")
     width = int(examples[0][0].shape[1])
-    maximum = max(len(tokens) for tokens, _ in examples)
+    maximum = max(len(example[0]) for example in examples)
     batch = len(examples)
     tokens = torch.zeros((batch, maximum, width), dtype=torch.bfloat16)
     modalities = torch.zeros((batch, maximum), dtype=torch.long)
     positions = torch.zeros((batch, maximum), dtype=torch.float32)
     valid = torch.zeros((batch, maximum), dtype=torch.bool)
-    for row, (value, modality) in enumerate(examples):
-        if value.ndim != 2 or value.shape[1] != width or len(value) != len(modality):
+    for row, example in enumerate(examples):
+        if len(example) == 2:
+            value, modality = example
+            item_positions = normalized_modality_positions(modality)
+            item_valid = torch.ones((len(value),), dtype=torch.bool)
+        elif len(example) == 4:
+            value, modality, item_positions, item_valid = example
+        else:
+            raise ValueError(f"expected 2 or 4 tensors per example, got {len(example)}")
+        if (
+            value.ndim != 2 or value.shape[1] != width
+            or len(value) != len(modality)
+            or len(value) != len(item_positions)
+            or len(value) != len(item_valid)
+        ):
             raise ValueError("inconsistent token example")
         stop = len(value)
         tokens[row, :stop] = value
         modalities[row, :stop] = modality
-        positions[row, :stop] = normalized_modality_positions(modality)
-        valid[row, :stop] = True
+        positions[row, :stop] = item_positions
+        valid[row, :stop] = item_valid
     return tokens, modalities, positions, valid

@@ -7,10 +7,11 @@ whose fields are all ``categorical(num_values=C)`` -- so the existing schema
 hashing/validation and the existing ``Predictor``/codec machinery apply directly
 to latents (see ``latent_predictor`` and the exact codec as the lossless anchor).
 
-``StateTokens`` carries the frozen mixed target ``x_t`` (semantic / ocr / visual
-/ state subspaces). The world-model posterior ``q_phi(z_t | h_t, x_t)`` consumes
-it and the decoder ``D_omega`` reconstructs it; the *front-end* that produces
-``x_t`` (structured oracle first, Qwen3.5 + tokenizer later) is swappable behind
+``StateTokens`` carries a frozen state target and an explicit valid-slot mask.
+The raw PCA state is ``x_t``; a fixed wrapper may convert it to normalized
+``xbar_t`` before the world-model posterior ``q_phi(z_t | h_t, xbar_t, m_t)``.
+``z_t`` is reserved for the grouped categorical stochastic latent. The front-end
+(structured oracle first, Qwen3.5 + tokenizer later) remains swappable behind
 this interface.
 """
 from __future__ import annotations
@@ -99,6 +100,7 @@ class StateTokens:
 
     tokens: np.ndarray
     subspaces: Mapping[str, tuple[int, ...]] = dataclasses.field(default_factory=dict)
+    valid: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         array = np.asarray(self.tokens, dtype=np.float32)
@@ -109,6 +111,15 @@ class StateTokens:
             object.__setattr__(
                 self, "subspaces", {"state": tuple(range(array.shape[0]))}
             )
+        valid = (
+            np.ones((array.shape[0],), np.bool_)
+            if self.valid is None else np.asarray(self.valid, np.bool_)
+        )
+        if valid.shape != (array.shape[0],):
+            raise ValueError(
+                f"StateTokens.valid must have shape ({array.shape[0]},); got {valid.shape}"
+            )
+        object.__setattr__(self, "valid", valid)
 
     @property
     def num_tokens(self) -> int:

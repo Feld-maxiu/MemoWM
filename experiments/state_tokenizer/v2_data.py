@@ -97,7 +97,7 @@ def derive_v2_targets(record: dict) -> dict:
         "has_radio": bool(radios),
         "has_textbox": bool(textboxes),
         "has_select": bool(set(tags) & {"select", "option"}),
-        "has_dialog": any(
+        "has_dialog": "dialog" in tags or any(
             "ui-dialog" in element.get("classes", "") or "dialog" in element.get("id", "")
             for element in elements
         ),
