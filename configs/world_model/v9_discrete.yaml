@@ -1,0 +1,74 @@
+protocol: residualmem_v8_discrete_wm_v1
+
+# Frozen v9 architecture and budget. Nothing here may be tuned: the whole point
+# of this config is that the budget is fixed *before* any number is looked at.
+#
+# Architecture is the winner of worklog section 24.3 (12L/4096 + dropout 0.3,
+# 33.24M parameters). Capacity above ~15M only pays once the model is
+# regularised, which is why num_layers/mlp_dim differ from v8_discrete.yaml
+# while everything else is unchanged.
+#
+# Budget is derived, not searched. The dev protocol was 31,555 fit transitions
+# x 240,000 updates x batch 32 = 243.4 epochs. The v9 train split is 2x that
+# data, so the same exposure is exactly 480,000 updates.
+#
+# min_steps == max_steps disables early stopping, so all three seeds run an
+# identical budget. The delivered checkpoint is last.pkl, fixed in advance --
+# selecting best.pkl on validation and then bootstrapping on the same
+# validation would bias the interval. Measured cost of taking the final
+# checkpoint on this exact config: 9.97 bits (best 7324.62 @202k vs final
+# 7334.60 @240k), under a tenth of the ~110-bit noise floor.
+
+model:
+  num_tasks: 12
+  max_history: 7
+  num_latent_tokens: 64
+  num_subspaces: 32
+  num_categories: 256
+  num_observation_slots: 64
+  code_embedding_dim: 8
+  d_model: 256
+  num_layers: 12
+  num_heads: 8
+  mlp_dim: 4096
+  dropout: 0.3
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  # Adopted: worth +434.76 bits (section 12 A3), independently cross-checked at
+  # 387.8 by the rank screen (section 23.7).
+  use_copy_gate: true
+  # Falsified in section 21.3: its +60.81-bit bill is deterministic and buys no
+  # measurable observation gain. Also unsupported by train.py, which does not
+  # pass actions["targets"].
+  use_target_channel: false
+  max_payload_bytes: 40
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  max_steps: 480000
+  min_steps: 480000
+  eval_every: 4000
+  patience_steps: 480000
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  max_ref: 63
+  payload_bytes: 40
+  select_option_uses_parent: true
+  structural_bill_bits: 11
+  payload_length_bill_bits: 6
+  task_bill_bits_per_episode: 4
