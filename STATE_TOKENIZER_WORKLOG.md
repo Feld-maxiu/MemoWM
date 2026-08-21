@@ -1,6 +1,11 @@
 # ResidualMem State Tokenizer 工作日志
 
 当前冻结状态：**v8 / AXTree / `(32,16,16,0)` / 10 万状态**。
+
+> 2026-08-20 恢复说明：v8 本文与结果定义保持不变；跨 WorldMemArena
+> 的 v9 Qwen3.5-Instruct wrapper、fused-observation retrieval/reader bridge
+> 已恢复在 `QWEN35_INSTRUCT_WORLDMEMARENA.md`。模型权重与训练输出不属于
+> 本次两日前源码备份，需按该文档重跑。
 本文件记录「做了什么、为什么、哪些量具骗过我」，不是 API 文档。
 
 ---

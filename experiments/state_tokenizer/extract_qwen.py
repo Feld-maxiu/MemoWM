@@ -56,18 +56,46 @@ def _prompt(dom: str, instruction: str) -> str:
     )
 
 
-def _input_text(processor, dom: str, instruction: str) -> str:
-    return (
-        f"{processor.vision_start_token}{processor.image_token}"
-        f"{processor.vision_end_token}\n{_prompt(dom, instruction)}"
+PROMPT_MODES = ("base", "instruct")
+
+
+def _input_text(
+    processor, dom: str, instruction: str, prompt_mode: str = "base"
+) -> str:
+    """Serialize the frozen observation prompt for Base or Instruct Qwen.
+
+    Marker-delimited DOM/instruction spans are deliberately identical between
+    modes.  Only the model-native conversation wrapper differs, which keeps
+    modality indexing exact while allowing v8 Base artifacts and v9 Instruct
+    artifacts to coexist.
+    """
+    if prompt_mode == "base":
+        return (
+            f"{processor.vision_start_token}{processor.image_token}"
+            f"{processor.vision_end_token}\n{_prompt(dom, instruction)}"
+        )
+    if prompt_mode != "instruct":
+        raise ValueError(f"prompt_mode must be one of {PROMPT_MODES}, got {prompt_mode!r}")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image"},
+            {"type": "text", "text": _prompt(dom, instruction)},
+        ],
+    }]
+    return processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
 
-def _process_once(processor, image: Image.Image, dom: str, instruction: str):
+def _process_once(
+    processor, image: Image.Image, dom: str, instruction: str,
+    prompt_mode: str = "base",
+):
     # Qwen3.5-9B-Base intentionally ships without a chat template.  Supply the
     # native multimodal sentinel sequence directly; Qwen3VLProcessor expands
     # the single image token to the exact number required by image_grid_thw.
-    text = _input_text(processor, dom, instruction)
+    text = _input_text(processor, dom, instruction, prompt_mode)
     return processor(
         images=[image],
         text=[text],
@@ -76,8 +104,11 @@ def _process_once(processor, image: Image.Image, dom: str, instruction: str):
     )
 
 
-def prepare_inputs(processor, image: Image.Image, dom: str, instruction: str, max_length: int):
-    inputs = _process_once(processor, image, dom, instruction)
+def prepare_inputs(
+    processor, image: Image.Image, dom: str, instruction: str, max_length: int,
+    prompt_mode: str = "base",
+):
+    inputs = _process_once(processor, image, dom, instruction, prompt_mode)
     full_length = int(inputs["input_ids"].shape[1])
     if full_length <= max_length:
         return inputs, False, len(dom), full_length
@@ -86,7 +117,9 @@ def prepare_inputs(processor, image: Image.Image, dom: str, instruction: str, ma
     best = None
     while low <= high:
         middle = (low + high) // 2
-        candidate = _process_once(processor, image, dom[:middle], instruction)
+        candidate = _process_once(
+            processor, image, dom[:middle], instruction, prompt_mode
+        )
         length = int(candidate["input_ids"].shape[1])
         if length <= max_length:
             best = (candidate, middle, length)
@@ -275,7 +308,8 @@ def extract(args: argparse.Namespace) -> dict:
             with Image.open(image_path) as image_handle:
                 image = image_handle.convert("RGB")
                 inputs, truncated, kept_chars, original_length = prepare_inputs(
-                    processor, image, record["dom"], record["instruction"], args.max_length
+                    processor, image, record["dom"], record["instruction"],
+                    args.max_length, args.prompt_mode,
                 )
             inputs = inputs.to(device)
             indices = modality_indices(processor, model, inputs["input_ids"])
@@ -322,6 +356,7 @@ def extract(args: argparse.Namespace) -> dict:
         "max_length": args.max_length,
         "use_kernels": args.use_kernels,
         "early_stop": args.early_stop,
+        "prompt_mode": args.prompt_mode,
         "truncated_count": int(np.asarray(arrays["truncated"]).sum()),
         "slot_layouts": {str(key): list(value) for key, value in SLOT_LAYOUTS.items()},
         "modalities": list(MODALITIES),
@@ -344,6 +379,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-kernels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prompt-mode", choices=PROMPT_MODES, default="base")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:

@@ -19,6 +19,11 @@
    指标是 **held-out 预测码长（bits/transition）**，越低越好。
 
 关键点：tokenizer **训练一次就冻结**，之后所有 WM 实验都只读它的输出。
+
+WorldMemArena web 的跨 benchmark 接入不改变这里的 v8/WM 协议；适配层、
+v9 Instruct prompt 与 Raw-Fused 对照见 `QWEN35_INSTRUCT_WORLDMEMARENA.md`
+和 `WORLDMEMARENA_TOKENIZER_RAG.md`。特别注意 assistant plan/action 是动作
+输出，不是当前观察，禁止进入 tokenizer detail slot。
 这样 WM 的所有比较都在同一个离散空间里，数字可比。
 
 ---

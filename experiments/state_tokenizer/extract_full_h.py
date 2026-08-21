@@ -94,7 +94,7 @@ def extract(args: argparse.Namespace) -> dict:
             with Image.open(image_path) as image_handle:
                 inputs, truncated, _, _ = prepare_inputs(
                     processor, image_handle.convert("RGB"), record["dom"],
-                    record["instruction"], args.max_length,
+                    record["instruction"], args.max_length, args.prompt_mode,
                 )
             if truncated:
                 raise ValueError(f"v2 Full-H record was truncated: {record['state_id']}")
@@ -147,6 +147,7 @@ def extract(args: argparse.Namespace) -> dict:
         "subset_manifest": str(Path(args.records).resolve()),
         "early_stop": args.early_stop,
         "use_kernels": args.use_kernels,
+        "prompt_mode": args.prompt_mode,
     }
     write_json(output / "summary.json", summary)
     return summary
@@ -169,6 +170,7 @@ def main() -> None:
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-kernels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prompt-mode", choices=("base", "instruct"), default="base")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:

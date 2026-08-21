@@ -7,3 +7,6 @@ outputs/
 MUJOCO_LOG.TXT
 ;
 .venv/
+.venv-jax/
+models/
+*.incomplete

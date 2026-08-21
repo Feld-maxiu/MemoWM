@@ -26,8 +26,13 @@ from .static_key_pooling import (
 )
 
 
-def _dom_offsets(processor, model, record: dict, expected_dom_tokens: int):
-    text = _input_text(processor, record["dom"], record["instruction"])
+def _dom_offsets(
+    processor, model, record: dict, expected_dom_tokens: int,
+    prompt_mode: str = "base",
+):
+    text = _input_text(
+        processor, record["dom"], record["instruction"], prompt_mode
+    )
     encoded = processor.tokenizer(
         text,
         add_special_tokens=True,
@@ -180,7 +185,7 @@ def rebuild(args: argparse.Namespace) -> dict:
             dom_hidden = flat[image_stop:dom_stop]
             prompt_hidden = flat[dom_stop:]
             dom_offsets, prompt_tokens = _dom_offsets(
-                processor, model, record, len(dom_hidden)
+                processor, model, record, len(dom_hidden), args.prompt_mode
             )
             if prompt_tokens != len(prompt_hidden):
                 raise ValueError(
@@ -240,6 +245,7 @@ def rebuild(args: argparse.Namespace) -> dict:
             "model": str(Path(args.model).resolve()),
             "device": str(device),
             "records_manifest": str(Path(args.records).resolve()),
+            "prompt_mode": args.prompt_mode,
         })
     summary = {
         "protocol": STATIC_KEY64_PROTOCOL,
@@ -281,6 +287,7 @@ def main() -> None:
                              "value padded by filler falls back under the raw-slot "
                              "threshold instead of being pooled; off reproduces v5 "
                              "bit for bit")
+    parser.add_argument("--prompt-mode", choices=("base", "instruct"), default="base")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:

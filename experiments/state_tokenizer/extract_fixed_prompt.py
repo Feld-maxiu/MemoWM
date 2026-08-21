@@ -30,19 +30,22 @@ from .ragged_store import global_modality_lengths
 
 def _prepare(
     processor, model, record: dict, records_path: Path, max_length: int,
-    *, need_dom_offsets: bool = True,
+    *, need_dom_offsets: bool = True, prompt_mode: str = "base",
 ):
     image_path = records_path.resolve().parent / record["screenshot"]
     with Image.open(image_path) as handle:
         inputs, truncated, _, _ = prepare_inputs(
-            processor, handle.convert("RGB"), record["dom"], record["instruction"], max_length
+            processor, handle.convert("RGB"), record["dom"], record["instruction"],
+            max_length, prompt_mode,
         )
     if truncated:
         raise ValueError(f"fixed-prompt record was truncated: {record['state_id']}")
     indices = modality_indices(processor, model, inputs["input_ids"])
     dom_offsets = None
     if need_dom_offsets:
-        text = _input_text(processor, record["dom"], record["instruction"])
+        text = _input_text(
+            processor, record["dom"], record["instruction"], prompt_mode
+        )
         dom_offsets = aligned_dom_token_offsets(
             processor, model, text, record["dom"], inputs["input_ids"], indices[1]
         )
@@ -80,6 +83,7 @@ def extract(args: argparse.Namespace) -> dict:
     first_inputs, first_indices, first_dom_offsets = _prepare(
         processor, model, subset[int(subset_rows[0])], records_path, args.max_length,
         need_dom_offsets=not args.instruction_only_cache,
+        prompt_mode=args.prompt_mode,
     )
     first_lengths = np.asarray([len(index) for index in first_indices], np.int32)
     source_count = sum(1 for _ in iter_jsonl(args.source_records))
@@ -182,6 +186,7 @@ def extract(args: argparse.Namespace) -> dict:
                 inputs, indices, dom_offsets = _prepare(
                     processor, model, record, records_path, args.max_length,
                     need_dom_offsets=not args.instruction_only_cache,
+                    prompt_mode=args.prompt_mode,
                 )
             image_grid_thw = inputs["image_grid_thw"][0].tolist()
             inputs = inputs.to(device)
@@ -282,6 +287,7 @@ def extract(args: argparse.Namespace) -> dict:
         "subset_manifest": str(records_path.resolve()),
         "early_stop": args.early_stop,
         "use_kernels": args.use_kernels,
+        "prompt_mode": args.prompt_mode,
     }
     if key64_audit is not None:
         audit_values = np.asarray(key64_audit)
@@ -323,6 +329,7 @@ def main() -> None:
     parser.add_argument("--use-kernels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--instruction-only-cache", action="store_true")
+    parser.add_argument("--prompt-mode", choices=("base", "instruct"), default="base")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:
