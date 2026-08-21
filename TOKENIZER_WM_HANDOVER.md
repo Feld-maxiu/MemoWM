@@ -21,8 +21,9 @@
 关键点：tokenizer **训练一次就冻结**，之后所有 WM 实验都只读它的输出。
 
 WorldMemArena web 的跨 benchmark 接入不改变这里的 v8/WM 协议；适配层、
-v9 Instruct prompt 与 Raw-Fused 对照见 `QWEN35_INSTRUCT_WORLDMEMARENA.md`
-和 `WORLDMEMARENA_TOKENIZER_RAG.md`。特别注意 assistant plan/action 是动作
+v9 Instruct prompt 与 Raw-Fused 对照见本文 §9，v8 数据重采协议与 2026-08
+恢复重建记录见本文 §10，当前状态与关键数字速查见
+`WORLDMEMARENA_TOKENIZER_RAG.md`。特别注意 assistant plan/action 是动作
 输出，不是当前观察，禁止进入 tokenizer detail slot。
 这样 WM 的所有比较都在同一个离散空间里，数字可比。
 
@@ -477,8 +478,8 @@ payload: ≤40 字节 UTF-8
 | 阶段 | 解释器 | 关键依赖 |
 |---|---|---|
 | 采集 | `browsergym-venv` | playwright / gymnasium / browsergym；**刻意不装 torch、jax** |
-| 特征抽取 | MemCompiler 环境 | torch / transformers |
-| tokenizer + WM | `residualmem-jax-venv` | jax / optax |
+| 特征抽取 | Mem_compiler 环境 | torch / transformers |
+| tokenizer + WM | `.venv-jax`（原名 residualmem-jax-venv） | jax 0.4.33 / optax；**Blackwell sm_120 需 ptxas ≥ 12.8.93** |
 
 ```bash
 JX=<repo>/../residualmem-jax-venv/bin/python
@@ -495,3 +496,303 @@ $JX tests/run_tests.py tests/world_model/test_*.py     # 改代码后请跑
 > 由于 64 个槽位里有 32 个是 image 槽位，这会让新采数据和旧数据**分布不一致**。
 > **换机器采集前，务必先用相同 seed 重采几条旧 episode，逐字节比对
 > `dom` / `axtree_raw` / 截图像素。**
+
+---
+
+## 9. WorldMemArena RAG 适配协议（v9 Instruct）
+
+> 原独立文件 `QWEN35_INSTRUCT_WORLDMEMARENA.md`，2026-08-22 并入。
+> 本节固定 ResidualMem v9 在 WorldMemArena web 子集上的输入、训练与评测协议。
+> 核心问题：把当前观察压缩为 `xbar_t` / A2 后，能否在相同 RAG 检索配置下接近
+> 未压缩的 fused observation。当前状态与关键数字速查见
+> `WORLDMEMARENA_TOKENIZER_RAG.md`。
+
+### 9.1 三类不可混淆的内容
+
+| 内容 | tokenizer / fused observation | 完整 round 文本行 |
+|---|---:|---|
+| 当前 screenshot | 是 | attachment 元数据 |
+| user 原始文本 | 是 | 是 |
+| image caption | 是 | 是 |
+| assistant 的观察/计划（`I can see...`） | **否** | 是 |
+| assistant Action JSON | **否** | 是 |
+
+assistant 是基于当前观察产生的 policy/action 输出，不是 `x_t` 的输入。数据 loader
+会把 caption 再内联到 user text；适配器必须先移除这份副本，保证 caption 在
+observation 中只出现一次。
+
+WorldMemArena 没有 BrowserGym AXTree。零训练适配将 user 文本与 caption 序列化为
+合法的 synthetic AXTree；截图仍走视觉 token。该映射仅复用 tokenizer 既有输入槽，
+不使用 benchmark 标签。
+
+### 9.2 严格对照
+
+**Raw-Fused**（`Qwen3-VL-Embedding-8B-FusedObs-RAG`）：每个有观察的 round 产生
+两条 document row —— (1) 完整 round 文本（user + assistant）；(2) screenshot +
+genuine user text + caption 在**同一条** Qwen3-VL document 请求中的 fused vector。
+空观察 round 只产生第 1 条。fused 编码失败必须报错，禁止静默降级为 caption-only。
+
+**ResidualMem** 四个主实验：
+
+- `ResidualMem-Instruct-Xbar-Input-RAG`
+- `ResidualMem-Instruct-A2-Input-RAG`
+- `ResidualMem-Instruct-Xbar-L16-RAG`
+- `ResidualMem-Instruct-A2-L16-RAG`
+
+保持相同的完整 round 文本行；第 2 条由共享 retrieval head 将 `xbar_t`（或 A2
+重建的 `xbar_hat_t`）映射到归一化 4096 维向量。
+
+所有方法使用官方 Qwen3-VL query encoder、row-level cosine、`top_k=10`、不做
+round dedup（同一 round 两行可能同时命中）。官方 `Qwen3-VL-Embedding-8B` 的
+完整文本向量 + 独立 image 向量模式保留为论文复现参考，**不是压缩质量的控制组**。
+
+### 9.3 v9 tokenizer 与产物
+
+v9 = v8 Base，仅 prompt wrapper 换成 `Qwen3.5-9B-Instruct` 原生 chat template；
+DOM/instruction marker、Static Key64 `(32,16,16,0)`、PCA512、train-only
+group/channel normalization、A1/A2 语义全部不变。
+
+```text
+outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca.npz
+outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca-normalization.npz
+outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/train-cache-fused-observation.npz
+outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/retrieval-head-fused-observation.pt
+```
+
+2026-08-21 用户决定：本轮只评估连续 `xbar`，不重跑 A1/A2。旧 A2 checkpoint 绑定
+纠错前的旧 PCA 坐标（见 §10.3），不能与本节 20k-balanced PCA 混用——既不进入
+cache，也不进入 retrieval loss。
+
+### 9.4 A1 / A2 正式重训配置
+
+train split 优化、validation 选 best checkpoint、全程不读 test。A1 固定 64 个
+512 维连续 token、1.0× 标量宽度、10,000 步固定预算：
+
+```text
+stage steps       = 2,000 / 3,000 / 5,000
+learning rates    = 1e-3 / 3e-4 / 1e-4
+batch             = 32
+eval every        = 250
+matmul precision  = highest
+patience          = 0（固定预算）
+```
+
+A2 从本轮 A1 checkpoint 初始化，冻结 v8 主配置：PQ、64 tokens、M=32、C=256、
+`group_weights=(1,2,0.5,0.5)`、K-means 25 iterations、70,000 steps；codebook LR
+`3e-4`、backbone LR `3e-5`、batch 32、每 500 steps validation、patience 0。
+
+K-means **不抽样**：70,018 个 train state 全部参与 2,048 个 `(token, subspace)`
+问题。latent 以 FP32 存 host memory，GPU 每次只驻留 64 个问题（避免一次性物化
+约 9.18 GB 及转置副本导致 OOM，见 §10.3）。随机数协议
+`per_problem_fold_in_v1`（seed 0 + 全局 problem id）：调整 resident problem batch
+只改显存峰值，不改每个问题的初始化与最终中心。
+
+两阶段均 FP32 activation + `highest` matmul precision + FP64 host metric 累加。
+统一入口：
+
+```bash
+./scripts_v9_instruct.sh a1
+./scripts_v9_instruct.sh a2
+```
+
+正式产物：`outputs/a1/v9-instruct{,.npz}`、`outputs/a2/v9-instruct-m32-gw{,.npz}`。
+
+### 9.5 Retrieval head 训练
+
+训练数据只来自 BrowserGym/MiniWoB++：默认 5,000 train + 500 validation，按 task
+平衡抽样；WorldMemArena 记录、QA 和答案均不参与训练。
+
+Teacher 是同一 BrowserGym observation 的官方 Qwen3-VL document embedding：
+
+- image：BrowserGym screenshot；
+- text：真实 task instruction + AXTree DOM；
+- image/text 必须位于同一个 document 请求；
+- 输出为归一化 4096 维 `teacher_fused_embedding`。
+
+Student 是 `MaskedAttentionRetrievalHead`，只读连续 `xbar`：
+
+```text
+LayerNorm(512)
+  -> masked scalar attention over 64 slots
+  -> weighted pooling
+  -> Linear(512,1024) + GELU + Linear(1024,4096)
+  -> L2 normalize
+```
+
+Loss 为 symmetric InfoNCE + cosine。代码向后兼容 `representation=both` 的
+Xbar/A2 共享 head（该模式另有 `0.1 × consistency`），本轮产物 metadata 为
+`representation=xbar`，不含 `a2_xbar`。
+
+缓存协议锁（旧 screenshot-only `teacher_embedding` cache 会被拒绝）：
+
+```text
+qwen35_instruct_bridge_cache_v2
+qwen3_vl_fused_observation_v1
+browsergym_task_plus_dom_v1
+```
+
+```bash
+python -m experiments.state_tokenizer.build_instruct_bridge_cache \
+  --records outputs/state_tokenizer/v8/full-721.jsonl \
+  --features outputs/state_tokenizer/v9-instruct-pca20k-balanced/static_features \
+  --normalization outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca-normalization.npz \
+  --representation xbar \
+  --teacher-backend sentence_transformers \
+  --teacher-model-path models/Qwen3-VL-Embedding-8B \
+  --teacher-num-gpus 8 \
+  --output outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/train-cache-fused-observation.npz
+
+python -m experiments.state_tokenizer.train_retrieval_bridge \
+  --cache outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/train-cache-fused-observation.npz \
+  --representation xbar \
+  --output outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/retrieval-head-fused-observation.pt
+```
+
+### 9.6 2026-08-21 正式 Xbar 结果（MiniWoB 域内）
+
+- PCA：20,000 train states，12 task 各 1,666–1,667；解释方差 `0.9185917377`，
+  SHA256 `f98c517c...f6efb2a`。
+- cache：5,000 train + 500 validation，只有 `xbar/valid/teacher_fused_embedding`；
+  全部 finite、invalid slots 精确为零、5,500 索引唯一。
+- retrieval head：best step 5,000，validation loss `0.6449992`、paired cosine
+  `0.8711105`；500-way Recall@1/5/10 = `0.840/0.956/0.986`，MRR `0.8946`。
+
+⚠️ 这是 **MiniWoB/BrowserGym 域内** validation，不能替代 WMA 跨域检验（§9.8）。
+
+### 9.7 Reader connector
+
+- **Input connector**：`LN(512) -> Linear(4096) -> GELU -> Linear(4096) -> RMSNorm`，
+  另有零初始化 rank embedding；把每个 latent slot 作为 Qwen 输入 soft token。
+- **Layer-16 connector**：先严格逆 normalization/PCA 恢复到 4096 维 layer-16
+  状态，再叠加零初始化的 `Linear(512,4096)` residual adapter；推理时在第 17 层
+  入口替换 prefix states。
+
+Reader 必须用 Qwen3.5-Instruct 原生生成答案。若 connector 未加载，适配器不得
+假装运行 native reader；当前实现会明确报错或走未启用 native-answer 的外部
+answer stage。
+
+### 9.8 分布偏移与判据（当前主要风险）
+
+训练域是 MiniWoB++ 的规则化小网页（498×321），评测域是 1280×720 的真实 Chrome
+轨迹，caption 更长、视觉熵和页面复杂度更高。**这是实验的主要风险，不是实现
+细节。**必须同时报告：
+
+- Raw-Fused vs Xbar：连续 tokenizer 的跨域损失；
+- Xbar vs A2：离散化额外损失；
+- retrieval RC/Recall 与最终 QA 指标；
+- WMA web 内按「有截图/无截图、caption 长度、session 长度」分桶结果。
+
+成功判据不是绝对分数复现论文全表，而是在完全相同的两行建库与 top-10 协议下
+Residual 与 Raw-Fused 接近；若 Raw-Fused 自身偏低，应先排查 Qwen server/数据
+协议，不能归因给 tokenizer。
+
+**web_01 最终 checkpoint smoke**（25 sessions / 49 full-round rows / 14
+observations / 10 questions）：
+
+| 指标 | Raw-Fused | Xbar |
+|---|---:|---:|
+| evidence Recall@10 | 0.765 | 0.725 |
+| NDCG@10 | 0.5429 | 0.5529 |
+| top-10 observation rows（100 槽位合计） | 8 | **0** |
+
+总体 top-10 overlap `0.91`、top-1 agreement `1.00` 是两侧共有 49 条完全相同
+full-round text row 的**掩盖效应**。只看 14 条 observation：paired cosine
+`0.1836`，14-way Recall@1/5/10 = `0.0714/0.5714/0.8571`（R@1 ≈ 随机 1/14），
+MRR `0.2958`。首个 checkpoint（5 sessions / 2 obs）同样 observation row 从未
+命中（paired cosine 0.2174）。
+
+**结论：当前零训练 synthetic-AXTree 适配未通过跨域压缩门禁**；不得用总体
+top-10 overlap 宣称压缩成功，修正域适配前不得扩到全量 web benchmark。逐问证据：
+
+```text
+outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/
+  worldmemarena-web01-checkpoint0-10q.json
+  worldmemarena-web01-final-checkpoint-10q.json
+```
+
+---
+
+## 10. v8 数据重采协议与 2026-08 恢复重建记录
+
+> 原独立文件 `RECOVERY_WORKLOG_20260820.md`，2026-08-22 并入精简。
+> 只保留可复用的工程协议、门禁数字与 bugfix；8-20 的恢复步骤（权重下载、
+> 源码找回）已全部完成，过程叙述不再保留。
+
+背景：两日前备份只有源码，`outputs/` 全部丢失，100,008 states 无法逆向恢复，
+必须重采且与旧数据逐字节等价。环境固化：BrowserGym 0.14.3 + Playwright 1.44
+Chromium 固化在仓库目录；MiniWoB++ 检出官方固定 commit `7fd85d71`。
+
+### 10.1 lane 并行采集协议（不改变数据内容的加速）
+
+原 12-worker 协议：task `t` 的 episode 序列 `episode_index = t + 12k`，env seed
+= `seed + t×1,000,000 + episode_index`。实测吞吐仅 ~75 states/min（BrowserGym
+0.14.3 每个 episode 冷启动 task 与 chat 两个 Chromium），外推 2–3 天。
+
+- **lane 划分**：只按 `k mod L` 分 lane，`lane l: episode_index = t + 12l + n·(12L)`。
+  任一 episode 的 id、seed、动作 RNG、split、页面内容全部不变。
+- **assembler 硬校验**（`assemble_browsergym_lanes.py`）：episode lattice 无缺口、
+  step 从 0 连续、seed/split/state_id 全匹配、无重复/半截 episode；与旧数据的
+  重叠记录与截图**逐 SHA256 比对**；最后按冻结顺序精确保留每任务最早 8,334
+  states。
+- **并发教训**：228 lanes 一次性全启 → 全部阻塞在首次 `env.reset()`，系统
+  load ≈ 250、大量 SwiftShader GPU-process（Chromium 软件渲染子进程，与 CUDA
+  无关）。正确做法是**有上限的分批调度**（64 active lanes），lattice 与最终
+  数据完全不变，按实测吞吐调档而非按 CPU 核数盲拉。
+- **`pre_observation_delay` 不可降为 0**：0.5→0 秒在 12 task / 37 records 中
+  产生 8 条 AXTree 语义 sidecar 差异 + 5 张截图差异，门禁失败。生产保持 0.5 秒。
+- **browser reuse**（opt-in）：保留 0.5s 观察时序，每个 episode 仍新建 incognito
+  context，只复用两个 Chromium 进程。门禁 114/114 截图 SHA256 一致，tokenizer/WM
+  输入字段全等；稳态吞吐 ~4.2k–4.4k states/min（消除冷启动后的数量级提升），
+  0 retry、0 episode failure。
+- **AXTree nodeId 波动**：少量 `axtree_raw` 仅在 CDP `nodeId/parentId/childIds`
+  数值上不同；完全不复用 browser 的对照同样出现 → 是 Chrome 跨进程固有的内部
+  编号波动，不是 reuse 改变状态。assembler 只对这三类 id 做按节点顺序的规范化
+  比较，拓扑与 role/name/value/browsergym_id 仍须完全一致；有回归测试保证语义
+  变化会被拒绝。
+
+### 10.2 canonical 装配与审计（2026-08-21 完成）
+
+- 228/228 deterministic lanes 全部完成：128,364 候选 states / 53,112 完整
+  episodes，collector/retry/failure 均为 0；精确裁剪到 100,008（12 task × 8,334）。
+- 与两日前 partial reference 的 **6,792 重叠 states 全量审计**：6,792/6,792
+  规范化 nodeId 后语义完全相同；6,770 截图逐字节相同；剩余 22 张差异仅
+  scrollbar/resize-handle raster（最坏 112/159,858 像素 ≈ 0.07%，全图 uint8
+  MAE ≤ 0.023），fresh-browser 对照同样存在。assembly 门禁因此显式放宽为
+  changed fraction `0.001` / MAE `0.03`；**代码默认仍是 0/0 严格模式，不得
+  静默放宽**。
+- 产物结构：`outputs/state_tokenizer/v8-recovered` 为实体；canonical
+  `outputs/state_tokenizer/v8` 是指向它的**符号链接**（防脚本误读旧数据）；
+  partial reference 保留在 `v8-reference-partial-20260821` 供审计。
+- `records-merged.jsonl` / `full-721.jsonl` / `extend-100008.jsonl` 均 100,008
+  条，state id 唯一、index 连续、截图缺失 0；7/2/1 split = train 70,018 /
+  validation 20,011 / test 9,979，episode 跨 split 0、old-train leakage 0；
+  merged manifest SHA256
+  `c61ee90c87684ec3873174849300a7443351d71b71301ff4718fec7936e45865`。
+
+### 10.3 v9 Instruct 重建要点与 bugfix
+
+- **modality fast path**：固定 498×321 截图的 image token 恒为 160（12 task
+  首尾 24 条实测）；DOM/instruction 长度用 text-only tokenizer 与完整 processor
+  逐项相等。先用一张真实图片标定 image token，其余走 fast path，超长记录自动
+  回退完整 processor。100,008/100,008 覆盖，fallback 0、truncation 0。
+- **legacy Key64 layout bug**：恢复代码残留旧 `(32,28,4)`；冻结语义布局
+  (32,16,16,0) 对应的 Key64 modality layout 应为 `(32,32,0)`。`ragged_store.py`
+  改为从冻结 semantic layout 自动推导；categorical bottleneck 测试的 detail
+  slice `32:44` 同步修正为 `32:48`。
+- **Full-H 抽取**：6 ranks × 16,668，约 12.3 states/s/rank、每卡 ~18.7 GiB，
+  总占用 ~420 GiB；`done.npy == key64-done.npy` 且前缀连续。
+- **PCA first-N 纠错**：恢复期生成的 2,000-state PCA 实为 first-N selector
+  （全部来自 `click-button-v1`），并非 task-balanced。新增确定性
+  `task_balanced` selector + 回归测试；正式 PCA 见 §9.6。旧 artifact 保留供
+  审计但禁止作为正式坐标。
+- **A2 K-means OOM 修复**：旧实现把 `(70018,64,512)` latent 留在 GPU 再整体
+  转置为 2,048 个 PQ 问题（额外连续分配 9.18 GB），K-means 前即 OOM。修复后
+  全量 latent 走 host FP32 + GPU 驻留 64 问题 + `per_problem_fold_in_v1` 种子
+  协议，并有 blocked-vs-monolithic 精确等价测试。
+- **teacher 编码后端**：memcompiler 环境的 vLLM 0.11.0 与其 Torch CUDA ABI 不
+  匹配（模型加载前退出、不占 GPU）。改用官方 SentenceTransformer 6.0 本地
+  encoder；其原生 spawn pool 无法 pickle checkpoint 动态函数 → 改为每 GPU 一
+  个独立 deterministic shard process。
+- **A2 作废时间线**：8-21 17:42 起训的 A2 绑定纠错前的旧 PCA（19:31 才发现并
+  重训 20k-balanced），该轮 A2 坐标失效，不入 cache、不入 loss（见 §9.3）；
+  绑定新 PCA 的重训待做。

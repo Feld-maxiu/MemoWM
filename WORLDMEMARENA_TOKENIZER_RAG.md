@@ -282,7 +282,7 @@ export LD_LIBRARY_PATH=$R/browsergym-venv/syslibs/usr/lib/x86_64-linux-gnu:${LD_
 
 **P1 偏移归因诊断（零训练，最优先实验）。**
 在 14 个 WMA observation 上做槽位分解：Xbar→head 输出与 teacher 的逐 slot 余弦、
-image/detail/context 组贡献；按协议 §6 分桶（有/无截图、caption 长度、session 长度）；
+image/detail/context 组贡献；按 handover §9.8 分桶（有/无截图、caption 长度、session 长度）；
 用同分辨率重采样截图做对照，消除分辨率混杂（WMA 1280×720 vs 训练域 498×321）。
 产出：偏移主要来自视觉域还是 synthetic-AXTree 文本域的定量结论 → 决定 P3 走 (a) 还是 (b)。
 
@@ -307,16 +307,14 @@ AXTree-vs-DOM 同环境受控对照（`dom_control` 采集时已存，只差一�
 
 ---
 
-## 9. 文档导航（12 个项目 .md 的定位与可信度）
+## 9. 文档导航（10 个项目 .md 的定位与可信度）
 
 | 文件 | 定位 | 可信度 |
 |---|---|---|
 | `WORLDMEMARENA_TOKENIZER_RAG.md` | 本交接文档 | 以本版为准 |
-| `QWEN35_INSTRUCT_WORLDMEMARENA.md` | WMA-RAG 权威协议（对照定义、A1/A2 配置、retrieval head、reader、判据 §6） | ✅ 权威 |
-| `RECOVERY_WORKLOG_20260820.md` | 8-20 备份恢复 + 8-21 全天重建运行记录 | ✅ 权威（运行史） |
 | `WORLD_MODEL_WORKLOG.md` | WM 线权威（§0 结案表、§25 正式化；§22.2 噪声底；§23.7 秩筛查） | ✅ 权威 |
 | `STATE_TOKENIZER_WORKLOG.md` | tokenizer 训练史（§9 量具失效、§10 待办） | ✅ 权威 |
-| `TOKENIZER_WM_HANDOVER.md` | 跨 benchmark 移植手册（数据契约、cache 格式、坑表 §7） | ✅ 权威 |
+| `TOKENIZER_WM_HANDOVER.md` | 跨 benchmark 移植手册：数据契约、cache 格式、坑表 §7、**§9 WMA-RAG 协议、§10 v8 重采/恢复记录**（两份旧文档已并入删除） | ✅ 权威 |
 | `技术报告_ResidualMem.md` | 愿景与系统设计（H1-H4、公式、benchmark、风险 §18） | ⚠️ 头部 8-12 注记过时 |
 | `README.md` | 方法概览 + 环境与工程坑（旧 NAS 路径已失效） | ⚠️ 路径过时，坑有效 |
 | `refine-logs/EXPERIMENT_TRACKER.md` | M0-M4 状态 | ❌ 停在 M1，已被 §25 取代 |

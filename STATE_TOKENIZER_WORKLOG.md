@@ -4,8 +4,8 @@
 
 > 2026-08-20 恢复说明：v8 本文与结果定义保持不变；跨 WorldMemArena
 > 的 v9 Qwen3.5-Instruct wrapper、fused-observation retrieval/reader bridge
-> 已恢复在 `QWEN35_INSTRUCT_WORLDMEMARENA.md`。模型权重与训练输出不属于
-> 本次两日前源码备份，需按该文档重跑。
+> 协议已并入 `TOKENIZER_WM_HANDOVER.md` §9（原 QWEN35 文件已删除）。模型权重
+> 与训练输出不属于本次两日前源码备份，需按该文档重跑。
 本文件记录「做了什么、为什么、哪些量具骗过我」，不是 API 文档。
 
 ---
