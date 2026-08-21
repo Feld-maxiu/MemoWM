@@ -126,67 +126,9 @@ def _pairwise_sq(points, centers):
     )
 
 
-def kmeans_codebook(points, num_clusters, seed, iterations, chunk=64):
-    """Batched K-means++ over ``(problems, samples, dim)`` with empty repair.
-
-    One independent problem per ``(latent token, subspace)`` pair. Average
-    occupancy being low does not by itself imply empty clusters -- K-means++ plus
-    repair usually keeps every centroid populated -- so occupancy is measured and
-    reported rather than assumed.
-    """
-    points = jnp.asarray(points, jnp.float32)
-    problems, samples, _ = points.shape
-    key = jax.random.PRNGKey(seed)
-
-    # ---- K-means++ seeding ----
-    key, subkey = jax.random.split(key)
-    first = jax.random.randint(subkey, (problems,), 0, samples)
-    centers = [jnp.take_along_axis(points, first[:, None, None], 1)[:, 0]]
-    closest = _pairwise_sq(points, centers[0][:, None, :])[..., 0]
-    for _ in range(num_clusters - 1):
-        key, subkey = jax.random.split(key)
-        logits = jnp.log(jnp.maximum(closest, 1e-30))
-        picked = jax.random.categorical(subkey, logits, axis=-1)
-        chosen = jnp.take_along_axis(points, picked[:, None, None], 1)[:, 0]
-        centers.append(chosen)
-        closest = jnp.minimum(closest, _pairwise_sq(points, chosen[:, None, :])[..., 0])
-    centers = jnp.stack(centers, 1)  # (problems, clusters, dim)
-
-    @jax.jit
-    def lloyd(block_points, block_centers):
-        distance = _pairwise_sq(block_points, block_centers)
-        assignment = jnp.argmin(distance, -1)
-        onehot = jax.nn.one_hot(assignment, num_clusters, dtype=jnp.float32)
-        counts = jnp.sum(onehot, 1)
-        totals = jnp.einsum("bnc,bnd->bcd", onehot, block_points)
-        updated = totals / jnp.maximum(counts, 1.0)[..., None]
-        updated = jnp.where(counts[..., None] > 0, updated, block_centers)
-        # Deterministic empty-cluster repair: hand the j-th empty cluster the
-        # j-th worst-fitting point.
-        residual = jnp.take_along_axis(distance, assignment[..., None], -1)[..., 0]
-        order = jnp.argsort(-residual, axis=-1)
-        empty = counts == 0
-        rank = jnp.clip(jnp.cumsum(empty, -1) - 1, 0, block_points.shape[1] - 1)
-        donor = jnp.take_along_axis(order, rank, -1)
-        rescued = jnp.take_along_axis(
-            block_points, donor[..., None].repeat(block_points.shape[-1], -1), 1
-        )
-        updated = jnp.where(empty[..., None], rescued, updated)
-        return updated, counts
-
-    counts = None
-    for _ in range(iterations):
-        blocks, block_counts = [], []
-        for start in range(0, problems, chunk):
-            stop = min(start + chunk, problems)
-            updated, count = lloyd(points[start:stop], centers[start:stop])
-            blocks.append(updated)
-            block_counts.append(count)
-        centers = jnp.concatenate(blocks, 0)
-        counts = jnp.concatenate(block_counts, 0)
-
-    occupancy = np.asarray(counts, np.int64)
-    stats = {
+def _occupancy_stats(occupancy, *, num_clusters, problems, samples, iterations):
+    occupancy = np.asarray(occupancy, np.int64)
+    return {
         "clusters": int(num_clusters),
         "problems": int(problems),
         "samples": int(samples),
@@ -199,32 +141,195 @@ def kmeans_codebook(points, num_clusters, seed, iterations, chunk=64):
         "occupancy_p95": float(np.percentile(occupancy, 95)),
         "occupancy_max": int(occupancy.max()),
     }
+
+
+@jax.jit
+def _lloyd_step(block_points, block_centers):
+    """One independent Lloyd update for every problem in a device block."""
+    num_clusters = block_centers.shape[1]
+    distance = _pairwise_sq(block_points, block_centers)
+    assignment = jnp.argmin(distance, -1)
+    onehot = jax.nn.one_hot(assignment, num_clusters, dtype=jnp.float32)
+    counts = jnp.sum(onehot, 1)
+    totals = jnp.einsum("bnc,bnd->bcd", onehot, block_points)
+    updated = totals / jnp.maximum(counts, 1.0)[..., None]
+    updated = jnp.where(counts[..., None] > 0, updated, block_centers)
+    # Deterministic empty-cluster repair: hand the j-th empty cluster the
+    # j-th worst-fitting point.
+    residual = jnp.take_along_axis(distance, assignment[..., None], -1)[..., 0]
+    order = jnp.argsort(-residual, axis=-1)
+    empty = counts == 0
+    rank = jnp.clip(jnp.cumsum(empty, -1) - 1, 0, block_points.shape[1] - 1)
+    donor = jnp.take_along_axis(order, rank, -1)
+    rescued = jnp.take_along_axis(
+        block_points, donor[..., None].repeat(block_points.shape[-1], -1), 1
+    )
+    updated = jnp.where(empty[..., None], rescued, updated)
+    return updated, counts
+
+
+def kmeans_codebook(
+    points,
+    num_clusters,
+    seed,
+    iterations,
+    chunk=64,
+    *,
+    problem_offset=0,
+    return_occupancy=False,
+):
+    """Batched K-means++ over ``(problems, samples, dim)`` with empty repair.
+
+    One independent problem per ``(latent token, subspace)`` pair. Average
+    occupancy being low does not by itself imply empty clusters -- K-means++ plus
+    repair usually keeps every centroid populated -- so occupancy is measured and
+    reported rather than assumed.
+    """
+    points = jnp.asarray(points, jnp.float32)
+    problems, samples, _ = points.shape
+    if iterations <= 0:
+        raise ValueError("K-means iterations must be positive")
+    if num_clusters > samples:
+        raise ValueError(
+            f"K-means clusters ({num_clusters}) exceed samples ({samples})"
+        )
+
+    # A key is derived from the global problem id, not the current block shape.
+    # Consequently a memory-only change to the problem batch preserves exactly
+    # the same K-means++ initialisation for every (token, subspace) problem.
+    base_key = jax.random.PRNGKey(seed)
+    problem_ids = jnp.arange(
+        problem_offset, problem_offset + problems, dtype=jnp.uint32
+    )
+    problem_keys = jax.vmap(lambda problem: jax.random.fold_in(base_key, problem))(
+        problem_ids
+    )
+
+    # ---- K-means++ seeding ----
+    first_keys = jax.vmap(lambda key: jax.random.fold_in(key, 0))(problem_keys)
+    first = jax.vmap(lambda key: jax.random.randint(key, (), 0, samples))(first_keys)
+    centers = [jnp.take_along_axis(points, first[:, None, None], 1)[:, 0]]
+    closest = _pairwise_sq(points, centers[0][:, None, :])[..., 0]
+    for cluster_index in range(1, num_clusters):
+        logits = jnp.log(jnp.maximum(closest, 1e-30))
+        choice_keys = jax.vmap(
+            lambda key: jax.random.fold_in(key, cluster_index)
+        )(problem_keys)
+        picked = jax.vmap(
+            lambda key, problem_logits: jax.random.categorical(
+                key, problem_logits, axis=-1
+            )
+        )(choice_keys, logits)
+        chosen = jnp.take_along_axis(points, picked[:, None, None], 1)[:, 0]
+        centers.append(chosen)
+        closest = jnp.minimum(closest, _pairwise_sq(points, chosen[:, None, :])[..., 0])
+    centers = jnp.stack(centers, 1)  # (problems, clusters, dim)
+
+    counts = None
+    for _ in range(iterations):
+        blocks, block_counts = [], []
+        for start in range(0, problems, chunk):
+            stop = min(start + chunk, problems)
+            updated, count = _lloyd_step(points[start:stop], centers[start:stop])
+            blocks.append(updated)
+            block_counts.append(count)
+        centers = jnp.concatenate(blocks, 0)
+        counts = jnp.concatenate(block_counts, 0)
+
+    occupancy = np.asarray(counts, np.int64)
+    stats = _occupancy_stats(
+        occupancy, num_clusters=num_clusters, problems=problems,
+        samples=samples, iterations=iterations,
+    )
+    if return_occupancy:
+        return centers, stats, occupancy
     return centers, stats
 
 
 def collect_latents(params, split: SplitData, config: CategoricalBottleneckConfig,
-                    batch_size: int) -> jnp.ndarray:
+                    batch_size: int) -> np.ndarray:
+    """Encode every state once into a bounded GPU batch and a host array.
+
+    Keeping the complete latent tensor on the accelerator costs 9.18 GB for the
+    70,018-state v9 train split. More importantly, the old subsequent transpose
+    required another contiguous 9.18 GB allocation. The host result remains the
+    same full train tensor; this is memory scheduling, not state subsampling.
+    """
     continuous = config.continuous
-    chunks = [
-        encode(params, split.xbar_device[start:start + batch_size],
-               split.valid_device[start:start + batch_size], continuous)
-        for start in range(0, len(split), batch_size)
-    ]
-    return jnp.concatenate(chunks, 0)
+    latents = np.empty(
+        (len(split), config.num_e_tokens, config.e_dim), dtype=np.float32
+    )
+    report_batches = max(1, math.ceil(max(len(split), 1) / batch_size / 10))
+    for batch_index, start in enumerate(range(0, len(split), batch_size)):
+        stop = min(start + batch_size, len(split))
+        encoded = encode(
+            params, split.xbar_device[start:stop],
+            split.valid_device[start:stop], continuous,
+        )
+        latents[start:stop] = np.asarray(encoded, np.float32)
+        if (batch_index + 1) % report_batches == 0 or stop == len(split):
+            print(json.dumps({
+                "event": "a2_collect_latents",
+                "states": stop,
+                "total_states": len(split),
+            }, sort_keys=True), flush=True)
+    return latents
 
 
 def fit_codebook(params, train: SplitData, config: CategoricalBottleneckConfig,
-                 *, seed: int, iterations: int, batch_size: int):
+                 *, seed: int, iterations: int, batch_size: int,
+                 problem_batch: int = 64):
     """Per-subspace K-means centroids fitted on the train split only."""
     if train.name != "train":
         raise ValueError("codebook centroids may only be fitted on the train split")
+    if problem_batch <= 0:
+        raise ValueError("K-means problem batch must be positive")
     latents = collect_latents(params, train, config, batch_size)  # (n, N, e_dim)
     tokens, subspaces = config.num_e_tokens, config.num_subspaces
-    points = latents.reshape(len(train), tokens, subspaces, config.subspace_dim)
-    points = jnp.transpose(points, (1, 2, 0, 3)).reshape(
-        tokens * subspaces, len(train), config.subspace_dim
+    latent_subspaces = latents.reshape(
+        len(train), tokens, subspaces, config.subspace_dim
     )
-    centers, stats = kmeans_codebook(points, config.num_categories, seed, iterations)
+    problems = tokens * subspaces
+    centers_host = np.empty(
+        (problems, config.num_categories, config.subspace_dim), np.float32
+    )
+    occupancy = np.empty((problems, config.num_categories), np.int64)
+    for start in range(0, problems, problem_batch):
+        stop = min(start + problem_batch, problems)
+        problem_ids = np.arange(start, stop)
+        token_ids = problem_ids // subspaces
+        subspace_ids = problem_ids % subspaces
+        # Only this device block is materialised in problem-major order. The
+        # complete latent tensor stays host-backed and is never transposed whole.
+        block_points = np.ascontiguousarray(
+            np.transpose(
+                latent_subspaces[:, token_ids, subspace_ids, :], (1, 0, 2)
+            )
+        )
+        block_centers, _, block_occupancy = kmeans_codebook(
+            block_points, config.num_categories, seed, iterations,
+            chunk=problem_batch, problem_offset=start, return_occupancy=True,
+        )
+        centers_host[start:stop] = np.asarray(block_centers, np.float32)
+        occupancy[start:stop] = block_occupancy
+        print(json.dumps({
+            "event": "a2_kmeans_block",
+            "problems": stop,
+            "total_problems": problems,
+            "train_states": len(train),
+        }, sort_keys=True), flush=True)
+
+    stats = _occupancy_stats(
+        occupancy, num_clusters=config.num_categories, problems=problems,
+        samples=len(train), iterations=iterations,
+    )
+    stats.update({
+        "problem_batch": int(problem_batch),
+        "problem_rng": "per_problem_fold_in_v1",
+        "state_sampling": "none_full_train_split",
+        "latent_storage": "float32_host",
+    })
+    centers = jnp.asarray(centers_host)
     codebook = centers.reshape(tokens, subspaces, config.num_categories, config.subspace_dim)
     return codebook, stats, latents
 
@@ -596,6 +701,7 @@ def run(args: argparse.Namespace) -> dict:
             codebook, kmeans_stats, latents = fit_codebook(
                 params, train, base_config, seed=args.seed,
                 iterations=args.kmeans_iterations, batch_size=args.init_batch_size,
+                problem_batch=getattr(args, "kmeans_problem_batch", 64),
             )
             params[CODEBOOK] = codebook
         else:
@@ -740,6 +846,15 @@ def run(args: argparse.Namespace) -> dict:
                 f"{selection_name}/r2": metrics["all/r2"],
                 "code/perplexity_median": metrics["code/perplexity_median"],
             })
+            print(json.dumps({
+                "event": "a2_eval",
+                "step": step,
+                "total_steps": args.max_steps,
+                "train_batch_loss": float(loss),
+                f"{selection_name}/mse": metrics["all/mse"],
+                f"{selection_name}/r2": metrics["all/r2"],
+                "code/perplexity_median": metrics["code/perplexity_median"],
+            }, sort_keys=True), flush=True)
             if metrics["all/mse"] < best["metric"]:
                 best = {"metric": metrics["all/mse"], "step": step}
                 best_params = params
@@ -1022,6 +1137,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-max-prob", type=float, default=0.8)
     parser.add_argument("--calibration-states", type=int, default=256)
     parser.add_argument("--kmeans-iterations", type=int, default=25)
+    parser.add_argument("--kmeans-problem-batch", type=int, default=64,
+                        help="number of independent (token, subspace) K-means "
+                             "problems resident on the accelerator at once; all "
+                             "train states still participate")
     parser.add_argument("--overfit-states", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=70000)

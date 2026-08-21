@@ -77,6 +77,22 @@ def test_next_episode_keeps_the_worker_stride(tmp_path):
     assert next_index % NUM_WORKERS == WORKER
 
 
+def test_lane_resume_keeps_custom_stride_and_counts_complete_episodes(tmp_path):
+    path = tmp_path / "records-lane.jsonl"
+    write(path, [
+        record("miniwob/click-button-v1", 0, 0),
+        record("miniwob/click-button-v1", 0, 1),
+        record("miniwob/click-button-v1", 96, 0),
+        record("miniwob/click-button-v1", 192, 0),
+    ])
+    progress, surviving = _resume_state(path, 96)
+    assert [item["episode_index"] for item in surviving] == [0, 0, 96]
+    entry = progress["miniwob/click-button-v1"]
+    assert entry["states"] == 3
+    assert entry["episodes"] == 2
+    assert entry["next_episode"] == 192
+
+
 def test_progress_is_tracked_per_task(tmp_path):
     """A worker walks its tasks in order; each carries its own count and cursor."""
     path = tmp_path / "records-worker00.jsonl"

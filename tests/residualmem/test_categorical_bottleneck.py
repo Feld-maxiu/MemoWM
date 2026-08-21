@@ -404,7 +404,8 @@ def test_group_slice_matches_the_configured_layout():
     config = _tiny()  # (4, 2, 1, 1)
     spans = [Q.group_slice(config, name) for name in Q.GROUP_NAMES]
     assert spans == [slice(0, 4), slice(4, 6), slice(6, 7), slice(7, 8)]
-    assert Q.group_slice(Q.CategoricalBottleneckConfig(), "detail") == slice(32, 44)
+    # Frozen v8/v9 layout recycles the old four prompt slots into detail.
+    assert Q.group_slice(Q.CategoricalBottleneckConfig(), "detail") == slice(32, 48)
     with pytest.raises(ValueError):
         Q.group_slice(config, "dom")
 

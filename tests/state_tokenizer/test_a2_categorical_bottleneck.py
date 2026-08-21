@@ -86,7 +86,7 @@ def _args(dataset, tmp_path, **overrides) -> argparse.Namespace:
         num_e_tokens=4, e_dim=8, num_subspaces=2, num_categories=4,
         num_heads=2, ffn_hidden=16,
         temperature=1.0, calibrate_temperature=True, target_max_prob=0.8,
-        calibration_states=8, kmeans_iterations=3,
+        calibration_states=8, kmeans_iterations=3, kmeans_problem_batch=3,
         overfit_states=0, seed=0, max_steps=4, batch_size=4,
         eval_batch_size=8, eval_every=2, patience_evals=0, init_batch_size=8,
         codebook_learning_rate=3e-4, backbone_learning_rate=3e-5,
@@ -196,6 +196,29 @@ def test_kmeans_and_temperature_calibration_are_recorded(dataset, tmp_path):
                          temperature=2.5, output=str(tmp_path / "fixed.json")))
     assert fixed["init"]["temperature_calibration"] is None
     assert fixed["config"]["temperature"] == pytest.approx(2.5)
+
+
+def test_kmeans_problem_blocking_is_numerically_equivalent():
+    """Changing only the resident problem count must not change centroids."""
+    points = np.random.default_rng(7).normal(size=(7, 20, 3)).astype(np.float32)
+    whole, whole_stats, whole_occupancy = A2.kmeans_codebook(
+        points, num_clusters=4, seed=11, iterations=3, chunk=7,
+        return_occupancy=True,
+    )
+
+    blocked = []
+    occupancies = []
+    for start in range(0, len(points), 3):
+        centers, _, occupancy = A2.kmeans_codebook(
+            points[start:start + 3], num_clusters=4, seed=11, iterations=3,
+            chunk=3, problem_offset=start, return_occupancy=True,
+        )
+        blocked.append(np.asarray(centers))
+        occupancies.append(occupancy)
+
+    np.testing.assert_array_equal(np.concatenate(blocked), np.asarray(whole))
+    np.testing.assert_array_equal(np.concatenate(occupancies), whole_occupancy)
+    assert whole_stats["problems"] == len(points)
 
 
 def test_centroids_never_see_held_out_states(dataset, tmp_path):

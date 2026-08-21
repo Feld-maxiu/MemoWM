@@ -100,7 +100,7 @@ export PYTHONPATH=.
 
 | 用途 | 解释器 | 有什么 | 没有什么 |
 |---|---|---|---|
-| **采集** | `czs/browsergym-venv/bin/python` | playwright、gymnasium、browsergym | torch、jax |
+| **采集** | `residual-mem/browsergym-venv/bin/python` | playwright、gymnasium、browsergym | torch、jax |
 | **抽取 / 池化 / 探针** | `enter/envs/MemCompiler/bin/python3.12` | torch、transformers | jax、pytest |
 | **A1 / A2 瓶颈** | `enter/envs/ResidualMem/bin/python3.11` | jax 0.4.33、optax | torch |
 
@@ -109,19 +109,21 @@ export PYTHONPATH=.
 ### 1. 采集（BrowserGym + Playwright）
 
 ```sh
-R=/root/nas/users/luzheng/workspace/ssh/czs
+R=/mnt/data/users/luzheng/workspace/iclr/czs/residual-mem
 export PLAYWRIGHT_BROWSERS_PATH=$R/browsergym-venv/browsers
-export LD_LIBRARY_PATH=$R/browsergym-venv/syslibs:${LD_LIBRARY_PATH:-}
-export MINIWOB_URL="file://$R/miniwob-plusplus/.venv/lib/python3.12/site-packages/miniwob/html/miniwob/"
-export PYTHONPATH=$R/ResidualMem
+export LD_LIBRARY_PATH=$R/browsergym-venv/syslibs/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+export MINIWOB_URL="file://$R/third_party/miniwob-plusplus/miniwob/html/miniwob/"
+export PYTHONPATH=$R
 $R/browsergym-venv/bin/python -m experiments.state_tokenizer.collect_browsergym \
   --output outputs/state_tokenizer/v9 --target-states 1000 \
   --max-steps 7 --random-action-prob 0.5 --num-workers 6 --worker-id 0 --resume
 ```
 
-**前两个 export 是必须的，不是优化。** 会话容器重建会清掉 `~/.cache/ms-playwright` 与 apt 装的浏览器库；Chromium 与 84 个系统 `.so` 已固化到 NAS 上的这两个路径。缺了它们，`env.reset` 会永久失败而采集脚本**空转不报错**（已加 `--max-consecutive-failures` 拦截）。
+**前两个 export 是必须的，不是优化。** 会话容器重建会清掉 `~/.cache/ms-playwright` 与 apt 装的浏览器库；Chromium 与所需动态库已固化到项目目录。缺了它们，`env.reset` 会永久失败而采集脚本**空转不报错**（已加 `--max-consecutive-failures` 拦截）。
 
-浏览器依赖若需重装，Ubuntu 24.04 的包名带 `t64` 后缀（`libasound2t64`、`libatk1.0-0t64`、`libcups2t64`、`libglib2.0-0t64` 等），用旧名会得到 "no installation candidate"。
+当前宿主是 Ubuntu 22.04，动态库通过 `apt-get download` + `dpkg-deb -x` 解包到
+`browsergym-venv/syslibs`，没有修改系统包。若迁移到 Ubuntu 24.04，对应包名会带
+`t64` 后缀（如 `libatk1.0-0t64`、`libcups2t64`），不能原样沿用 22.04 包名。
 
 `--num-workers` **不得为 5 的倍数**（脚本会拒绝）：episode 索引是 `worker_id + k·num_workers`，划分按 `index % 10` 分桶，5 的倍数会让整个任务落进单一划分。
 
@@ -166,6 +168,12 @@ collect → merge_records（写 global_index = 合并清单行号）
 ```
 
 `extract_fixed_prompt` 而非 `extract_full_h`：只有前者写 `fixed-prompt-summary.json`，`rebuild` 会校验它。
+
+恢复版 v9 不再为了取得 token 数额外跑一遍 `extract_qwen`。先运行
+`experiments.state_tokenizer.modality_lengths --prompt-mode instruct` 生成只含
+`modality-lengths.npy` 的轻量 shard，再把它传给 `extract_fixed_prompt --source-features`。
+该预扫描只加载 processor/config、不加载 9B 权重；正式抽取仍会逐条重算长度并在不一致时
+立即失败，因此它不降低协议校验强度。可直接使用 `scripts_v9_instruct.sh modality-lengths`。
 
 ### 3. A1 / A2 瓶颈（JAX）
 

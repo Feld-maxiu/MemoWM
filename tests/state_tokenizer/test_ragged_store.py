@@ -2,7 +2,23 @@ from __future__ import annotations
 
 import torch
 
-from experiments.state_tokenizer.ragged_store import normalized_modality_positions, pad_token_batch
+from experiments.state_tokenizer.ragged_store import (
+    FixedRepresentationStore,
+    normalized_modality_positions,
+    pad_token_batch,
+)
+from experiments.state_tokenizer.slot_layout import (
+    CONTEXT_SLOTS,
+    DETAIL_SLOTS,
+    IMAGE_SLOTS,
+    PROMPT_SLOTS,
+)
+
+
+def test_key64_modality_layout_tracks_frozen_slot_layout():
+    expected = (IMAGE_SLOTS, DETAIL_SLOTS + CONTEXT_SLOTS, PROMPT_SLOTS)
+    for representation in ("key64", "key64_pca", "key64_static", "key64_static_pca"):
+        assert FixedRepresentationStore.SPECS[representation][3] == expected
 
 
 def test_normalized_positions_are_modality_local_and_scale_invariant():

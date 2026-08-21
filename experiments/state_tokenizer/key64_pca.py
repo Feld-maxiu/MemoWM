@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 import json
 import time
 from pathlib import Path
@@ -32,21 +33,77 @@ def valid_rows(values: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return values.reshape(-1, values.shape[-1])[valid.reshape(-1)]
 
 
+def select_fit_indices(records, fit_states: int, selection: str):
+    """Select train rows deterministically and report the realised task mix.
+
+    ``first`` preserves the historical behaviour. ``task_balanced`` walks the
+    tasks in sorted order, taking one state from each task per round while
+    preserving record order within a task. The latter prevents a task-grouped
+    manifest from silently fitting PCA on only its first task.
+    """
+    if fit_states < 1:
+        raise ValueError("fit-states must be positive")
+    if selection not in {"first", "task_balanced"}:
+        raise ValueError(f"unknown PCA fit selection: {selection}")
+
+    train_rows = []
+    by_task = defaultdict(list)
+    seen = set()
+    for record in records:
+        if record["split"] != "train":
+            continue
+        index = int(record["global_index"])
+        if index in seen:
+            raise ValueError(f"duplicate train global index in PCA records: {index}")
+        seen.add(index)
+        task = str(record["task"])
+        train_rows.append((index, task))
+        by_task[task].append(index)
+
+    if len(train_rows) < fit_states:
+        raise ValueError(f"requested {fit_states} PCA states, found {len(train_rows)}")
+
+    if selection == "first":
+        selected = [index for index, _ in train_rows[:fit_states]]
+        task_by_index = {index: task for index, task in train_rows[:fit_states]}
+    else:
+        tasks = sorted(by_task)
+        if not tasks:
+            raise ValueError("PCA task-balanced selection found no train tasks")
+        selected = []
+        offsets = {task: 0 for task in tasks}
+        while len(selected) < fit_states:
+            advanced = False
+            for task in tasks:
+                offset = offsets[task]
+                if offset >= len(by_task[task]):
+                    continue
+                selected.append(by_task[task][offset])
+                offsets[task] += 1
+                advanced = True
+                if len(selected) == fit_states:
+                    break
+            if not advanced:
+                raise RuntimeError("PCA task-balanced selection exhausted unexpectedly")
+        selected_set = set(selected)
+        task_by_index = {
+            index: task for task, indices in by_task.items() for index in indices
+            if index in selected_set
+        }
+
+    counts = Counter(task_by_index[index] for index in selected)
+    return selected, dict(sorted(counts.items()))
+
+
 def fit(args: argparse.Namespace) -> dict:
     if args.components != 512:
         raise ValueError("key64 PCA artifacts require exactly 512 components")
     if args.load_batch_states < 1 or args.fit_states < 1:
         raise ValueError("fit-states and load-batch-states must be positive")
-    train_indices = []
-    for record in iter_jsonl(args.records):
-        if record["split"] == "train":
-            train_indices.append(int(record["global_index"]))
-            if len(train_indices) == args.fit_states:
-                break
-    if len(train_indices) < args.fit_states:
-        raise ValueError(f"requested {args.fit_states} PCA states, found {len(train_indices)}")
-    if len(set(train_indices)) != len(train_indices):
-        raise ValueError("duplicate train global indices in PCA fit selection")
+    fit_selection = getattr(args, "fit_selection", "first")
+    train_indices, fit_task_counts = select_fit_indices(
+        iter_jsonl(args.records), args.fit_states, fit_selection
+    )
     selected = set(train_indices)
     prefix = _prefix(args)
     protocol = PREFIX_PROTOCOLS[prefix]
@@ -123,6 +180,9 @@ def fit(args: argparse.Namespace) -> dict:
         explained_variance=explained.cpu().numpy().astype(np.float32),
         explained_variance_ratio=np.asarray(float(explained_ratio), np.float32),
         fit_record_indices=np.asarray(train_indices, np.int64),
+        fit_selection=np.asarray(fit_selection),
+        fit_task_names=np.asarray(list(fit_task_counts)),
+        fit_task_counts=np.asarray(list(fit_task_counts.values()), np.int64),
         layout=np.asarray(KEY64_LAYOUT, np.int32),
         group_valid_rows=group_rows,
         prefix=np.asarray(prefix),
@@ -131,6 +191,8 @@ def fit(args: argparse.Namespace) -> dict:
     summary = {
         "protocol": protocol,
         "fit_states": len(train_indices),
+        "fit_selection": fit_selection,
+        "fit_task_counts": fit_task_counts,
         "fit_valid_slot_rows": len(matrix),
         "group_valid_rows": group_rows.tolist(),
         "layout": list(KEY64_LAYOUT),
@@ -257,6 +319,8 @@ def main() -> None:
     fit_parser.add_argument("--output", required=True)
     fit_parser.add_argument("--device", default="cuda:0")
     fit_parser.add_argument("--fit-states", type=int, default=2000)
+    fit_parser.add_argument("--fit-selection", choices=("first", "task_balanced"),
+                            default="first")
     fit_parser.add_argument("--components", type=int, choices=(512,), default=512)
     fit_parser.add_argument("--oversample", type=int, default=576)
     fit_parser.add_argument("--niter", type=int, default=3)

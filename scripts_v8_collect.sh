@@ -15,18 +15,18 @@
 # manifest even when it gives up on a task, and reports that in aborted_tasks.
 set -u
 w=$1
-R=/root/nas/users/luzheng/workspace/ssh/czs
-export PLAYWRIGHT_BROWSERS_PATH=$R/browsergym-venv/browsers
-export LD_LIBRARY_PATH=$R/browsergym-venv/syslibs:${LD_LIBRARY_PATH:-}
-export MINIWOB_URL="file://$R/miniwob-plusplus/.venv/lib/python3.12/site-packages/miniwob/html/miniwob/"
-export PYTHONPATH=$R/ResidualMem
-OUT=$R/ResidualMem/outputs/state_tokenizer/v8
-LOG=$R/ResidualMem/outputs/state_tokenizer/v8-logs/w$w.log
+R="$(cd "$(dirname "$0")" && pwd)"
+export PLAYWRIGHT_BROWSERS_PATH="$R/browsergym-venv/browsers"
+export LD_LIBRARY_PATH="$R/browsergym-venv/syslibs/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+export MINIWOB_URL="file://$R/third_party/miniwob-plusplus/miniwob/html/miniwob/"
+export PYTHONPATH="$R"
+OUT="$R/outputs/state_tokenizer/v8"
+LOG="$R/outputs/state_tokenizer/v8-logs/w$w.log"
 mkdir -p "$(dirname "$LOG")"
 
 for attempt in $(seq 1 100); do
   echo "=== attempt $attempt $(date -Is) ===" >> "$LOG"
-  $R/browsergym-venv/bin/python -m experiments.state_tokenizer.collect_browsergym \
+  "$R/browsergym-venv/bin/python" -m experiments.state_tokenizer.collect_browsergym \
     --output "$OUT" --target-states 100000 --max-steps 7 --random-action-prob 0.5 \
     --num-workers 12 --worker-id "$w" --resume --log-level INFO >> "$LOG" 2>&1
   status=$?

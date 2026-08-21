@@ -9,6 +9,14 @@ import numpy as np
 import torch
 
 from .feature_store import discover_shards
+from .slot_layout import CONTEXT_SLOTS, DETAIL_SLOTS, IMAGE_SLOTS, PROMPT_SLOTS
+
+
+KEY64_MODALITY_LAYOUT = (
+    IMAGE_SLOTS,
+    DETAIL_SLOTS + CONTEXT_SLOTS,
+    PROMPT_SLOTS,
+)
 
 
 def bf16_tensor_view(bits: np.ndarray) -> torch.Tensor:
@@ -135,10 +143,12 @@ class FixedRepresentationStore:
         "y64": ("y64-bf16.npy", 64, 4096, (40, 20, 4)),
         "y32": ("y32-bf16.npy", 32, 4096, (20, 10, 2)),
         "x64": ("x64-pca-bf16.npy", 64, 512, (40, 20, 4)),
-        "key64": ("key64-bf16.npy", 64, 4096, (32, 28, 4)),
-        "key64_pca": ("key64-pca-bf16.npy", 64, 512, (32, 28, 4)),
-        "key64_static": ("key64-static-bf16.npy", 64, 4096, (32, 28, 4)),
-        "key64_static_pca": ("key64-static-pca-bf16.npy", 64, 512, (32, 28, 4)),
+        "key64": ("key64-bf16.npy", 64, 4096, KEY64_MODALITY_LAYOUT),
+        "key64_pca": ("key64-pca-bf16.npy", 64, 512, KEY64_MODALITY_LAYOUT),
+        "key64_static": ("key64-static-bf16.npy", 64, 4096, KEY64_MODALITY_LAYOUT),
+        "key64_static_pca": (
+            "key64-static-pca-bf16.npy", 64, 512, KEY64_MODALITY_LAYOUT
+        ),
     }
     EXPLICIT_METADATA = {"key64", "key64_pca", "key64_static", "key64_static_pca"}
     METADATA_PREFIX = {

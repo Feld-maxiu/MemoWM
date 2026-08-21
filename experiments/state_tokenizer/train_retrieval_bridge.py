@@ -23,7 +23,7 @@ def load_cache(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
         if "teacher_embedding" in data.files:
             raise ValueError("stale screenshot-only teacher cache is forbidden")
-        required = {"xbar", "a2_xbar", "valid", "teacher_fused_embedding", "split", "metadata"}
+        required = {"xbar", "valid", "teacher_fused_embedding", "split", "metadata"}
         missing = required - set(data.files)
         if missing:
             raise ValueError(f"bridge cache missing {sorted(missing)}")
@@ -32,7 +32,17 @@ def load_cache(path: str | Path) -> dict[str, np.ndarray]:
             raise ValueError("bridge cache protocol mismatch")
         if metadata.get("teacher_protocol") != FUSED_OBSERVATION_TEACHER_PROTOCOL:
             raise ValueError("bridge teacher is not fused observation v1")
+        representation = metadata.get(
+            "representation", "both" if "a2_xbar" in data.files else "xbar"
+        )
+        if representation not in {"xbar", "both"}:
+            raise ValueError(f"unsupported cache representation {representation!r}")
+        if representation == "both" and "a2_xbar" not in data.files:
+            raise ValueError("representation=both cache has no a2_xbar")
+        if "a2_xbar" in data.files:
+            required.add("a2_xbar")
         output = {name: np.asarray(data[name]) for name in required if name != "metadata"}
+        metadata["representation"] = representation
         output["metadata"] = metadata
     if output["xbar"].shape[1:] != (64, 512):
         raise ValueError(f"unexpected xbar shape {output['xbar'].shape}")
@@ -47,8 +57,16 @@ def symmetric_infonce(student: torch.Tensor, teacher: torch.Tensor, temperature:
     return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
 
-def batch_loss(head, xbar, a2, valid, teacher, temperature):
+def batch_loss(head, xbar, valid, teacher, temperature, a2=None):
     x_vector = head(xbar, valid)
+    if a2 is None:
+        contrastive = symmetric_infonce(x_vector, teacher, temperature)
+        cosine = (1.0 - (x_vector * teacher).sum(-1)).mean()
+        return contrastive + cosine, {
+            "contrastive": contrastive,
+            "cosine": cosine,
+            "xbar_cosine": (x_vector * teacher).sum(-1).mean(),
+        }
     a2_vector = head(a2, valid)
     contrastive = 0.5 * (
         symmetric_infonce(x_vector, teacher, temperature)
@@ -76,8 +94,9 @@ def evaluate(head, tensors, indices, batch_size, temperature):
         for start in range(0, len(indices), batch_size):
             index = indices[start:start + batch_size]
             loss, metrics = batch_loss(
-                head, tensors["xbar"][index], tensors["a2_xbar"][index],
-                tensors["valid"][index], tensors["teacher"][index], temperature,
+                head, tensors["xbar"][index], tensors["valid"][index],
+                tensors["teacher"][index], temperature,
+                tensors.get("a2_xbar", None)[index] if "a2_xbar" in tensors else None,
             )
             values = {"loss": loss, **metrics}
             for name, value in values.items():
@@ -88,15 +107,22 @@ def evaluate(head, tensors, indices, batch_size, temperature):
 
 def train(args: argparse.Namespace) -> dict:
     cache = load_cache(args.cache)
+    cache_representation = str(cache["metadata"]["representation"])
+    representation = cache_representation if args.representation == "auto" else args.representation
+    if representation == "both" and "a2_xbar" not in cache:
+        raise ValueError("representation=both requested but cache has no a2_xbar")
     device = torch.device(args.device)
     tensors = {
         "xbar": torch.as_tensor(cache["xbar"], dtype=torch.float32, device=device),
-        "a2_xbar": torch.as_tensor(cache["a2_xbar"], dtype=torch.float32, device=device),
         "valid": torch.as_tensor(cache["valid"], dtype=torch.bool, device=device),
         "teacher": F.normalize(torch.as_tensor(
             cache["teacher_fused_embedding"], dtype=torch.float32, device=device
         ), dim=-1),
     }
+    if representation == "both":
+        tensors["a2_xbar"] = torch.as_tensor(
+            cache["a2_xbar"], dtype=torch.float32, device=device
+        )
     split = cache["split"].astype(str)
     train_idx = np.flatnonzero(split == "train")
     val_idx = np.flatnonzero(split == "validation")
@@ -116,8 +142,9 @@ def train(args: argparse.Namespace) -> dict:
         head.train()
         optimizer.zero_grad(set_to_none=True)
         loss, _ = batch_loss(
-            head, tensors["xbar"][index_t], tensors["a2_xbar"][index_t],
-            tensors["valid"][index_t], tensors["teacher"][index_t], args.temperature,
+            head, tensors["xbar"][index_t], tensors["valid"][index_t],
+            tensors["teacher"][index_t], args.temperature,
+            tensors.get("a2_xbar", None)[index_t] if "a2_xbar" in tensors else None,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(head.parameters(), args.clip_norm)
@@ -125,6 +152,7 @@ def train(args: argparse.Namespace) -> dict:
         if step % args.eval_every == 0 or step == args.max_steps:
             metrics = evaluate(head, tensors, torch.as_tensor(val_idx, device=device), args.eval_batch_size, args.temperature)
             history.append({"step": step, **metrics})
+            print(json.dumps(history[-1], sort_keys=True), flush=True)
             if metrics["loss"] < best:
                 best = metrics["loss"]
                 best_step = step
@@ -133,6 +161,9 @@ def train(args: argparse.Namespace) -> dict:
                     args.output, head, protocol=RETRIEVAL_BRIDGE_PROTOCOL,
                     cache_protocol=BRIDGE_CACHE_PROTOCOL,
                     teacher_protocol=FUSED_OBSERVATION_TEACHER_PROTOCOL,
+                    representation=representation,
+                    cache=str(Path(args.cache).resolve()),
+                    temperature=args.temperature,
                     best_step=step, validation=metrics,
                 )
             else:
@@ -141,6 +172,7 @@ def train(args: argparse.Namespace) -> dict:
                     break
     report = {
         "protocol": RETRIEVAL_BRIDGE_PROTOCOL,
+        "representation": representation,
         "cache": str(Path(args.cache).resolve()),
         "output": str(Path(args.output).resolve()),
         "best_step": best_step,
@@ -156,6 +188,7 @@ def main() -> None:
     parser.add_argument("--cache", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--representation", choices=("auto", "xbar", "both"), default="auto")
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=128)

@@ -9,4 +9,7 @@ MUJOCO_LOG.TXT
 .venv/
 .venv-jax/
 models/
+browsergym-venv/
+third_party/
 *.incomplete
+.tmp/

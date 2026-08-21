@@ -596,6 +596,16 @@ def run(args: argparse.Namespace) -> dict:
                     f"{selection_name}/mse": selection_metrics["all/mse"],
                     f"{selection_name}/r2": selection_metrics["all/r2"],
                 })
+                print(json.dumps({
+                    "event": "a1_eval",
+                    "step": step,
+                    "total_steps": total_steps,
+                    "stage": stage,
+                    "learning_rate": learning_rate,
+                    "train_batch_loss": loss,
+                    f"{selection_name}/mse": selection_metrics["all/mse"],
+                    f"{selection_name}/r2": selection_metrics["all/r2"],
+                }, sort_keys=True), flush=True)
                 if selection_metrics["all/mse"] < best["metric"]:
                     best = {
                         "loss": best["loss"],

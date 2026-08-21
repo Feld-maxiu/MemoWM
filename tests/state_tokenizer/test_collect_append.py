@@ -100,3 +100,30 @@ def test_unknown_only_tasks_are_rejected_rather_than_silently_collecting_nothing
     assert arguments.only_tasks == ["miniwob/click-button-v1"]
     # A typo would otherwise produce an empty assignment and a zero-state shard.
     assert set(arguments.only_tasks) <= set(PILOT_TASKS)
+
+
+def test_lane_arguments_preserve_the_original_episode_lattice():
+    arguments = _parse(
+        "--assigned-task-index", "3", "--target-episodes", "7",
+        "--shard-name", "lane-t03-l02of08",
+        "--episode-start", str(3 + 12 * 2),
+        "--episode-stride", str(12 * 8),
+    )
+    assert arguments.assigned_task_index == 3
+    assert arguments.episode_start == 27
+    assert arguments.episode_stride == 96
+    assert arguments.target_episodes == 7
+
+
+def test_lane_arguments_reject_partial_or_off_lattice_configurations():
+    assert _rejects("--assigned-task-index", "0")
+    assert _rejects(
+        "--assigned-task-index", "3", "--target-episodes", "7",
+        "--shard-name", "bad/name", "--episode-start", "27",
+        "--episode-stride", "96",
+    )
+    assert _rejects(
+        "--assigned-task-index", "3", "--target-episodes", "7",
+        "--shard-name", "lane", "--episode-start", "15",
+        "--episode-stride", "95",
+    )

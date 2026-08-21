@@ -21,12 +21,14 @@ import json
 import logging
 import re
 from pathlib import Path
+from unittest.mock import patch
 
 import gymnasium
 import numpy as np
 from PIL import Image
 
 import browsergym.miniwob  # noqa: F401  -- registers the browsergym/miniwob.* ids
+from browsergym.core.env import _get_global_playwright
 from browsergym.utils.obs import flatten_dom_to_str
 
 from .common import (
@@ -44,6 +46,42 @@ INTERACTIVE_TAGS = {
     "button", "a", "label", "input_button", "input_submit", "option", "select",
 }
 TYPING_TAGS = {"input_text", "input_password", "textarea"}
+
+
+def _enable_browser_reuse(env) -> None:
+    """Reuse both BrowserGym Chromium processes while replacing their contexts.
+
+    BrowserGym 0.14.3 launches one Chromium for the task and another for its
+    chat UI on every reset.  MiniWoB teardown has no browser-level state, and a
+    fresh incognito context still isolates each episode.  This wrapper keeps
+    the two processes but lets BrowserGym execute its unchanged reset path.
+    It is opt-in because production use requires exact overlap validation.
+    """
+    base = env.unwrapped
+    original_reset = base.reset
+
+    def reset_with_reused_browsers(*args, **kwargs):
+        main_browser = base.browser
+        chat_browser = base.chat.browser if base.chat is not None else None
+        if (
+            main_browser is None
+            or chat_browser is None
+            or not main_browser.is_connected()
+            or not chat_browser.is_connected()
+        ):
+            return original_reset(*args, **kwargs)
+
+        chromium = _get_global_playwright().chromium
+        # BrowserEnv.reset launches task Chromium first; Chat.__init__ launches
+        # chat Chromium second.  Closing either old context remains untouched.
+        with (
+            patch.object(main_browser, "close", return_value=None),
+            patch.object(chat_browser, "close", return_value=None),
+            patch.object(chromium, "launch", side_effect=(main_browser, chat_browser)),
+        ):
+            return original_reset(*args, **kwargs)
+
+    base.reset = reset_with_reused_browsers
 
 
 def _quote(value: str) -> str:
@@ -242,7 +280,7 @@ def _save_state(
     return record
 
 
-def _resume_state(path: Path, num_workers: int) -> tuple[dict[str, dict], list[dict]]:
+def _resume_state(path: Path, episode_stride: int) -> tuple[dict[str, dict], list[dict]]:
     """Per-task progress from an existing shard, minus its last episode.
 
     A run that spans hours will be interrupted -- the session container that owns
@@ -277,12 +315,22 @@ def _resume_state(path: Path, num_workers: int) -> tuple[dict[str, dict], list[d
         if int(record["episode_index"]) != last_episode.get(record["task"])
     ]
     progress: dict[str, dict] = {}
+    episodes: dict[str, set[int]] = {}
     for record in surviving:
-        entry = progress.setdefault(record["task"], {"states": 0, "next_episode": 0})
+        entry = progress.setdefault(
+            record["task"], {"states": 0, "episodes": 0, "next_episode": 0}
+        )
         entry["states"] += 1
-        entry["next_episode"] = max(entry["next_episode"], int(record["episode_index"]) + num_workers)
+        episodes.setdefault(record["task"], set()).add(int(record["episode_index"]))
+        entry["next_episode"] = max(
+            entry["next_episode"], int(record["episode_index"]) + episode_stride
+        )
+    for task, values in episodes.items():
+        progress[task]["episodes"] = len(values)
     for task, index in last_episode.items():
-        entry = progress.setdefault(task, {"states": 0, "next_episode": 0})
+        entry = progress.setdefault(
+            task, {"states": 0, "episodes": 0, "next_episode": 0}
+        )
         # re-collect the dropped episode
         entry["next_episode"] = max(entry["next_episode"], index)
     return progress, surviving
@@ -303,23 +351,37 @@ def collect(args: argparse.Namespace) -> dict:
         unknown = sorted(chosen - set(tasks))
         if unknown:
             raise SystemExit(f"--only-tasks names unknown tasks: {unknown}")
-    assigned = [
-        (index, task) for index, task in enumerate(tasks)
-        if index % args.num_workers == args.worker_id
-        and (chosen is None or task in chosen)
-    ]
+    lane_mode = args.target_episodes is not None
+    if args.assigned_task_index is None:
+        assigned = [
+            (index, task) for index, task in enumerate(tasks)
+            if index % args.num_workers == args.worker_id
+            and (chosen is None or task in chosen)
+        ]
+    else:
+        if not 0 <= args.assigned_task_index < len(tasks):
+            raise SystemExit(
+                f"--assigned-task-index={args.assigned_task_index} is outside "
+                f"the canonical task list of length {len(tasks)}"
+            )
+        selected = tasks[args.assigned_task_index]
+        if chosen is not None and selected not in chosen:
+            raise SystemExit("--assigned-task-index is excluded by --only-tasks")
+        assigned = [(args.assigned_task_index, selected)]
     # Budget is per *collected* task, so skipping tasks concentrates the target
     # on the ones that remain rather than silently under-collecting.
     per_task = int(np.ceil(args.target_states / len(chosen or tasks)))
-    records_path = output / f"records-worker{args.worker_id:02d}.jsonl"
+    shard_name = args.shard_name or f"worker{args.worker_id:02d}"
+    records_path = output / f"records-{shard_name}.jsonl"
     counts = {"train": 0, "validation": 0, "test": 0}
     task_counts: dict[str, int] = {}
+    task_episode_counts: dict[str, int] = {}
     aborted: list[str] = []
     total = 0
 
     progress: dict[str, dict] = {}
     if args.resume:
-        progress, surviving = _resume_state(records_path, args.num_workers)
+        progress, surviving = _resume_state(records_path, args.episode_stride)
         if progress:
             with records_path.open("w", encoding="utf-8") as handle:
                 for item in surviving:
@@ -334,11 +396,24 @@ def collect(args: argparse.Namespace) -> dict:
     with records_path.open(mode, encoding="utf-8") as handle:
         for task_index, task in assigned:
             task_total = progress.get(task, {}).get("states", 0)
-            episode_index = progress.get(task, {}).get("next_episode", args.worker_id)
-            if task_total >= per_task:
+            episode_total = progress.get(task, {}).get("episodes", 0)
+            episode_index = progress.get(task, {}).get(
+                "next_episode", args.episode_start
+            )
+
+            def complete() -> bool:
+                return (
+                    episode_total >= args.target_episodes
+                    if lane_mode else task_total >= per_task
+                )
+
+            if complete():
                 logging.info("worker=%d task=%s already complete (%d/%d)",
-                             args.worker_id, task, task_total, per_task)
+                             args.worker_id, task,
+                             episode_total if lane_mode else task_total,
+                             args.target_episodes if lane_mode else per_task)
                 task_counts[task] = task_total
+                task_episode_counts[task] = episode_total
                 continue
             # "miniwob/click-button-v1" -> "browsergym/miniwob.click-button"
             slug = re.sub(r"^miniwob/|-v1$", "", task)
@@ -347,13 +422,17 @@ def collect(args: argparse.Namespace) -> dict:
                 headless=True,
                 wait_for_user_message=False,
                 timeout=args.timeout_ms,
+                pre_observation_delay=args.pre_observation_delay,
             )
+            if args.reuse_browser:
+                _enable_browser_reuse(env)
             try:
                 consecutive_failures = 0
-                while task_total < per_task:
+                while not complete():
                     seed = args.seed + task_index * 1_000_000 + episode_index
                     episode: list[dict] = []
                     tampered: set[str] = set()
+                    episode_ok = False
                     try:
                         observation, _ = env.reset(seed=seed)
                         rng = np.random.default_rng(seed)
@@ -372,15 +451,17 @@ def collect(args: argparse.Namespace) -> dict:
                             if record is not None:
                                 record["action"] = None
                                 episode.append(record)
-                                counts[record["split"]] += 1
-                                task_total += 1
-                                total += 1
-                                if total % args.log_every == 0:
-                                    logging.info(
-                                        "worker=%d records=%d current_task=%s task_records=%d/%d",
-                                        args.worker_id, total, task, task_total, per_task,
-                                    )
-                                if task_total >= per_task:
+                                if not lane_mode:
+                                    counts[record["split"]] += 1
+                                    task_total += 1
+                                    total += 1
+                                    if total % args.log_every == 0:
+                                        logging.info(
+                                            "worker=%d records=%d current_task=%s "
+                                            "task_records=%d/%d",
+                                            args.worker_id, total, task, task_total, per_task,
+                                        )
+                                if not lane_mode and task_total >= per_task:
                                     break
                             action, described = _choose_action(
                                 rows, rng, step, args.random_action_prob
@@ -397,6 +478,11 @@ def collect(args: argparse.Namespace) -> dict:
                                 break
                             if terminated or truncated:
                                 break
+                        if lane_mode and not episode:
+                            raise RuntimeError(
+                                f"lane episode produced no state: task={task} "
+                                f"episode={episode_index}"
+                            )
                     except Exception:
                         logging.exception("Episode failed: task=%s episode=%d", task, episode_index)
                         consecutive_failures += 1
@@ -410,20 +496,41 @@ def collect(args: argparse.Namespace) -> dict:
                             logging.error(
                                 "worker=%d task=%s aborting after %d consecutive episode "
                                 "failures; collected %d/%d",
-                                args.worker_id, task, consecutive_failures, task_total, per_task,
+                                args.worker_id, task, consecutive_failures,
+                                episode_total if lane_mode else task_total,
+                                args.target_episodes if lane_mode else per_task,
                             )
                             break
                     else:
                         consecutive_failures = 0
+                        episode_ok = True
+                        episode_total += 1
+                        if lane_mode:
+                            for item in episode:
+                                counts[item["split"]] += 1
+                            task_total += len(episode)
+                            total += len(episode)
+                            if episode_total % args.log_every == 0:
+                                logging.info(
+                                    "shard=%s episodes=%d/%d records=%d task=%s",
+                                    shard_name, episode_total, args.target_episodes,
+                                    total, task,
+                                )
                     finally:
-                        for item in episode:
-                            handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-                        handle.flush()
-                    episode_index += args.num_workers
+                        if episode_ok or not lane_mode:
+                            for item in episode:
+                                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                            handle.flush()
+                    if lane_mode:
+                        if episode_ok:
+                            episode_index += args.episode_stride
+                    else:
+                        episode_index += args.episode_stride
             finally:
                 env.close()
             task_counts[task] = task_total
-            if task_total < per_task:
+            task_episode_counts[task] = episode_total
+            if not complete():
                 aborted.append(task)
 
     summary = {
@@ -431,8 +538,16 @@ def collect(args: argparse.Namespace) -> dict:
         "obs_kind": "axtree",
         "random_action_prob": args.random_action_prob,
         "max_steps": args.max_steps,
+        "pre_observation_delay": args.pre_observation_delay,
+        "reuse_browser": args.reuse_browser,
         "seed": args.seed,
         "num_workers": args.num_workers,
+        "shard_name": shard_name,
+        "lane_mode": lane_mode,
+        "assigned_task_index": args.assigned_task_index,
+        "episode_start": args.episode_start,
+        "episode_stride": args.episode_stride,
+        "target_episodes": args.target_episodes,
         "records": total,
         "split_counts": counts,
         "task_counts": task_counts,
@@ -440,8 +555,11 @@ def collect(args: argparse.Namespace) -> dict:
         # exits non-zero when this is non-empty.
         "aborted_tasks": aborted,
         "records_path": str(records_path),
+        "task_episode_counts": {
+            task: task_episode_counts.get(task, 0) for task in task_counts
+        },
     }
-    write_json(output / f"collect-worker{args.worker_id:02d}.json", summary)
+    write_json(output / f"collect-{shard_name}.json", summary)
     return summary
 
 
@@ -451,6 +569,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-states", type=int, default=10_000)
     parser.add_argument("--worker-id", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument(
+        "--assigned-task-index", type=int,
+        help="canonical task index for deterministic episode-lane collection",
+    )
+    parser.add_argument(
+        "--episode-start", type=int,
+        help="first episode index; defaults to worker-id in the legacy protocol",
+    )
+    parser.add_argument(
+        "--episode-stride", type=int,
+        help="episode-index stride; defaults to num-workers in the legacy protocol",
+    )
+    parser.add_argument(
+        "--target-episodes", type=int,
+        help="collect this many complete episodes for the assigned lane instead "
+             "of stopping after target-states",
+    )
+    parser.add_argument(
+        "--shard-name",
+        help="unique [A-Za-z0-9._-]+ shard suffix; defaults to workerNN",
+    )
     parser.add_argument("--max-steps", type=int, default=7)
     parser.add_argument("--random-action-prob", type=float, default=0.5,
                         help="probability of replacing the scripted action with a "
@@ -459,6 +598,17 @@ def parse_args() -> argparse.Namespace:
                              "observation, so a positive value is what makes the "
                              "action carry information beyond the state")
     parser.add_argument("--timeout-ms", type=int, default=5_000)
+    parser.add_argument(
+        "--pre-observation-delay", type=float, default=0.5,
+        help="seconds BrowserGym waits before extracting each observation; the "
+             "historical protocol is 0.5, and a faster value must pass exact "
+             "record/screenshot overlap validation before production use",
+    )
+    parser.add_argument(
+        "--reuse-browser", action=argparse.BooleanOptionalAction, default=False,
+        help="reuse BrowserGym's task/chat Chromium processes across episodes "
+             "while creating fresh contexts; opt-in pending exact overlap validation",
+    )
     parser.add_argument("--max-consecutive-failures", type=int, default=20,
                         help="give up on a task after this many episodes fail in a "
                              "row. A dead browser makes every later reset fail, so "
@@ -491,10 +641,47 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
+    args.episode_start = (
+        args.worker_id if args.episode_start is None else args.episode_start
+    )
+    args.episode_stride = (
+        args.num_workers if args.episode_stride is None else args.episode_stride
+    )
     if not 0 <= args.worker_id < args.num_workers:
         parser.error("worker-id must be in [0, num-workers)")
+    if args.episode_start < 0 or args.episode_stride < 1:
+        parser.error("episode-start must be non-negative and episode-stride positive")
+    if args.target_episodes is not None and args.target_episodes < 1:
+        parser.error("target-episodes must be positive")
+    lane_values = (
+        args.assigned_task_index, args.target_episodes, args.shard_name,
+    )
+    if any(value is not None for value in lane_values) and not all(
+        value is not None for value in lane_values
+    ):
+        parser.error(
+            "lane collection requires assigned-task-index, target-episodes, "
+            "and shard-name together"
+        )
+    lane_mode = args.target_episodes is not None
+    if args.shard_name and not re.fullmatch(r"[A-Za-z0-9._-]+", args.shard_name):
+        parser.error("shard-name must match [A-Za-z0-9._-]+")
+    if lane_mode:
+        if args.state_id_prefix or args.force_split:
+            parser.error("lane collection forbids state-id-prefix and force-split")
+        if args.assigned_task_index is not None:
+            if args.episode_start % len(PILOT_TASKS) != args.assigned_task_index:
+                parser.error(
+                    "episode-start must preserve the original task_index + 12k lattice"
+                )
+            if args.episode_stride % len(PILOT_TASKS):
+                parser.error(
+                    "episode-stride must be a multiple of the original 12-worker stride"
+                )
     if not 0.0 <= args.random_action_prob <= 1.0:
         parser.error("random-action-prob must be in [0, 1]")
+    if args.pre_observation_delay < 0.0:
+        parser.error("pre-observation-delay must be non-negative")
     # The block property this whole scheme rests on: merge_records sorts by
     # state_id, so a prefixed id sorts after every unprefixed one only if its
     # first character sorts after 't'. Checked rather than assumed, because a
@@ -512,7 +699,7 @@ def parse_args() -> argparse.Namespace:
     # notices; the split file just quietly stops covering all twelve tasks.
     # --force-split bypasses split_for_episode entirely, so the hazard cannot
     # arise and the constraint does not apply.
-    if args.num_workers % 5 == 0 and args.force_split is None:
+    if not lane_mode and args.num_workers % 5 == 0 and args.force_split is None:
         parser.error(
             f"num-workers={args.num_workers} is a multiple of 5: each worker would "
             "reach too few split buckets and tasks would be confined to one split"

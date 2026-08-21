@@ -51,16 +51,55 @@ v9 使用本地 `Qwen3.5-9B-Instruct` 第 16 层。相对 v8 Base，仅 prompt w
 主要产物：
 
 ```text
-outputs/state_tokenizer/v9-instruct/key64-static-pca.npz
-outputs/state_tokenizer/v9-instruct/key64-static-pca-normalization.npz
-outputs/a2/v9-instruct-m32-gw.npz
-outputs/instruct_bridge/v9-instruct/train-cache-fused-observation.npz
-outputs/instruct_bridge/v9-instruct/retrieval-head-fused-observation.pt
-outputs/instruct_bridge/v9-instruct/input-connector.pt
-outputs/instruct_bridge/v9-instruct/layer16-connector.pt
+outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca.npz
+outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca-normalization.npz
+outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/train-cache-fused-observation.npz
+outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/retrieval-head-fused-observation.pt
 ```
 
-已删除的模型权重和上述训练产物不能由源码恢复，需要重新生成。
+2026-08-21 当前实验按用户决定只评估连续 `xbar`，不重跑 A1/A2。旧 A2 checkpoint
+绑定旧 PCA 坐标，不能与本节的 20k-balanced PCA 混用；它既不进入 cache，也不进入
+retrieval loss。
+
+### 3.1 A1 / A2 正式重训配置
+
+旧 v8 checkpoint 的结构可以用来核对配置，但其 metadata 绑定 Base 模型的 PCA、
+normalization 和 records hash，不能直接当作 v9 结果。v9 从 seed 0 重新训练；train split
+用于优化，validation 用于选取 best checkpoint，全程不读取 test split。
+
+A1 固定为 64 个 512 维连续 token，保持 1.0× 标量宽度，训练 10,000 steps：
+
+```text
+stage steps       = 2,000 / 3,000 / 5,000
+learning rates    = 1e-3 / 3e-4 / 1e-4
+batch             = 32
+eval every        = 250
+matmul precision  = highest
+patience          = 0（固定预算）
+```
+
+A2 从本轮 A1 checkpoint 初始化，使用冻结的 v8 主配置：PQ、64 tokens、M=32、C=256，
+`group_weights=(1,2,0.5,0.5)`，K-means 25 iterations，训练 70,000 steps；codebook LR
+`3e-4`、backbone LR `3e-5`、batch 32、每 500 steps validation、patience 0。prompt 权重虽
+保留为 0.5，但冻结布局的 prompt 槽数为 0，因此不贡献 loss。
+
+K-means **不抽样**：70,018 个 train state 全部参与 2,048 个 `(token, subspace)` 问题。
+为避免一次性在 GPU 物化约 9.18 GB latent 及另一份同尺寸转置副本，latent 以 FP32 放在
+host memory，GPU 每次只处理 64 个独立问题。随机数协议为
+`per_problem_fold_in_v1`（seed 0 + 全局 problem id），因此调整 resident problem batch 只
+改变显存峰值，不改变每个问题的初始化或最终中心。该内存调度记录在结果 JSON 的
+`init.kmeans` 中。
+
+两阶段均使用 FP32 activation、`highest` matmul precision 和 FP64 host metric 累加。
+统一入口为：
+
+```bash
+./scripts_v9_instruct.sh a1
+./scripts_v9_instruct.sh a2
+```
+
+正式产物分别为 `outputs/a1/v9-instruct{,.npz}` 和
+`outputs/a2/v9-instruct-m32-gw{,.npz}`。
 
 ## 4. Retrieval head 训练
 
@@ -73,7 +112,7 @@ Teacher 是同一 BrowserGym observation 的官方 Qwen3-VL document embedding�
 - image/text 必须位于同一个 document 请求；
 - 输出为归一化 4096 维 `teacher_fused_embedding`。
 
-Student 是同一个 `MaskedAttentionRetrievalHead`，分别读取 `xbar` 和 A2 `xbar_hat`：
+当前主实验的 Student 是 `MaskedAttentionRetrievalHead`，只读取连续 `xbar`：
 
 ```text
 LayerNorm(512)
@@ -83,7 +122,9 @@ LayerNorm(512)
   -> L2 normalize
 ```
 
-目标为 Xbar/A2 各自的 symmetric InfoNCE + cosine，并加 `0.1 ×` 两分支 consistency。共享 head 是刻意的：比较对象是表示损失，不允许给 A2 单独增加检索容量。
+目标为 Xbar 的 symmetric InfoNCE + cosine。代码仍向后兼容 `representation=both` 的
+Xbar/A2 共享 head（该模式另有 `0.1 × consistency`），但本轮产物 metadata 明确为
+`representation=xbar`，不含 `a2_xbar`。
 
 缓存协议锁：
 
@@ -100,15 +141,31 @@ browsergym_task_plus_dom_v1
 ```bash
 python -m experiments.state_tokenizer.build_instruct_bridge_cache \
   --records outputs/state_tokenizer/v8/full-721.jsonl \
-  --features outputs/state_tokenizer/v9-instruct/static_features \
-  --normalization outputs/state_tokenizer/v9-instruct/key64-static-pca-normalization.npz \
-  --a2-checkpoint outputs/a2/v9-instruct-m32-gw.npz \
-  --output outputs/instruct_bridge/v9-instruct/train-cache-fused-observation.npz
+  --features outputs/state_tokenizer/v9-instruct-pca20k-balanced/static_features \
+  --normalization outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca-normalization.npz \
+  --representation xbar \
+  --teacher-backend sentence_transformers \
+  --teacher-model-path models/Qwen3-VL-Embedding-8B \
+  --teacher-num-gpus 8 \
+  --output outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/train-cache-fused-observation.npz
 
 python -m experiments.state_tokenizer.train_retrieval_bridge \
-  --cache outputs/instruct_bridge/v9-instruct/train-cache-fused-observation.npz \
-  --output outputs/instruct_bridge/v9-instruct/retrieval-head-fused-observation.pt
+  --cache outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/train-cache-fused-observation.npz \
+  --representation xbar \
+  --output outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/retrieval-head-fused-observation.pt
 ```
+
+### 4.1 2026-08-21 正式 Xbar 结果
+
+- PCA：20,000 个 train state，12 task 各 1,666–1,667；解释方差
+  `0.9185917377`，SHA256 `f98c517c...f6efb2a`。此前恢复出的 2,000-state PCA 实际是
+  first-N 且全部来自 `click-button`，不是 task-balanced，已禁止作为正式坐标。
+- cache：5,000 train + 500 validation，只有 `xbar/valid/teacher_fused_embedding`，
+  所有值 finite、invalid slots 精确为零、索引 5,500/5,500 唯一。
+- retrieval head：best step 5,000，validation loss `0.6449992`、paired cosine
+  `0.8711105`；500-way Recall@1/5/10 为 `0.840/0.956/0.986`，MRR `0.8946`。
+
+这些是 **MiniWoB/BrowserGym 域内 validation**，不能替代 WMA 跨域检验。
 
 ## 5. Reader connector
 
@@ -129,3 +186,28 @@ Reader 必须用 Qwen3.5-Instruct 原生生成答案。若 connector 未加载�
 
 成功判据不是绝对分数复现论文全表，而是在完全相同的两行建库与 top-10 协议下，Residual 与 Raw-Fused 接近；若 Raw-Fused 自身偏低，应先排查 Qwen server/数据协议，不能归因给 tokenizer。
 
+### 6.1 WMA web smoke 的当前结论
+
+`web_01` 最终 checkpoint、完整 25 sessions、14 个 screenshot observation、前 10 个
+问题的严格对照结果：
+
+| 指标 | Raw-Fused | Xbar |
+|---|---:|---:|
+| evidence Recall@10 | 0.765 | 0.725 |
+| NDCG@10 | 0.5429 | 0.5529 |
+| top-10 observation rows（100 个槽位合计） | 8 | 0 |
+
+两行检索的 top-10 overlap 为 0.91、top-1 agreement 为 1.00，但这是因为两侧共有
+49 条完全相同的 full-round text row。只看 14 条 observation，Raw fused 与 Xbar 的
+paired cosine 为 `0.1836`，14-way Recall@1/5/10 为 `0.0714/0.5714/0.8571`，MRR
+`0.2958`。Recall@1 接近随机 `1/14`，因此当前零训练 synthetic-AXTree 适配**没有通过
+跨域压缩门禁**；不能用总体 top-10 overlap 宣称压缩成功，也不应在修正前直接扩到全量
+web benchmark。
+
+逐问证据与 top-10 rows 保存在：
+
+```text
+outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/
+  worldmemarena-web01-checkpoint0-10q.json
+  worldmemarena-web01-final-checkpoint-10q.json
+```

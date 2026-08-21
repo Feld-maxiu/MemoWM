@@ -12,6 +12,7 @@ import json
 import mimetypes
 import os
 import subprocess
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -139,6 +140,88 @@ def encode_teacher(
     return output
 
 
+def encode_teacher_local(
+    rows: list[tuple[Path, str]], *, model_path: str, device: str,
+    batch_size: int, num_gpus: int,
+) -> np.ndarray:
+    """Encode fused documents with the official SentenceTransformer model.
+
+    This is numerically the same document-side model/prompt used by the
+    WorldMemArena Qwen3-VL baseline, without requiring a vLLM HTTP server.
+    For ``num_gpus > 1``, SentenceTransformer shares the CPU weights and
+    launches one inference worker per requested GPU.
+    """
+    payloads = [{"image": str(image.resolve()), "text": text} for image, text in rows]
+    if num_gpus <= 1:
+        from .encode_teacher_shard import encode_payloads
+
+        output = encode_payloads(
+            payloads, model_path=str(Path(model_path).resolve()),
+            device=device, batch_size=batch_size, show_progress_bar=True,
+        )
+    else:
+        available = torch.cuda.device_count()
+        if available < num_gpus:
+            raise ValueError(
+                f"requested {num_gpus} teacher GPUs, only {available} are visible"
+            )
+        # The official checkpoint contains dynamically created callables and
+        # cannot be pickled by SentenceTransformer.start_multi_process_pool.
+        # Independent module processes avoid that limitation while retaining
+        # exactly the same model, prompt and encode() implementation.
+        with tempfile.TemporaryDirectory(prefix="residualmem-teacher-") as directory:
+            root = Path(directory)
+            shards = [list(range(rank, len(payloads), num_gpus)) for rank in range(num_gpus)]
+            processes = []
+            logs = []
+            for rank, indices in enumerate(shards):
+                manifest = root / f"shard-{rank:02d}.jsonl"
+                manifest.write_text("".join(
+                    json.dumps(payloads[index], ensure_ascii=False) + "\n"
+                    for index in indices
+                ))
+                output_path = root / f"shard-{rank:02d}.npy"
+                log_path = root / f"shard-{rank:02d}.log"
+                log_handle = log_path.open("w")
+                logs.append((log_path, log_handle))
+                processes.append((
+                    rank,
+                    indices,
+                    output_path,
+                    subprocess.Popen([
+                        sys.executable, "-m", "experiments.state_tokenizer.encode_teacher_shard",
+                        "--input", str(manifest),
+                        "--output", str(output_path),
+                        "--model", str(Path(model_path).resolve()),
+                        "--device", f"cuda:{rank}",
+                        "--batch-size", str(batch_size),
+                    ], stdout=log_handle, stderr=subprocess.STDOUT),
+                ))
+            failures = []
+            for rank, _indices, _output_path, process in processes:
+                code = process.wait()
+                if code:
+                    failures.append((rank, code))
+            for _path, handle in logs:
+                handle.close()
+            if failures:
+                details = "\n".join(
+                    f"rank {rank} exit {code}:\n{logs[rank][0].read_text()[-4000:]}"
+                    for rank, code in failures
+                )
+                raise RuntimeError(f"teacher shard failures:\n{details}")
+            output = np.empty((len(payloads), 4096), dtype=np.float32)
+            for _rank, indices, output_path, _process in processes:
+                shard = np.asarray(np.load(output_path), dtype=np.float32)
+                if shard.shape != (len(indices), 4096):
+                    raise ValueError(f"unexpected teacher shard shape {shard.shape}")
+                output[indices] = shard
+    output = np.asarray(output, dtype=np.float32)
+    if output.shape != (len(rows), 4096):
+        raise ValueError(f"teacher dimension must be 4096, got {output.shape}")
+    return output
+
+
 def _a2_reconstruct(
     path: str, xbar: np.ndarray, valid: np.ndarray, batch: int, jax_python: str
 ) -> np.ndarray:
@@ -157,6 +240,8 @@ def _a2_reconstruct(
 
 
 def build(args: argparse.Namespace) -> dict:
+    if args.representation == "both" and not args.a2_checkpoint:
+        raise ValueError("representation=both requires --a2-checkpoint")
     records_path = Path(args.records).resolve()
     records = list(iter_jsonl(records_path))
     selected: list[int] = []
@@ -169,9 +254,11 @@ def build(args: argparse.Namespace) -> dict:
     x_t, valid = load_static_features(args.features, global_indices)
     normalizer = GroupChannelNormalizer.from_npz(args.normalization)
     xbar = normalizer.normalize(x_t, valid)
-    a2_xbar = _a2_reconstruct(
-        args.a2_checkpoint, xbar, valid, args.a2_batch, args.jax_python
-    )
+    a2_xbar = None
+    if args.representation == "both":
+        a2_xbar = _a2_reconstruct(
+            args.a2_checkpoint, xbar, valid, args.a2_batch, args.jax_python
+        )
     teacher_rows = []
     for row in selected:
         record = records[row]
@@ -179,38 +266,60 @@ def build(args: argparse.Namespace) -> dict:
         if not screenshot.is_file():
             raise FileNotFoundError(screenshot)
         teacher_rows.append((screenshot, browsergym_teacher_text(record)))
-    teacher = encode_teacher(
-        teacher_rows,
-        base_url=args.teacher_base_url,
-        model=args.teacher_model,
-        api_key=args.teacher_api_key,
-        workers=args.teacher_workers,
-    )
+    if args.teacher_backend == "sentence_transformers":
+        if not args.teacher_model_path:
+            raise ValueError("local teacher backend requires --teacher-model-path")
+        teacher = encode_teacher_local(
+            teacher_rows,
+            model_path=args.teacher_model_path,
+            device=args.teacher_device,
+            batch_size=args.teacher_batch_size,
+            num_gpus=args.teacher_num_gpus,
+        )
+    else:
+        teacher = encode_teacher(
+            teacher_rows,
+            base_url=args.teacher_base_url,
+            model=args.teacher_model,
+            api_key=args.teacher_api_key,
+            workers=args.teacher_workers,
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     metadata = cache_metadata_json(
         records=str(records_path),
         features=str(Path(args.features).resolve()),
         normalization=str(Path(args.normalization).resolve()),
-        a2_checkpoint=str(Path(args.a2_checkpoint).resolve()),
+        representation=args.representation,
+        a2_checkpoint=(
+            str(Path(args.a2_checkpoint).resolve()) if args.a2_checkpoint else None
+        ),
+        teacher_backend=args.teacher_backend,
+        teacher_model=(
+            str(Path(args.teacher_model_path).resolve())
+            if args.teacher_backend == "sentence_transformers"
+            else args.teacher_model
+        ),
         seed=args.seed,
         train_states=args.train_states,
         validation_states=args.validation_states,
     )
-    np.savez_compressed(
-        output,
+    arrays = dict(
         xbar=xbar.astype(np.float32),
-        a2_xbar=a2_xbar.astype(np.float32),
         valid=valid.astype(np.bool_),
         teacher_fused_embedding=teacher.astype(np.float32),
         global_indices=np.asarray(global_indices, np.int64),
         split=np.asarray(split_labels),
         metadata=np.asarray(metadata),
     )
+    if a2_xbar is not None:
+        arrays["a2_xbar"] = a2_xbar.astype(np.float32)
+    np.savez_compressed(output, **arrays)
     return {
         "protocol": BRIDGE_CACHE_PROTOCOL,
         "teacher_protocol": FUSED_OBSERVATION_TEACHER_PROTOCOL,
         "teacher_text_protocol": BROWSERGYM_TEACHER_TEXT_PROTOCOL,
+        "representation": args.representation,
         "states": len(selected),
         "train_states": args.train_states,
         "validation_states": args.validation_states,
@@ -223,13 +332,22 @@ def main() -> None:
     parser.add_argument("--records", required=True)
     parser.add_argument("--features", required=True)
     parser.add_argument("--normalization", required=True)
-    parser.add_argument("--a2-checkpoint", required=True)
+    parser.add_argument("--representation", choices=("xbar", "both"), default="both")
+    parser.add_argument("--a2-checkpoint")
     parser.add_argument("--output", required=True)
     parser.add_argument("--train-states", type=int, default=5000)
     parser.add_argument("--validation-states", type=int, default=500)
     parser.add_argument("--seed", type=int, default=35)
     parser.add_argument("--a2-batch", type=int, default=64)
     parser.add_argument("--jax-python", default=os.getenv("JAX_PYTHON", ".venv-jax/bin/python"))
+    parser.add_argument(
+        "--teacher-backend", choices=("http", "sentence_transformers"),
+        default=os.getenv("QWEN_VL_EMBED_BACKEND", "http"),
+    )
+    parser.add_argument("--teacher-model-path", default=os.getenv("QWEN_VL_EMBED_MODEL_PATH"))
+    parser.add_argument("--teacher-device", default=os.getenv("QWEN_VL_EMBED_DEVICE", "cuda:0"))
+    parser.add_argument("--teacher-batch-size", type=int, default=8)
+    parser.add_argument("--teacher-num-gpus", type=int, default=1)
     parser.add_argument("--teacher-base-url", default=os.getenv("QWEN_VL_EMBED_BASE_URL", "http://127.0.0.1:8014/v1"))
     parser.add_argument("--teacher-model", default=os.getenv("QWEN_VL_EMBED_MODEL", "Qwen3-VL-Embedding-8B"))
     parser.add_argument("--teacher-api-key", default=os.getenv("QWEN_VL_EMBED_API_KEY", "EMPTY"))
