@@ -1,8 +1,8 @@
 # WorldMemArena tokenizer-RAG 交接文档（换账号接手的单一入口）
 
 > 更新：2026-08-22。本文件自足汇总两条实验线的现状、产物与下一步。
-> 权威协议：`QWEN35_INSTRUCT_WORLDMEMARENA.md`（WMA-RAG 轨道）。
-> 运行记录：`RECOVERY_WORKLOG_20260820.md`（8-20 恢复 + 8-21 全天重建）。
+> 权威协议：`TOKENIZER_WM_HANDOVER.md` §9（WMA-RAG 轨道，原 QWEN35 协议文件已并入删除）。
+> 运行记录：`TOKENIZER_WM_HANDOVER.md` §10（v8 重采协议 + 8 月恢复重建，原 RECOVERY_WORKLOG 已并入删除）。
 > WM 线权威结论：`WORLD_MODEL_WORKLOG.md` §0 / §25。
 
 ---
@@ -13,7 +13,7 @@ v8/v9 数据与 tokenizer 链已在 8-21 全部重建完成（100,008 states 重
 Key64、20k-balanced PCA、A1、Xbar retrieval head），域内门禁全部通过；但
 WorldMemArena 跨域 smoke 显示 **Xbar 的 observation row 在 100 个 top-10 槽位中
 命中 0 条**（Raw 命中 8 条），14-way Recall@1≈随机。跨域压缩门禁失败，全量
-web benchmark 已冻结，等 P1 偏移归因。两仓库有大量未提交改动（P0，先做）。
+web benchmark 已冻结，等 P1 偏移归因。residual-mem 已全部提交推送 gitee（P0 完成）。
 
 ---
 
@@ -116,7 +116,7 @@ retrieval head 相同，reader 路径不同；当前只有 Xbar-Input 的检索�
 | 阶段 | 状态 | 关键数字 |
 |---|---|---|
 | 环境恢复（.venv-jax / browsergym-venv / qwen-vl 联合环境） | ✅ | JAX 0.4.33 + ptxas 12.8.93（Blackwell sm_120 兼容） |
-| 权重落盘（Qwen3.5-9B / Qwen3-VL-Embedding-8B） | ✅ residual-mem 侧 | WMA 侧 `eval_framework/baselines/.../weights/` 下载中 |
+| 权重落盘（Qwen3.5-9B / Qwen3-VL-Embedding-8B） | ✅ 双侧 | residual-mem `models/` 19G+16G；WMA `eval_framework/baselines/.../weights/` 16G 四分片齐全、无 .incomplete |
 | v8 数据重采（lane 并行 + browser reuse） | ✅ | 100,008 states / 43,751+ episodes；重叠审计通过 |
 | v9 Full-H 抽取（6 ranks） | ✅ | 100,008/100,008；~420 GiB |
 | Static Key64 + PCA + normalization | ✅ | 20k task-balanced PCA，解释方差 0.9186 |
@@ -127,7 +127,7 @@ retrieval head 相同，reader 路径不同；当前只有 Xbar-Input 的检索�
 | WMA 跨域 smoke（web_01 final ckpt） | ❌ 门禁失败 | obs rows 0/100 槽位（Raw 8）；14-way R@1 0.0714≈随机 |
 | reader connector（Input/L16） | ⏳ 未训 | 检索侧通过后做（P4） |
 | 全量 web benchmark | 🧊 冻结 | 修正域适配前不启动 |
-| 两仓库 commit + push gitee | ⏳ P0 | residual-mem ~20 文件；WorldMemArena 6+新文件 |
+| residual-mem commit + push gitee | ✅ P0 完成 | HEAD `8434711`（ab423f9 重建 → 4e3c253 文档合并 → 8434711 P0 修正）；WorldMemArena 禁推 |
 
 ---
 
@@ -144,7 +144,7 @@ retrieval head 相同，reader 路径不同；当前只有 Xbar-Input 的检索�
 | Full-H | `outputs/state_tokenizer/v9-instruct/full-h`（6 shards） | ~420 GiB |
 | Static PCA 特征 | `…/v9-instruct-pca20k-balanced/static_features` | ~55 GiB |
 | **正式 PCA** | `…/v9-instruct-pca20k-balanced/key64-static-pca.npz` | SHA256 `f98c517c…f6efb2a`；12 task × 1,666–1,667 train states |
-| ⚠️ 作废 PCA | `…/v9-instruct-pca2000/`（2,000-state） | first-N 全部来自 click-button，**禁止作为坐标**，仅审计保留 |
+| ⚠️ 作废 PCA | `…/v9-instruct/key64-static-pca{,-normalization}.npz` | 2,000-state first-N 全部来自 click-button（PCA SHA256 `6d2df9b5…01a26`），**禁止作为坐标**，仅审计保留；注意它和 Full-H 同目录，勿误用 |
 | normalization | `…/key64-static-pca-normalization.npz` | SHA256 `648135a1…7e57` |
 | A1 | `outputs/a1/v9-instruct{,.npz}` | R² 0.99868；绑定新 PCA hash |
 | ⚠️ 作废 A2 | `outputs/a2/…`（8-21 训练） | 绑定旧 PCA 坐标，不入 cache、不入 loss |
@@ -276,7 +276,7 @@ export LD_LIBRARY_PATH=$R/browsergym-venv/syslibs/usr/lib/x86_64-linux-gnu:${LD_
 
 ## 8. 接下来要做什么
 
-**P0（已完成）：residual-mem 提交 + 推送 gitee（`main`，最新 `4e3c253`）。**
+**P0（已完成）：residual-mem 提交 + 推送 gitee（`main`，最新 `8434711`）。**
 - ⚠️ `WorldMemArena` 是**上游 benchmark 仓库**（origin = github.com/UCSB-AI/WorldMemArena），
   **禁止推送**。8-21 的适配改动（residualmem_instruct_adapter、tests、
   README_DATASET/README_ResidualMem 等）以本地未提交形式留在工作树；
@@ -297,7 +297,7 @@ image/detail/context 组贡献；按 handover §9.8 分桶（有/无截图、cap
 (b) 扩大训练域多样性（多分辨率重采、更多任务模板），需重走 PCA→A1→A2 链。
 
 **P4 reader connector（Input/L16）重训。**
-native answer 路径缺 connector；检索侧（P1-P3）通过后做。定义见协议 §5。
+native answer 路径缺 connector；检索侧（P1-P3）通过后做。定义见 handover §9.7。
 
 **P5（可选、独立轨道）WM 线续作。**
 重采可复现性已验证（§1.4），两个方向：扩数据（幂律外推 2×≈+599，但新 episode
