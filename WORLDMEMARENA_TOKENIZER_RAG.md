@@ -276,9 +276,11 @@ export LD_LIBRARY_PATH=$R/browsergym-venv/syslibs/usr/lib/x86_64-linux-gnu:${LD_
 
 ## 8. 接下来要做什么
 
-**P0（先做）：提交 + 推送两仓库到 gitee。**
-- `residual-mem`：全部修改文件 + 本交接文档；push `git@gitee.com:feld-ceng/residual-mem.git` main。
-- `WorldMemArena`：6 修改 + 新文件（residualmem_instruct_adapter、tests、README_DATASET/README_ResidualMem）；**排除** `eval_framework/baselines/Qwen3-VL-Embedding-8B/weights/`（加 .gitignore）；新建 gitee 私有仓库推送。
+**P0（已完成）：residual-mem 提交 + 推送 gitee（`main`，最新 `4e3c253`）。**
+- ⚠️ `WorldMemArena` 是**上游 benchmark 仓库**（origin = github.com/UCSB-AI/WorldMemArena），
+  **禁止推送**。8-21 的适配改动（residualmem_instruct_adapter、tests、
+  README_DATASET/README_ResidualMem 等）以本地未提交形式留在工作树；
+  `eval_framework/baselines/Qwen3-VL-Embedding-8B/weights/` 是 16GB 级权重目录，切勿 `git add -A`。
 
 **P1 偏移归因诊断（零训练，最优先实验）。**
 在 14 个 WMA observation 上做槽位分解：Xbar→head 输出与 teacher 的逐 slot 余弦、
