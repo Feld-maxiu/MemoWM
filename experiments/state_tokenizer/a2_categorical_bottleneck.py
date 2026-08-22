@@ -558,11 +558,45 @@ def load_pq_for_equivalence(path: str | Path, config: CategoricalBottleneckConfi
     return learned_params_from_pq(pq_params, pq_config, config), pq_config
 
 
-def load_a1_warm_start(path: str | Path, config: CategoricalBottleneckConfig) -> dict:
-    """Inherit encoder/decoder from a formal A1 checkpoint; codebook stays fresh."""
+def _a1_checkpoint_metadata(path: str | Path) -> dict:
     with np.load(path, allow_pickle=False) as checkpoint:
         if "metadata" not in checkpoint.files:
             raise ValueError(f"{path} has no metadata; not an A1 checkpoint")
+        return json.loads(str(np.asarray(checkpoint["metadata"]).item()))
+
+
+def _assert_a1_coordinates(path: str | Path, expected_pca_sha256: str | None) -> None:
+    """Reject an A1 checkpoint fitted under different PCA axes.
+
+    This is the one mismatch the geometry checks cannot see. A1 and A2 both
+    operate on 64x512, so an A1 fitted under different axes passes every shape
+    assertion and warm-starts happily onto coordinates its weights were never
+    trained for. Nothing raises; A2 simply starts from a mis-rotated encoder and
+    converges somewhere quietly worse. The two coordinate trees under
+    ``outputs/state_tokenizer/`` carry identical file names, so this is a live
+    hazard rather than a hypothetical one -- as of 2026-08-22 the checked-in A1
+    is bound to the invalidated first-N PCA while the official normalization is
+    the task-balanced one.
+    """
+    if not expected_pca_sha256:
+        return
+    found = _a1_checkpoint_metadata(path).get("pca_sha256")
+    if found != expected_pca_sha256:
+        raise ValueError(
+            f"A1 checkpoint {path} was fitted under PCA {str(found)[:16]}... but "
+            f"this run normalizes with {expected_pca_sha256[:16]}...; retrain A1 "
+            "on these coordinates before warm-starting A2"
+        )
+
+
+def load_a1_warm_start(
+    path: str | Path,
+    config: CategoricalBottleneckConfig,
+    expected_pca_sha256: str | None = None,
+) -> dict:
+    """Inherit encoder/decoder from a formal A1 checkpoint; codebook stays fresh."""
+    _assert_a1_coordinates(path, expected_pca_sha256)
+    with np.load(path, allow_pickle=False) as checkpoint:
         metadata = json.loads(str(np.asarray(checkpoint["metadata"]).item()))
         if metadata.get("protocol") != A1_PROTOCOL:
             raise ValueError(
@@ -614,6 +648,12 @@ def run(args: argparse.Namespace) -> dict:
     normalizer = GroupChannelNormalizer.from_npz(args.normalization)
     if (normalizer.num_tokens, normalizer.token_dim) != (64, 512):
         raise ValueError("A2 requires a 64x512 normalizer")
+
+    # Before the split build, which reads tens of thousands of states: warm start
+    # happens long after that, and a coordinate mismatch discovered there costs
+    # the whole load for nothing.
+    if args.init_a1_checkpoint:
+        _assert_a1_coordinates(args.init_a1_checkpoint, normalizer.pca_sha256)
 
     devices = jax.devices(args.platform)
     if not 0 <= args.device_index < len(devices):
@@ -692,7 +732,9 @@ def run(args: argparse.Namespace) -> dict:
     else:
         params = initialize_params(base_config, args.seed)
         if args.init_a1_checkpoint:
-            warm_start = load_a1_warm_start(args.init_a1_checkpoint, base_config)
+            warm_start = load_a1_warm_start(
+                args.init_a1_checkpoint, base_config, normalizer.pca_sha256
+            )
             params.update(warm_start)
         params = jax.device_put(params, device)
 
