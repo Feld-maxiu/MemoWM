@@ -9,11 +9,24 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from experiments.state_tokenizer.pca_binding import sha256_file
+
+
+def _head_path() -> str | None:
+    """Where the adapter will load the retrieval head from, if it is set.
+
+    The adapter takes this from the environment rather than a flag, so the
+    report has to reach for the same source to record what actually ran.
+    """
+    path = os.getenv("RESIDUALMEM_RETRIEVAL_HEAD")
+    return str(Path(path).resolve()) if path else None
 
 
 def _top_rows(adapter, record) -> list[dict]:
@@ -164,9 +177,25 @@ def run(args: argparse.Namespace) -> dict:
     raw_kinds = Counter(row.get("row_kind", "unknown") for row in raw._rounds)
     xbar_kinds = Counter(row.get("row_kind", "unknown") for row in xbar._rounds)
     return {
-        "protocol": "worldmemarena_raw_fused_vs_xbar_retrieval_smoke_v1",
+        "protocol": "worldmemarena_raw_fused_vs_xbar_retrieval_smoke_v2",
+        # v2 adds this block. The v1 report recorded no coordinate provenance, so
+        # when the run logs were lost with /tmp there was no way to tell whether a
+        # result came from the official PCA or the invalidated one -- and the two
+        # trees carry identical file names. Never ship a retrieval number without
+        # the coordinates it was produced in.
+        "coordinates": {
+            "pca": str(Path(args.pca).resolve()),
+            "pca_sha256": sha256_file(args.pca),
+            "normalization": str(Path(args.normalization).resolve()),
+            "normalization_sha256": sha256_file(args.normalization),
+            "retrieval_head": _head_path(),
+            "retrieval_head_sha256": (
+                sha256_file(_head_path()) if _head_path() else None
+            ),
+        },
         "sample_id": sample.sample_id,
         "checkpoint_id": checkpoint.checkpoint_id,
+        "checkpoint_index": args.checkpoint_index,
         "covered_sessions": list(checkpoint.covered_sessions),
         "max_sessions": max_sessions,
         "queries": len(per_query),

@@ -27,6 +27,12 @@ class FrozenTokenizerOutput:
     xbar: np.ndarray
     valid: np.ndarray
     a2_xbar: np.ndarray | None = None
+    # Pooled layer-16 Key64 *before* PCA and normalization, 64x4096. Off by
+    # default because it is 8x the size of xbar and nothing on the benchmark
+    # path wants it; the shift diagnosis does, because every question about
+    # whether the PCA basis or the tokenizer is at fault has to be asked on
+    # this side of the projection.
+    key64: np.ndarray | None = None
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
@@ -74,7 +80,28 @@ class FrozenV9InstructTokenizer:
     def _blank_image() -> Image.Image:
         return Image.new("RGB", (1280, 720), color=(255, 255, 255))
 
-    def encode(self, observation: WebObservation) -> FrozenTokenizerOutput:
+    def encode(
+        self,
+        observation: WebObservation,
+        *,
+        validate: bool = True,
+        image: Image.Image | None = None,
+        return_key64: bool = False,
+    ) -> FrozenTokenizerOutput:
+        """Encode one observation to frozen ``xbar``.
+
+        ``validate`` and ``image`` exist for the shift-attribution ablations and
+        are not used on the benchmark path.
+
+        ``validate=False`` permits the empty control arm of the modality
+        decomposition -- an observation with no screenshot, text or caption is a
+        real error when it comes from a benchmark round, but is the deliberate
+        ``m00`` baseline against which the other arms are measured.
+
+        ``image`` overrides the screenshot source, which is how the
+        resolution-matched control resamples WorldMemArena's 1280x720 captures
+        down to the 498x321 the image slots were pooled from.
+        """
         from experiments.state_tokenizer.extract_qwen import (
             _StopAtLayer,
             _input_text,
@@ -85,9 +112,12 @@ class FrozenV9InstructTokenizer:
         from experiments.state_tokenizer.fixed_prompt import OBSERVATION_PROMPT
         from experiments.state_tokenizer.static_key_pooling import build_static_key64
 
-        validate_observation(observation)
+        if validate:
+            validate_observation(observation)
         dom = synthetic_axtree(observation)
-        if observation.screenshot:
+        if image is not None:
+            image = image.convert("RGB")
+        elif observation.screenshot:
             with Image.open(observation.screenshot) as handle:
                 image = handle.convert("RGB")
         else:
@@ -168,10 +198,12 @@ class FrozenV9InstructTokenizer:
             xbar=xbar,
             valid=valid,
             a2_xbar=a2_xbar,
+            key64=tokens.float().cpu().numpy() if return_key64 else None,
             metadata={
                 "protocol": self.protocol,
                 "original_sequence_length": original_length,
                 "image_grid_thw": image_grid,
+                "image_size": tuple(image.size),
                 "synthetic_axtree": dom,
             },
         )
