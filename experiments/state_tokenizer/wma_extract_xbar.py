@@ -167,15 +167,27 @@ class RecordingTokenizer:
         return outputs["m11"]
 
 
-def _sample_ids(bundle, subcategory: str) -> list[str]:
-    return [
-        s.sample_id for s in bundle.samples
-        if getattr(s, "_subcategory", "") == subcategory
-    ]
+def _sample_ids(bundle, subcategories: list[str]) -> list[str]:
+    """Sample ids for the given subcategories, in bundle order.
+
+    Empty output is an error rather than an empty run: the loader's
+    ``_subcategory`` strings do not match the directory names (``webarena-lite``
+    sits under ``agent/vab/`` with a hyphen, not ``agent/arena/`` with an
+    underscore), so a typo silently selects nothing.
+    """
+    wanted = set(subcategories)
+    ids = [s.sample_id for s in bundle.samples if getattr(s, "_subcategory", "") in wanted]
+    if not ids:
+        available = sorted({getattr(s, "_subcategory", "") for s in bundle.samples})
+        raise KeyError(
+            f"no samples for {sorted(wanted)}; available subcategories:\n  "
+            + "\n  ".join(available)
+        )
+    return ids
 
 
 def run_sample(sample, tokenizer, *, top_k: int, checkpoint_index: int,
-               save_key64: bool = False) -> dict:
+               save_key64: bool = False, arms=ARMS) -> dict:
     from eval_framework.memory_adapters.residualmem_instruct_adapter import (
         ResidualMemInstructAdapter,
     )
@@ -214,7 +226,7 @@ def run_sample(sample, tokenizer, *, top_k: int, checkpoint_index: int,
     # path, this fails loudly instead of silently embedding against some server.
     os.environ.setdefault("QWEN_VL_EMBED_BASE_URL", "http://xbar-extraction-never-calls-this.invalid/v1")
 
-    recorder = RecordingTokenizer(tokenizer, save_key64=save_key64)
+    recorder = RecordingTokenizer(tokenizer, arms=arms, save_key64=save_key64)
     adapter = _XbarOnlyAdapter(
         baseline_name="ResidualMem-Instruct-Xbar-Input-RAG",
         tokenizer=recorder,
@@ -245,7 +257,7 @@ def run_sample(sample, tokenizer, *, top_k: int, checkpoint_index: int,
     }
 
 
-def save_sample(path: Path, payload: dict) -> None:
+def save_sample(path: Path, payload: dict, arms=ARMS) -> None:
     arrays: dict[str, np.ndarray] = {}
     meta = []
     for index, record in enumerate(payload["records"]):
@@ -261,7 +273,7 @@ def save_sample(path: Path, payload: dict) -> None:
     arrays["metadata"] = np.asarray(json.dumps({
         **{k: v for k, v in payload.items() if k != "records"},
         "records": meta,
-        "arms": list(ARMS),
+        "arms": list(arms),
         "protocol": "wma_xbar_ablation_v1",
     }, ensure_ascii=False))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,7 +291,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--split", choices=("all", "small"), default="all")
-    parser.add_argument("--subcategory", default="agent/arena/web")
+    parser.add_argument("--subcategory", action="append", default=None,
+                        help="repeatable; defaults to agent/arena/web. NB the loader's\n"
+                             "strings differ from directory names -- webarena-lite is\n"
+                             "agent/vab/webarena-lite, not agent/arena/webarena_lite")
     parser.add_argument("--sample-id", action="append", default=None,
                         help="restrict to these samples; repeatable")
     parser.add_argument("--checkpoint-index", type=int, default=-1,
@@ -293,18 +308,56 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--save-key64", action="store_true",
                         help="also store the pre-PCA 64x4096 Key64 for the m11 arm")
+    parser.add_argument("--axtree-style", default="",
+                        help="empty = the frozen default; 'v1' = the pre-2026-08-22\n"
+                             "serialization; otherwise comma-separated AxtreeStyle flags\n"
+                             "(canonical_rows, root_node, split_captions,\n"
+                             "explicit_no_instruction) to override it explicitly.\n"
+                             "Changing this changes H16, so a PCA fitted under one style\n"
+                             "is not a valid basis for another")
+    parser.add_argument("--arms", default=None,
+                        help="comma-separated subset of " + ",".join(ARMS) + ". Fitting a\n"
+                             "PCA only needs m11; the ablation arms exist for the shift\n"
+                             "diagnosis and cost a 9B forward each")
     args = parser.parse_args()
+
+    arms = tuple(a.strip() for a in args.arms.split(",")) if args.arms else ARMS
+    unknown = [a for a in arms if a not in ARMS]
+    if unknown:
+        raise SystemExit(f"unknown arms {unknown}; known: {list(ARMS)}")
+    if "m11" not in arms:
+        raise SystemExit("m11 is required: it is the arm the adapter consumes")
 
     _wma_root()
     from eval_framework.datasets.worldmemarena import load_worldmemarena
+    from residualmem.benchmarks.worldmemarena_tokenizer import (
+        DEFAULT_AXTREE_STYLE, LEGACY_V1_AXTREE_STYLE, AxtreeStyle,
+    )
     from residualmem.latent.frozen_v8_runtime import FrozenV9InstructTokenizer
 
+    requested = args.axtree_style.strip()
+    if not requested:
+        style = DEFAULT_AXTREE_STYLE
+    elif requested == "v1":
+        style = LEGACY_V1_AXTREE_STYLE
+    else:
+        flags = [f.strip() for f in requested.split(",") if f.strip()]
+        known = set(AxtreeStyle.__dataclass_fields__)
+        bad = [f for f in flags if f not in known]
+        if bad:
+            raise SystemExit(
+                f"unknown axtree-style flags {bad}; known: {sorted(known)} (or 'v1')"
+            )
+        style = AxtreeStyle(**{f: True for f in flags})
+    print(f"[extract] axtree_style={style}")
+
     bundle = load_worldmemarena(Path(args.dataset), split=args.split)
-    ids = args.sample_id or _sample_ids(bundle, args.subcategory)
+    ids = args.sample_id or _sample_ids(bundle, args.subcategory or ["agent/arena/web"])
     by_id = {s.sample_id: s for s in bundle.samples}
     missing = [i for i in ids if i not in by_id]
     if missing:
         raise KeyError(f"samples not found: {missing}")
+    print(f"[extract] arms={list(arms)}")
     print(f"[extract] {len(ids)} samples: {', '.join(ids[:6])}{' ...' if len(ids) > 6 else ''}")
 
     out_dir = Path(args.output_dir)
@@ -314,6 +367,7 @@ def main() -> None:
         normalization_path=args.normalization,
         device=args.device,
         use_kernels=False,
+        axtree_style=style,
     )
 
     done = skipped = 0
@@ -326,9 +380,9 @@ def main() -> None:
         payload = run_sample(
             by_id[sample_id], tokenizer,
             top_k=args.top_k, checkpoint_index=args.checkpoint_index,
-            save_key64=args.save_key64,
+            save_key64=args.save_key64, arms=arms,
         )
-        save_sample(target, payload)
+        save_sample(target, payload, arms=arms)
         done += 1
         print(f"[extract] {sample_id}: {payload['observation_rows']} observations "
               f"/ {payload['total_rows']} rows -> {target.name}", flush=True)

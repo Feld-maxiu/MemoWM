@@ -15,6 +15,8 @@ import torch
 from PIL import Image
 
 from residualmem.benchmarks.worldmemarena_tokenizer import (
+    DEFAULT_AXTREE_STYLE,
+    AxtreeStyle,
     WebObservation,
     synthetic_axtree,
     validate_observation,
@@ -52,12 +54,17 @@ class FrozenV9InstructTokenizer:
         layer: int = 16,
         max_length: int = 8192,
         use_kernels: bool = True,
+        axtree_style: AxtreeStyle = DEFAULT_AXTREE_STYLE,
     ) -> None:
         from experiments.state_tokenizer.extract_qwen import _load_model
 
         self.device = torch.device(device)
         self.layer = int(layer)
         self.max_length = int(max_length)
+        # Which synthetic-AXTree rules to serialize WorldMemArena text under.
+        # Frozen for a given set of coordinates: changing it changes H16, and a
+        # PCA fitted on the old H16 is then a different coordinate system.
+        self.axtree_style = axtree_style
         self.processor, self.model = _load_model(str(model_path), self.device, use_kernels)
         with np.load(pca_path, allow_pickle=False) as artifact:
             self.pca_mean = torch.as_tensor(
@@ -114,7 +121,7 @@ class FrozenV9InstructTokenizer:
 
         if validate:
             validate_observation(observation)
-        dom = synthetic_axtree(observation)
+        dom = synthetic_axtree(observation, self.axtree_style)
         if image is not None:
             image = image.convert("RGB")
         elif observation.screenshot:

@@ -31,6 +31,7 @@ from residualmem.world_model import categorical_bottleneck as Q
 from .a1_continuous_bottleneck import FeatureStore, select_split_rows
 from .a2_categorical_bottleneck import load_checkpoint, read_checkpoint_config
 from .common import iter_jsonl, write_json
+from .slot_layout import KEY64_LAYOUT
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -41,8 +42,14 @@ def run(args: argparse.Namespace) -> dict:
 
     store = FeatureStore(args.features)
     normalizer = GroupChannelNormalizer.from_npz(args.normalization)
+    # The checkpoint already records its own layout; overriding it with a literal
+    # is what made this gate slice group metrics over the wrong slot ranges. The
+    # dead (32, 12, 16, 4) predates the prompt band being recycled into detail,
+    # so image/detail/context/prompt were reported over shifted spans while
+    # all/* stayed correct -- the same silent failure that once had
+    # fit_normalization compute prompt statistics for a group of width 0.
     config = Q.CategoricalBottleneckConfig(
-        **{**read_checkpoint_config(args.checkpoint), "group_sizes": (32, 12, 16, 4)}
+        **{**read_checkpoint_config(args.checkpoint), "group_sizes": KEY64_LAYOUT}
     )
     device = jax.devices(args.platform)[args.device_index]
     params = jax.device_put(load_checkpoint(args.checkpoint, config), device)

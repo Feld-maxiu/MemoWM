@@ -8,6 +8,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# One source, not a second literal. The layout was repeated verbatim in several
+# places and every copy kept reporting the pre-recycling (32, 12, 16, 4) after
+# the four prompt slots were folded into detail -- nothing raised, the group
+# metrics were simply sliced over the wrong spans. A1/A2 were corrected then;
+# this default was missed.
+from .continuous_bottleneck import DEFAULT_GROUP_SIZES
+
 
 @dataclasses.dataclass(frozen=True)
 class SlotReconstructionConfig:
@@ -15,7 +22,7 @@ class SlotReconstructionConfig:
     token_dim: int = 512
     num_heads: int = 8
     ffn_hidden: int = 1024
-    group_sizes: tuple[int, ...] = (32, 12, 16, 4)
+    group_sizes: tuple[int, ...] = DEFAULT_GROUP_SIZES
 
     def __post_init__(self):
         object.__setattr__(self, "group_sizes", tuple(self.group_sizes))
