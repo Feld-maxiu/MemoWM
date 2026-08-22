@@ -346,6 +346,118 @@ Phase 2（学习式投影）从「必要」降为「可能锦上添花」，其�
    `MultiQueryRetrievalHead` 与现有 head 对照，域内不得退化，走官方指标 gate。
 3. Phase 2 的取舍在 Phase 1 结果出来后重定。
 
+---
+
+## 官方评测基础设施（2026-08-22 晚）
+
+官方仓库**只为 embedding 服务提供启动脚本**（`run_qwen_vl_embed_vllm.sh`），
+answer/judge 模型预期指向外部 OpenAI 兼容 API。本机 vLLM 不可用
+（唯一装了 vllm 0.11.0 的 env 是 torch 2.11，而 0.11.0 钉死 torch 2.8，
+扩展加载报 undefined c10::cuda symbol），且**不该改动别人的共享 conda 环境**，
+所以新写 `experiments/state_tokenizer/local_openai_server.py` 顶这一格
+（标准库 + transformers，不新增依赖）。
+
+**踩过的三个坑，都已修**：
+
+1. **线程加副本无效**：12 个线程副本与 4 个的吞吐完全一样（0.71 req/s）——
+   `generate()` 的自回归循环在 Python 层，全卡在 **GIL** 上。改成**多进程 +
+   `SO_REUSEPORT`** 后 24 路并发 4.59 req/s，**6.5×**。
+2. **keep-alive 废掉了负载均衡**：`SO_REUSEPORT` 均衡的是**连接**不是请求，
+   而 OpenAI SDK 持有连接池，一条连接固定绑到某个 worker，导致堆积方 300 秒超时、
+   服务端 `BrokenPipeError`。改为每响应后 `Connection: close`，让内核逐请求重新分配，
+   24 路 5.32 req/s 且零超时。
+3. **停服务只杀了父进程**：多进程模式下子进程存活并各占约 23 GB 显存，
+   下次启动 OOM。`setsid` 使父进程成为进程组长，改用 `kill -- -PID` 杀整组。
+   入口是 `scripts_local_llm_server.sh`（**用 pidfile，不用 `ps|grep`**——
+   后者在本场景必然自匹配，本会话已因此误杀自己的 shell 三次）。
+
+**Qwen3.5-9B 默认带 thinking 前导**，judge 要 JSON 标签时会把预算烧在推理上、
+返回不可解析的文本（框架随后静默降级为 `Omission`）。chat template 支持
+`enable_thinking=False`；框架本身也对 DeepSeek judge 做同样的事
+（注释："saves tokens, faster"），故默认关闭，`-think` 后缀可开回。
+
+⚠️ **本轮评测的重大局限（必须写进任何引用）**：
+
+| | 论文 Table 2 | 本轮 |
+|---|---|---|
+| 回答模型 | **GPT-5.4-nano**（统一骨干） | Qwen3.5-9B |
+| judge | **GPT-5.4-mini** | Qwen3.5-9B ——**与回答模型相同，即自我评判** |
+| 范围 | 461 样本 / 24,258 QA，Agentic + Lifelong 聚合 | `agent/gui/web` |
+| embedding 服务 | vLLM | SentenceTransformer 本地回退（两臂一致） |
+
+**所以本轮数字不得与论文 Table 2 并列。** 自我评判是我配 `.env` 时图省事引入的
+方法论缺陷，有已知的自我偏好偏差。有效的只是**同一次运行内的两臂对比**。
+计划是本地迭代、定稿后用 `--eval-only` 从已落盘的 `pipeline_*.jsonl` 换官方模型重判
+（不必重跑管线）。
+
+---
+
+## 官方指标下的第一次两臂对比（web_01，n=53）
+
+| | Raw-Fused | ResidualMem（现役 head） | Δ |
+|---|---:|---:|---:|
+| 记忆 Recall / Corr / Irrel | 0.8743 / 0.9200 / 0.0800 | **完全相同** | 0 |
+| RC (hit_rate) | 0.8301 | 0.8364 | +0.006 |
+| Recall@1 / @5 / @10 | 0.374 / 0.718 / 0.806 | 0.374 / 0.721 / 0.801 | ~0 |
+| nDCG@10 | 0.5715 | 0.5873 | +0.016 |
+| QA-C / QA-H / QA-O | 0.7925 / 0.0755 / 0.1321 | 0.7736 / 0.1132 / 0.1132 | 1–2 题 |
+| answer tokens/题 | 2,213 | 2,280 | **+67** |
+
+**记忆写入侧逐位相同**——代码层面就注定：两臂的 `memory_delta` 是同一批文本。
+
+`notmention_when_retrieved_ratio` 与 `omission_ratio` **完全相等**（0.1321），
+即**每一次 omission 都发生在 gold 已被检索到之后**：剩余误差的三分之二在生成侧。
+
+**按行类型分解**（用官方 `_ranking_metrics`，仅 web_01）：
+
+| | R@10 完整 | R@10 去掉观察行 | R@10 只留观察行 | 观察行占 top-10 |
+|---|---:|---:|---:|---:|
+| Raw-Fused | 0.8063 | **0.8063** | 0.4158 | 10.2% |
+| ResidualMem | 0.8012 | **0.8012** | **0.0000** | **0.0%** |
+
+我们的观察行**从未进入 top-10，贡献精确为零**——塌缩的直接后果。
+⚠️ 但**不能**据此断言「这个 benchmark 下观察行都不产生分数」：n=1 样本，
+Raw-Fused 那一列同样需要全量才能判断。全量 27 样本正在跑。
+
+---
+
+## Phase 1：并集 head（已完成，两条门槛均通过）
+
+`merge_bridge_caches.py` 把域内 5,500 行与 WMA 非 web 4,379 行合成 9,879 行
+（**各自保留原有 train/validation 划分**，使域内 validation 仍是现役 head 当年
+测的那 500 条，可比）。用**未改动的** `train_retrieval_bridge.py` 训练。
+
+合并时发现并堵掉一条捷径：**两域的 teacher 范数系统性不同**
+（域内 0.9964–1.0039，3,871/5,500 行偏离单位；WMA 精确 1.0）。
+InfoNCE 完全可以拿范数当作区分域的旁路信号，与内容无关。已统一归一化。
+
+| head | 域内 R@1 | 域内 cos | 域内两两 | **WMA 两两** | **WMA R@1/随机** | 高于随机 |
+|---|---:|---:|---:|---:|---:|---:|
+| 域内训练（现役） | 0.8400 | 0.8711 | 0.3418 | **0.8275** | 1.56× | 13/27 |
+| WMA-only（0c） | **0.1920** | 0.1008 | 0.0592 | 0.4052 | 9.00× | 27/27 |
+| **并集** | **0.8420** | **0.8821** | 0.3829 | **0.4627** | **7.37×** | 26/27 |
+
+- 预注册门槛：域内 500-way R@1 ≥ 0.80 ✅、WMA 塌缩 < 0.60 ✅。
+- **域内不但没退化，还略好**（R@1 +0.002，cos +0.011）。
+- 并集拿到 WMA-only 约 82% 的检索收益而不牺牲域内；paired cosine 0.6035 甚至
+  高于 WMA-only 的 0.5852，说明两域数据互补而非冲突。
+- 顺带证实 0c 那个 head 的域内确实废了（R@1 0.1920），**单域训练必然牺牲另一边**。
+
+⚠️ 这些都是**表示层面**的指标。它是否能推动**官方**指标，必须由全量三臂对比回答
+（Raw-Fused / ResidualMem-现役 / ResidualMem-并集）。
+
+---
+
+## 待办
+
+1. 全量 27 样本三臂对比，按行类型重做上面的分解（n=1,459 才有资格下结论）。
+2. Phase 3 reader connector：把回答从「原文交还」换成「latent 注入」。
+   现在 2,213 tok/题 两臂几乎相同，**「低成本」这条腿目前是负的**（我们多 3%）。
+3. 定稿后用官方模型（GPT-5.4-nano / GPT-5.4-mini）`--eval-only` 重判。
+
+**未提交**：`local_openai_server.py`、`scripts_local_llm_server.sh`、
+`wma_build_bridge_cache.py`、`merge_bridge_caches.py`、本文件的本节。
+
 **未提交**：serializer 冻结相关改动、`wma_serializer_screen.py`、
 `wma_pca_mixture_sweep.py`、`wma_build_bridge_cache.py`、两处布局修复、
 `test_wma_serializer.py` 的 docstring 更正、`WORLDMEMARENA_TOKENIZER_RAG.md` 的
