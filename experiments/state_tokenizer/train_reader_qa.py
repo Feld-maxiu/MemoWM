@@ -32,7 +32,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.nn import functional as F
 
 from residualmem.latent.instruct_bridge import (
     READER_BRIDGE_PROTOCOL,
@@ -41,79 +40,26 @@ from residualmem.latent.instruct_bridge import (
 )
 
 from .extract_qwen import _load_model
-
-# The reader builds exactly this at inference; training on a different shape is
-# what produced the mismatch in the first place.
-INSTRUCTION = (
-    "Answer the question from the retrieved memory. Keep the answer concise. "
-    "If absent, say exactly 'Not mentioned in memory.'.\nQuestion: "
-)
-
-
-def prompt_ids(processor, question: str, device):
-    encoded = processor.tokenizer(
-        INSTRUCTION + question, return_tensors="pt", add_special_tokens=True
-    )
-    return encoded["input_ids"].to(device)
+from .reader_losses import answer_ce_and_distill_kl
 
 
 def build_loss(model, processor, connector, row, device, max_answer_tokens, weight):
-    xbar, valid, question, answer, memory_text = row
-    embed = model.get_input_embeddings()
-    dtype = embed.weight.dtype
+    """Cached ``xbar`` -> soft tokens -> the shared reader losses.
 
+    The loss itself lives in ``reader_losses`` because ``train_qformer_joint``
+    optimizes exactly the same objective from a learnable latent, and keeping
+    two copies is how the distillation term ended up mis-scaled in one of them.
+    """
+    xbar, valid, question, answer, memory_text = row
+    valid_mask = torch.as_tensor(valid[None], dtype=torch.bool, device=device)
     latent = connector(
         torch.as_tensor(xbar[None], dtype=torch.float32, device=device),
-        torch.as_tensor(valid[None], dtype=torch.bool, device=device),
+        valid_mask,
     )
-    valid_mask = torch.as_tensor(valid[None], device=device).to(torch.long)
-
-    question_ids = prompt_ids(processor, question, device)
-    answer_ids = processor.tokenizer(
-        answer, return_tensors="pt", add_special_tokens=False,
-        truncation=True, max_length=max_answer_tokens,
-    )["input_ids"].to(device)
-    question_embeds = embed(question_ids).detach()
-    answer_embeds = embed(answer_ids).detach()
-    answer_len = int(answer_ids.shape[1])
-
-    # Text memory for the teacher: the observation the question is about is
-    # already what the latent encodes, so the teacher's context is that text.
-    def run(memory_embeds, memory_mask):
-        inputs = torch.cat((memory_embeds.to(dtype), question_embeds, answer_embeds), 1)
-        attention = torch.cat(
-            (memory_mask, torch.ones_like(question_ids), torch.ones_like(answer_ids)), 1
-        )
-        labels = torch.cat((
-            torch.full(memory_mask.shape, -100, device=device, dtype=torch.long),
-            torch.full_like(question_ids, -100),
-            answer_ids,
-        ), 1)
-        return model(inputs_embeds=inputs, attention_mask=attention,
-                     labels=labels, use_cache=False)
-
-    student = run(latent, valid_mask)
-    loss = student.loss
-
-    if weight > 0:
-        with torch.no_grad():
-            text_ids = processor.tokenizer(
-                memory_text, return_tensors="pt", add_special_tokens=False,
-                truncation=True, max_length=256,
-            )["input_ids"].to(device)
-            teacher = run(embed(text_ids), torch.ones_like(text_ids))
-        # Align on the answer span: the two sequences differ only in how the
-        # memory reached the model, so the last answer_len positions correspond.
-        student_logits = student.logits[:, -answer_len - 1 : -1]
-        teacher_logits = teacher.logits[:, -answer_len - 1 : -1]
-        kl = F.kl_div(
-            F.log_softmax(student_logits.float(), -1),
-            F.log_softmax(teacher_logits.float(), -1),
-            reduction="batchmean", log_target=True,
-        )
-        loss = loss + weight * kl
-        return loss, float(student.loss), float(kl)
-    return loss, float(student.loss), 0.0
+    return answer_ce_and_distill_kl(
+        model, processor, latent, valid_mask, question, answer, memory_text,
+        max_answer_tokens=max_answer_tokens, weight=weight,
+    )
 
 
 def main() -> None:
@@ -151,14 +97,26 @@ def main() -> None:
 
     device = torch.device(args.device)
     processor, model = _load_model(args.model, device, False)
-    connector = InputSoftTokenConnector().to(device)
+    # Seed *before* constructing the connector: its Linear layers draw from the
+    # global torch generator, so seeding afterwards left the initialization
+    # unreproducible. train_retrieval_bridge.py:131-132 is the correct order.
     torch.manual_seed(args.seed)
+    connector = InputSoftTokenConnector().to(device)
     optimizer = torch.optim.AdamW(connector.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
 
     split = pairs["split"].astype(str)
     train_rows = np.flatnonzero(split == "train")
     val_rows = np.flatnonzero(split == "validation")
+    # Drawn once, so every eval scores the same rows and the curve is
+    # comparable across steps. Taking the first N in index order instead
+    # sampled the earliest-sorted held-out samples rather than the split.
+    chosen_val = (
+        val_rows if len(val_rows) <= args.validation_rows
+        else np.random.default_rng(args.seed + 1).choice(
+            val_rows, args.validation_rows, replace=False
+        )
+    )
     missing = 0
 
     def row_at(index):
@@ -190,10 +148,9 @@ def main() -> None:
 
         if step % args.eval_every == 0 or step == args.max_steps:
             connector.eval()
-            chosen = val_rows[: args.validation_rows]
             losses = []
             with torch.no_grad():
-                for index in chosen:
+                for index in chosen_val:
                     row = row_at(int(index))
                     _, ce_value, _ = build_loss(
                         model, processor, connector, row, device,

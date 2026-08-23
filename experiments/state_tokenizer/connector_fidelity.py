@@ -31,14 +31,12 @@ import numpy as np
 import torch
 
 from residualmem.latent.instruct_bridge import (
-    RETRIEVAL_BRIDGE_PROTOCOL,
+    READER_BRIDGE_PROTOCOL,
     InputSoftTokenConnector,
     MemorySegment,
     Qwen35LatentReader,
     load_bridge,
 )
-
-READER_BRIDGE_PROTOCOL = "qwen35_instruct_reader_bridge_v1"
 
 
 def load_observations(directory: Path) -> dict[tuple[str, str], tuple]:

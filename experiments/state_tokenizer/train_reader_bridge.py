@@ -129,6 +129,9 @@ def train(args: argparse.Namespace) -> dict:
     val_rows = np.flatnonzero(split == "validation")
     device = torch.device(args.device)
     processor, model = _load_model(args.model, device, args.use_kernels)
+    # Seed before construction: connector init draws from the global torch
+    # generator, so seeding afterwards left it unreproducible.
+    torch.manual_seed(args.seed)
     if args.mode == "input":
         connector = InputSoftTokenConnector()
     else:
@@ -138,8 +141,6 @@ def train(args: argparse.Namespace) -> dict:
     connector.to(device).train()
     optimizer = torch.optim.AdamW(connector.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
-    # The numpy generator only seeds the batch sampler; connector init is torch's.
-    torch.manual_seed(args.seed)
     best, best_step, stale = math.inf, 0, 0
 
     def loss_for(source, rows, training):
