@@ -530,6 +530,48 @@ judge 零失败（`num_valid` 三臂均 1,459）。
 
 ---
 
+## Phase 3 Stage A/B1（2026-08-23）
+
+### latent reader 按原接线不可能工作
+
+`answer()` 只保留有 latent 的行，而 WMA web 上每题 top-10 里的观察行**均值仅 0.30**、
+**84% 的题一个都没有**。这些题拿到空列表，走 `Qwen35LatentReader.answer()` 的
+`if not states: return "Not mentioned in memory."`，被 judge 判为 Omission。
+被丢掉的行还携带 assistant 轮次——**那部分内容任何 latent 都覆盖不到**。
+
+**改为混合**：观察行 → 64 个 soft token，轮次文本行 → 原文，**按检索 rank 交错**。
+
+⚠️ **顺序是承重的**：`rank_embedding` 是 `(64, 4096)`，对每个状态广播的值完全相同，
+拼接后区分状态的**只有 RoPE 位置**。已加测试断言 latent-then-text 与 text-then-latent
+产出不同张量。
+
+**这不是 token 效率改动，不得如此宣传**：观察行只占检索字符的 1.6%，
+而且 connector 本身几乎不压缩——**一个 xbar 槽位一个 soft token、中间无池化**，
+64 个 soft token 对应的 WMA 观察文本中位是 **88 token**。它的价值是让这条臂
+不再从空上下文作答。
+
+### 跨域训练 connector 的三个阻塞
+
+目标文本原本靠 `global_index` 去 BrowserGym 的 jsonl 查，而 WMA 行没有该索引、
+合并 cache 里被填成 −1，**任何跨域语料在第一步之前就抛异常**——这也是 reader
+至今只可能在 BrowserGym 上训练的原因。
+
+文本其实早就在盘上：`wma_extract_xbar` 每条 record 存了 `fused_text`，与数组按位置
+对齐，且**就是 teacher 当初嵌入的那段**，是 `browsergym_teacher_text` 的 WMA 对应物。
+把它作为 `target_text` 列贯穿三个 builder，就彻底去掉了对 `global_indices` 的依赖；
+合并器还能从 records 回填旧 cache 的该列，**542 MB 的域内产物不必重建**。
+
+并集 cache：9,879 行（browsergym 5,500 / wma_nonweb 4,379），`target_text` 零空缺。
+
+### 顺手修的两个缺陷（此前不可见，因为没有任何测试碰过这两个文件）
+
+1. **`layer16` 训练崩在 dtype**：`torch.zeros_like(latent)` 保持 float32 而 embedding
+   表是 bf16，`cat()` 提升后第一个 Linear 拒绝混合输入。推理路径本来就转了。
+2. **训练器只 seed 了 numpy 不 seed torch**，connector 初始化不可复现
+   （`train_retrieval_bridge` 两个都 seed）。
+
+---
+
 ## 待办（按证据重排）
 
 1. **Phase 2 学习式投影**，目标明确为那 4 个 R@10 点。25% 混合 PCA 已定工作点
