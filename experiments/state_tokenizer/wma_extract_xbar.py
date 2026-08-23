@@ -154,6 +154,11 @@ class RecordingTokenizer:
             "fused_text": fused_observation_text(observation.user_text, observation.captions),
             "native_image_size": list(outputs["m11"].metadata.get("image_size", ())),
             "synthetic_axtree_chars": len(outputs["m11"].metadata.get("synthetic_axtree", "")),
+            # The serialized tree itself, for the same reason ``fused_text`` is
+            # stored: a learnable tokenizer has to re-run the trunk over the
+            # *identical* input, and rebuilding the tree from a second dataset
+            # walk is exactly the drift this file already avoids once.
+            "synthetic_axtree": outputs["m11"].metadata.get("synthetic_axtree", ""),
             "key64": outputs["m11"].key64,
             "arms": {
                 name: {
