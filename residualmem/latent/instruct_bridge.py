@@ -27,11 +27,28 @@ RETRIEVAL_BRIDGE_PROTOCOL = "qwen35_instruct_retrieval_bridge_v1"
 READER_BRIDGE_PROTOCOL = "qwen35_instruct_reader_bridge_v1"
 
 
-def _check_latents(xbar: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _check_latents(
+    xbar: torch.Tensor, valid: torch.Tensor, *, slots: int | None = 64
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shape guard for a state batch.
+
+    ``slots`` is the count the *calling module* was built for, because that is
+    who a mismatch would break. It used to be hardcoded to 64, which is right
+    for every module carrying a per-slot parameter (the connector's rank
+    embedding, A2's slot-position table) but wrong for the ones that pool over
+    slots and do not care -- and it blocked measuring whether 64 is the right
+    budget at all. Pass ``slots=None`` only when the module is genuinely
+    permutation- and count-agnostic.
+    """
     xbar = torch.as_tensor(xbar, dtype=torch.float32)
     valid = torch.as_tensor(valid, dtype=torch.bool, device=xbar.device)
-    if xbar.shape[-2:] != (64, 512):
-        raise ValueError(f"expected xbar (...,64,512), got {tuple(xbar.shape)}")
+    if xbar.ndim < 2 or xbar.shape[-1] != 512:
+        raise ValueError(f"expected xbar (...,slots,512), got {tuple(xbar.shape)}")
+    if slots is not None and xbar.shape[-2] != slots:
+        raise ValueError(
+            f"expected {slots} slots, got {xbar.shape[-2]} -- the state and the "
+            "module reading it were built for different budgets"
+        )
     if valid.shape != xbar.shape[:-1]:
         raise ValueError(f"valid mask {tuple(valid.shape)} does not match {tuple(xbar.shape)}")
     if not torch.isfinite(xbar).all():
@@ -63,7 +80,9 @@ class MaskedAttentionRetrievalHead(nn.Module):
         )
 
     def forward(self, xbar: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        xbar, valid = _check_latents(xbar, valid)
+        # Attention pooling over slots: permutation- and count-agnostic, so this
+        # head reads any budget.
+        xbar, valid = _check_latents(xbar, valid, slots=None)
         if not valid.any(dim=-1).all():
             raise ValueError("each state needs at least one valid slot")
         values = self.input_norm(xbar)
@@ -102,7 +121,8 @@ class InputSoftTokenConnector(nn.Module):
         self.rank_embedding = nn.Parameter(torch.zeros(slots, model_dim))
 
     def forward(self, xbar: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        xbar, valid = _check_latents(xbar, valid)
+        # rank_embedding is per-slot, so a mismatched budget must not broadcast.
+        xbar, valid = _check_latents(xbar, valid, slots=self.rank_embedding.shape[0])
         output = self.output_norm(self.mlp(self.input_norm(xbar)))
         output = output + self.rank_embedding
         return output * valid[..., None]

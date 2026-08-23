@@ -43,8 +43,13 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from torch.nn import functional as F
 
-from residualmem.latent.instruct_bridge import InputSoftTokenConnector, save_bridge
+from residualmem.latent.instruct_bridge import (
+    InputSoftTokenConnector,
+    MaskedAttentionRetrievalHead,
+    save_bridge,
+)
 from residualmem.latent.qformer import (
     QFORMER_PROTOCOL,
     QFormerStateReader,
@@ -92,6 +97,44 @@ class ObservationStore:
         return self._pooled[key]
 
 
+class TeacherStore:
+    """``(sample_id, index)`` -> the fused-observation embedding, for L_sem.
+
+    Rows are positionally aligned with the extraction's records, the same
+    contract ``wma_build_bridge_cache`` relies on. ``image_ids`` travels with
+    the teacher, so the alignment is checked rather than assumed -- a silent
+    off-by-one here would train the tokenizer to match the wrong observation.
+    """
+
+    def __init__(self, directory: str | Path) -> None:
+        self._directory = Path(directory)
+        self._cache: dict[str, tuple[np.ndarray, list]] = {}
+
+    def get(self, sample_id: str, index: int, image_ids: list[str]) -> np.ndarray:
+        if sample_id not in self._cache:
+            with np.load(self._directory / f"{sample_id}.npz", allow_pickle=False) as data:
+                protocol = str(np.asarray(data["protocol"]))
+                if protocol != "qwen3_vl_fused_observation_v1":
+                    raise ValueError(f"{sample_id}: teacher protocol {protocol!r}")
+                self._cache[sample_id] = (
+                    np.asarray(data["teacher"], np.float32),
+                    json.loads(str(np.asarray(data["image_ids"]))) if
+                    np.asarray(data["image_ids"]).dtype.kind in "US" and
+                    np.asarray(data["image_ids"]).ndim == 0
+                    else np.asarray(data["image_ids"]).tolist(),
+                )
+        teacher, ids = self._cache[sample_id]
+        if index >= len(teacher):
+            raise ValueError(f"{sample_id}[{index}]: only {len(teacher)} teacher rows")
+        expected = [str(x) for x in (ids[index] if index < len(ids) else [])]
+        if image_ids and expected and sorted(expected) != sorted(str(x) for x in image_ids):
+            raise ValueError(
+                f"{sample_id}[{index}] teacher covers {expected} but the observation "
+                f"covers {image_ids} -- the two extractions are not aligned"
+            )
+        return teacher[index]
+
+
 def spread(states: np.ndarray) -> dict[str, float]:
     """Report 5.4's monitors: how distinguishable are these states from each other.
 
@@ -135,6 +178,18 @@ def main() -> None:
     parser.add_argument("--qformer-hidden", type=int, default=1024)
     parser.add_argument("--qformer-heads", type=int, default=8)
     parser.add_argument("--qformer-layers", type=int, default=4)
+    parser.add_argument("--no-self-attention", action="store_true",
+                        help="drop the latent self-attention sublayer. It lets "
+                             "queries divide work but is also a mixing operator "
+                             "that pulls them together; the JAX resample() this "
+                             "is ported from has none")
+    parser.add_argument("--teacher-dir",
+                        help="fused-observation teacher embeddings, enabling L_sem")
+    parser.add_argument("--sem-weight", type=float, default=0.0,
+                        help="weight on 1 - cos(pool(xbar), teacher). The anchor "
+                             "against representation collapse: the answer losses "
+                             "need very little information, so nothing else stops "
+                             "the states from becoming interchangeable")
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--accumulate", type=int, default=8,
@@ -144,7 +199,9 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--clip-norm", type=float, default=5.0)
     parser.add_argument("--eval-every", type=int, default=100)
-    parser.add_argument("--validation-rows", type=int, default=96)
+    parser.add_argument("--validation-observations", type=int, default=96,
+                        help="distinct observations scored per eval; every "
+                             "question of each is averaged inside it first")
     parser.add_argument("--patience-evals", type=int, default=8)
     parser.add_argument("--seed", type=int, default=35)
     args = parser.parse_args()
@@ -164,25 +221,48 @@ def main() -> None:
         StateQFormer(
             num_queries=args.queries, hidden=args.qformer_hidden,
             heads=args.qformer_heads, layers=args.qformer_layers,
-            modalities=NUM_MODALITIES,
+            modalities=NUM_MODALITIES, self_attention=not args.no_self_attention,
         ),
         InputSoftTokenConnector(slots=args.queries),
+        MaskedAttentionRetrievalHead() if args.sem_weight > 0 else None,
     ).to(device)
     optimizer = torch.optim.AdamW(joint.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
     store = ObservationStore(args.xbar_dir)
+    if args.sem_weight > 0 and not args.teacher_dir:
+        raise ValueError("--sem-weight needs --teacher-dir")
+    teachers = TeacherStore(args.teacher_dir) if args.teacher_dir else None
 
     split = pairs["split"].astype(str)
-    train_rows = np.flatnonzero(split == "train")
-    val_rows = np.flatnonzero(split == "validation")
+    # Group by observation before sampling. The encoder is observation-level, so
+    # drawing QA pairs uniformly weights an observation by how many questions it
+    # happens to carry: 695 observations carry one question and 1,432 carry the
+    # four-question cap, so 45% of observations would consume 63% of the steps.
+    # That optimizes the question distribution rather than the observation
+    # distribution -- and a state tokenizer that fits the question distribution
+    # is exactly the shortcut the collapse monitor is watching for.
+    #
+    # The split is already by sample_id (strictly coarser than by observation),
+    # so every question of an observation lands on the same side and validation
+    # measures generalization to unseen states rather than unseen questions.
+    def grouped(rows):
+        table = collections.defaultdict(list)
+        for row in rows:
+            key = (str(pairs["sample_id"][row]), int(pairs["record_index"][row]))
+            table[key].append(int(row))
+        return [np.asarray(value) for value in table.values()]
+
+    train_groups = grouped(np.flatnonzero(split == "train"))
+    val_groups = grouped(np.flatnonzero(split == "validation"))
+    picker = np.random.default_rng(args.seed + 1)
     chosen_val = (
-        val_rows if len(val_rows) <= args.validation_rows
-        else np.random.default_rng(args.seed + 1).choice(
-            val_rows, args.validation_rows, replace=False
-        )
+        val_groups if len(val_groups) <= args.validation_observations
+        else [val_groups[i] for i in picker.choice(
+            len(val_groups), args.validation_observations, replace=False)]
     )
     trainable = sum(p.numel() for p in joint.parameters() if p.requires_grad)
-    print(f"[qformer] {len(train_rows)} train / {len(val_rows)} validation pairs, "
+    print(f"[qformer] {len(train_groups)} train / {len(val_groups)} validation observations "
+          f"({int((split == 'train').sum())}/{int((split == 'validation').sum())} pairs), "
           f"{len(chosen_val)} scored per eval", flush=True)
     print(f"[qformer] {trainable/1e6:.1f}M trainable, {args.queries} queries, "
           f"accumulate {args.accumulate}, distill weight {args.distill_weight}", flush=True)
@@ -200,15 +280,28 @@ def main() -> None:
         soft, xbar, valid = joint(*collate([states]))
         return soft, xbar, valid, record, sample_id, index
 
-    def loss_for(row: int, weight: float):
-        soft, xbar, valid, record, _sample, _index = latents_for(row)
+    def loss_for(row: int, weight: float, sem_weight: float = 0.0):
+        soft, xbar, valid, record, sample_id, index = latents_for(row)
         loss, ce, kl = answer_ce_and_distill_kl(
             model, processor, soft, valid,
             str(pairs["question"][row]), str(pairs["answer"][row]),
             str(record.get("fused_text", "")),
             max_answer_tokens=args.max_answer_tokens, weight=weight,
         )
-        return loss, ce, kl, xbar
+        sem = 0.0
+        if sem_weight > 0 and teachers is not None:
+            target = torch.as_tensor(
+                teachers.get(sample_id, index, record.get("image_ids") or []),
+                dtype=torch.float32, device=device,
+            )[None]
+            # Pool the slots to one vector *first*, then compare. Asking each
+            # slot to match the 4096-d target separately is what homogenizes
+            # them; the head's attention pooling is the pooling.
+            projected = joint.project(xbar, valid)
+            sem_loss = (1.0 - F.cosine_similarity(projected, F.normalize(target, dim=-1))).mean()
+            loss = loss + sem_weight * sem_loss
+            sem = float(sem_loss)
+        return loss, ce, kl, sem, xbar
 
     best, best_step, stale, history = math.inf, 0, 0, []
     for step in range(1, args.max_steps + 1):
@@ -216,11 +309,15 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         totals = collections.Counter()
         for _ in range(args.accumulate):
-            row = int(rng.choice(train_rows))
-            loss, ce, kl, _ = loss_for(row, args.distill_weight)
+            # Uniform over observations, then uniform over that observation's
+            # questions -- P(o) = 1/N, q ~ Q(o).
+            group = train_groups[int(rng.integers(len(train_groups)))]
+            row = int(rng.choice(group))
+            loss, ce, kl, sem, _ = loss_for(row, args.distill_weight, args.sem_weight)
             (loss / args.accumulate).backward()
             totals["ce"] += ce
             totals["kl"] += kl
+            totals["sem"] += sem
         torch.nn.utils.clip_grad_norm_(joint.parameters(), args.clip_norm)
         optimizer.step()
 
@@ -230,12 +327,19 @@ def main() -> None:
         joint.eval()
         losses, learned, pooled = [], [], []
         with torch.no_grad():
-            for row in chosen_val:
-                _loss, ce, _kl, xbar = loss_for(int(row), 0.0)
-                losses.append(ce)
+            for group in chosen_val:
+                # Every question of the observation, averaged inside it before
+                # averaging across observations: an unbiased observation-level
+                # estimate with no "which question got drawn" noise. The state
+                # is identical for all of them, so it enters the monitor once.
+                per_observation, xbar = [], None
+                for row in group:
+                    _loss, ce, _kl, _sem, xbar = loss_for(int(row), 0.0)
+                    per_observation.append(ce)
+                losses.append(float(np.mean(per_observation)))
                 learned.append(xbar[0].float().cpu().numpy())
                 pooled.append(store.pooled_xbar(
-                    str(pairs["sample_id"][row]), int(pairs["record_index"][row])
+                    str(pairs["sample_id"][group[0]]), int(pairs["record_index"][group[0]])
                 ))
         validation = float(np.mean(losses))
         # Same observations, both representations -- the comparison is paired.
@@ -255,7 +359,8 @@ def main() -> None:
         print(
             f"[qformer] step {step:5d}  val CE {validation:.4f}  "
             f"(train CE {totals['ce']/args.accumulate:.4f}, "
-            f"KL {totals['kl']/args.accumulate:.4f})  "
+            f"KL {totals['kl']/args.accumulate:.4f}, "
+            f"sem {totals['sem']/args.accumulate:.4f})  "
             f"cos {monitors['learned']['pairwise_cosine']:+.4f}"
             f"/{monitors['pooled']['pairwise_cosine']:+.4f}  "
             f"rank {monitors['learned']['effective_rank']:.1f}"

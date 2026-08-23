@@ -67,7 +67,8 @@ class FourierPositionEncoding(nn.Module):
 class QFormerBlock(nn.Module):
     """Pre-norm cross-attention to ``H_t``, self-attention among queries, FFN."""
 
-    def __init__(self, hidden: int, heads: int, mlp_ratio: int = 4) -> None:
+    def __init__(self, hidden: int, heads: int, mlp_ratio: int = 4,
+                 self_attention: bool = True) -> None:
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden {hidden} must be divisible by heads {heads}")
@@ -78,11 +79,19 @@ class QFormerBlock(nn.Module):
         self.cross_k = nn.Linear(hidden, hidden, bias=False)
         self.cross_v = nn.Linear(hidden, hidden, bias=False)
         self.cross_out = nn.Linear(hidden, hidden, bias=False)
-        self.self_norm = nn.LayerNorm(hidden)
-        self.self_q = nn.Linear(hidden, hidden, bias=False)
-        self.self_k = nn.Linear(hidden, hidden, bias=False)
-        self.self_v = nn.Linear(hidden, hidden, bias=False)
-        self.self_out = nn.Linear(hidden, hidden, bias=False)
+        # Self-attention among the latents lets queries divide work -- and is
+        # also a mixing operator: each query adds a weighted average of all the
+        # others, which pulls them together unless something opposes it. The
+        # JAX resample() this is ported from has no such sublayer, so it is a
+        # switch rather than a fixture: the measured query redundancy (64 slots
+        # spanning 9.5 dimensions instead of 40.7) may be caused by it.
+        self.self_attention = bool(self_attention)
+        if self.self_attention:
+            self.self_norm = nn.LayerNorm(hidden)
+            self.self_q = nn.Linear(hidden, hidden, bias=False)
+            self.self_k = nn.Linear(hidden, hidden, bias=False)
+            self.self_v = nn.Linear(hidden, hidden, bias=False)
+            self.self_out = nn.Linear(hidden, hidden, bias=False)
         self.ffn_norm = nn.LayerNorm(hidden)
         self.ffn = nn.Sequential(
             nn.Linear(hidden, hidden * mlp_ratio),
@@ -109,13 +118,14 @@ class QFormerBlock(nn.Module):
         )
         latents = latents + self.cross_out(self._merge(attended))
 
-        normed = self.self_norm(latents)
-        attended = F.scaled_dot_product_attention(
-            self._split(self.self_q(normed)),
-            self._split(self.self_k(normed)),
-            self._split(self.self_v(normed)),
-        )
-        latents = latents + self.self_out(self._merge(attended))
+        if self.self_attention:
+            normed = self.self_norm(latents)
+            attended = F.scaled_dot_product_attention(
+                self._split(self.self_q(normed)),
+                self._split(self.self_k(normed)),
+                self._split(self.self_v(normed)),
+            )
+            latents = latents + self.self_out(self._merge(attended))
 
         return latents + self.ffn(self.ffn_norm(latents))
 
@@ -135,11 +145,13 @@ class StateQFormer(nn.Module):
         heads: int = 8,
         layers: int = 4,
         modalities: int = 3,
+        self_attention: bool = True,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
         self.output_dim = int(output_dim)
         self.input_dim = int(input_dim)
+        self.self_attention = bool(self_attention)
         self.queries = nn.Parameter(torch.empty(self.num_queries, hidden))
         nn.init.normal_(self.queries, std=0.02)
         self.input_projection = nn.Linear(input_dim, hidden)
@@ -148,7 +160,8 @@ class StateQFormer(nn.Module):
         nn.init.zeros_(self.modality_embedding.weight)
         self.position_encoding = FourierPositionEncoding(hidden)
         self.blocks = nn.ModuleList(
-            QFormerBlock(hidden, heads) for _ in range(layers)
+            QFormerBlock(hidden, heads, self_attention=self.self_attention)
+            for _ in range(layers)
         )
         self.output_projection = nn.Linear(hidden, self.output_dim, bias=False)
         self.output_norm = nn.LayerNorm(self.output_dim)
@@ -215,10 +228,22 @@ class QFormerStateReader(nn.Module):
 
     connector_type = "qwen35_qformer_reader_v1"
 
-    def __init__(self, qformer: StateQFormer, connector: nn.Module) -> None:
+    def __init__(self, qformer: StateQFormer, connector: nn.Module,
+                 retrieval_head: nn.Module | None = None) -> None:
         super().__init__()
         self.qformer = qformer
         self.connector = connector
+        # Optional, and trained jointly when present. It is the same module A1
+        # uses, so the semantic anchor and the retrieval head are one thing:
+        # its attention pooling reduces the slots to a single vector *before*
+        # any cosine, which is what keeps the anchor from asking every slot to
+        # match the same 4096-d target and homogenizing them.
+        self.retrieval_head = retrieval_head
+
+    def project(self, xbar, valid):
+        if self.retrieval_head is None:
+            raise ValueError("this reader was built without a retrieval head")
+        return self.retrieval_head(xbar, valid)
 
     def encode(self, hidden_states, modality_ids, positions, key_mask):
         """-> ``(xbar, valid)``. Every query is always valid, unlike the pooled
