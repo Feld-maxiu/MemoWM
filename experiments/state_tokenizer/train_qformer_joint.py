@@ -93,17 +93,33 @@ class ObservationStore:
 
 
 def spread(states: np.ndarray) -> dict[str, float]:
-    """Report 5.4's monitors: how distinguishable are these states from each other."""
-    flat = states.reshape(len(states), -1)
-    unit = flat / np.maximum(np.linalg.norm(flat, axis=1, keepdims=True), 1e-9)
+    """Report 5.4's monitors: how distinguishable are these states from each other.
+
+    Every quantity is computed **after removing the mean across observations**.
+    Without that, the cosine measures a shared offset rather than collapse and
+    the two representations are not comparable: the pooled xbar is near
+    zero-mean by construction (frozen group/channel normalization) while a
+    learned resampler's output is not. Measured at step 400 the raw cosine read
+    1.0000 for the Q-Former against 0.5739 for the pooling, which looks like
+    total collapse; centred, the same states read 0.0389 against -0.0225, i.e.
+    close to orthogonal in both. ``mean_to_deviation`` is what the raw cosine
+    was actually reporting, kept as its own number -- 251.5 against 1.20 says
+    the informative part is 0.4% of the learned state's magnitude, which is a
+    real pathology but a different one from collapse.
+    """
+    flat = states.reshape(len(states), -1).astype(np.float64)
+    centred = flat - flat.mean(0, keepdims=True)
+    unit = centred / np.maximum(np.linalg.norm(centred, axis=1, keepdims=True), 1e-12)
     gram = unit @ unit.T
     upper = gram[np.triu_indices(len(unit), 1)]
-    singular = np.linalg.svdvals(flat - flat.mean(0, keepdims=True))
+    singular = np.linalg.svdvals(centred)
     share = singular / max(singular.sum(), 1e-12)
     share = share[share > 0]
+    deviation = np.linalg.norm(centred, axis=1).mean()
     return {
         "pairwise_cosine": float(upper.mean()),
         "effective_rank": float(np.exp(-(share * np.log(share)).sum())),
+        "mean_to_deviation": float(np.linalg.norm(flat.mean(0)) / max(deviation, 1e-12)),
     }
 
 
@@ -240,10 +256,12 @@ def main() -> None:
             f"[qformer] step {step:5d}  val CE {validation:.4f}  "
             f"(train CE {totals['ce']/args.accumulate:.4f}, "
             f"KL {totals['kl']/args.accumulate:.4f})  "
-            f"cos {monitors['learned']['pairwise_cosine']:.4f}"
-            f"/{monitors['pooled']['pairwise_cosine']:.4f}  "
+            f"cos {monitors['learned']['pairwise_cosine']:+.4f}"
+            f"/{monitors['pooled']['pairwise_cosine']:+.4f}  "
             f"rank {monitors['learned']['effective_rank']:.1f}"
-            f"/{monitors['pooled']['effective_rank']:.1f}{flag}",
+            f"/{monitors['pooled']['effective_rank']:.1f}  "
+            f"mean/dev {monitors['learned']['mean_to_deviation']:.1f}"
+            f"/{monitors['pooled']['mean_to_deviation']:.1f}{flag}",
             flush=True,
         )
         if validation < best:
