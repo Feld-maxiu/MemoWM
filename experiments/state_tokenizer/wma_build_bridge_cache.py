@@ -42,6 +42,19 @@ def load_sample(xbar_path: Path, teacher_path: Path, arm: str):
         valid = np.stack(
             [np.asarray(z[f"{arm}/valid/{k.rsplit('/', 1)[1]}"], bool) for k in keys]
         )
+        metadata = json.loads(str(np.asarray(z["metadata"])))
+    # The reader trainer reconstructs this text from the latent. It is the same
+    # string the teacher embedded, so it is the WorldMemArena analogue of
+    # browsergym_teacher_text and the two domains train on a matched target.
+    # Note it is a re-serialization of the same content, not the synthetic
+    # AXTree the tokenizer actually consumed -- only that one's length survives.
+    records = metadata.get("records") or []
+    if len(records) != len(xbar):
+        raise ValueError(
+            f"{xbar_path.stem}: {len(records)} records against {len(xbar)} states; "
+            "the metadata is not positionally aligned with the arrays"
+        )
+    target_text = np.asarray([str(record.get("fused_text", "")) for record in records])
     with np.load(teacher_path, allow_pickle=False) as z:
         teacher = np.asarray(z["teacher"], np.float32)
         protocol = str(np.asarray(z["protocol"]))
@@ -52,7 +65,7 @@ def load_sample(xbar_path: Path, teacher_path: Path, arm: str):
             f"{xbar_path.stem}: {len(xbar)} xbar rows against {len(teacher)} teacher rows; "
             "the two passes disagree on the observation set"
         )
-    return xbar, valid, teacher
+    return xbar, valid, teacher, target_text
 
 
 def main() -> None:
@@ -79,12 +92,15 @@ def main() -> None:
     n_val = max(1, int(round(len(stems) * args.validation_fraction)))
     val_stems = {stems[i] for i in order[:n_val]}
 
-    xbars, valids, teachers, splits, sample_ids = [], [], [], [], []
+    xbars, valids, teachers, texts, splits, sample_ids = [], [], [], [], [], []
     for stem in stems:
-        x, v, t = load_sample(xbar_dir / f"{stem}.npz", teacher_dir / f"{stem}.npz", args.arm)
+        x, v, t, target = load_sample(
+            xbar_dir / f"{stem}.npz", teacher_dir / f"{stem}.npz", args.arm
+        )
         xbars.append(x)
         valids.append(v)
         teachers.append(t)
+        texts.append(target)
         tag = "validation" if stem in val_stems else "train"
         splits.extend([tag] * len(x))
         sample_ids.extend([stem] * len(x))
@@ -93,6 +109,11 @@ def main() -> None:
     xbar = np.concatenate(xbars)
     valid = np.concatenate(valids)
     teacher = np.concatenate(teachers)
+    target_text = np.concatenate(texts)
+    empty = int((target_text == "").sum())
+    if empty:
+        print(f"[cache] {empty} rows have no fused_text; the reader trainer will "
+              f"reconstruct an empty string for them")
     split = np.asarray(splits)
     norms = np.linalg.norm(teacher, axis=1)
     if not np.allclose(norms, 1.0, atol=1e-3):
@@ -120,6 +141,7 @@ def main() -> None:
         xbar=xbar,
         valid=valid,
         teacher_fused_embedding=teacher,
+        target_text=target_text,
         split=split,
         sample_id=np.asarray(sample_ids),
         metadata=np.asarray(json.dumps(metadata)),

@@ -1,8 +1,14 @@
-"""Train Input/L16 connectors by BrowserGym observation-text reconstruction.
+"""Train Input/L16 connectors by observation-text reconstruction.
 
-The Qwen3.5-Instruct backbone is frozen. Only the connector is optimized, and
-WorldMemArena data is never read. This is a practical native-reader warm-up;
-retrieval quality remains governed by the independently trained shared head.
+The Qwen3.5-Instruct backbone is frozen; only the connector is optimized.
+Retrieval quality remains governed by the independently trained shared head.
+
+Targets come from the cache's ``target_text`` column when it has one, which is
+what lets a merged cross-domain corpus train the reader: the older path resolves
+text from the BrowserGym jsonl by ``global_index``, and WorldMemArena rows have
+no index into that file. When WorldMemArena rows are present they are from the
+non-evaluation subcategories only -- the `agent/gui/web` split stays out of
+training entirely.
 """
 from __future__ import annotations
 
@@ -58,7 +64,12 @@ def _forward_loss(model, processor, connector, mode, xbar, valid, texts, max_tok
     if mode == "input":
         inputs_embeds = torch.cat((latent.to(text_embeddings.dtype), text_embeddings), 1)
     else:
-        inputs_embeds = torch.cat((torch.zeros_like(latent), text_embeddings), 1)
+        # dtype matters: latent is float32 (_check_latents forces it) while the
+        # embedding table is bf16, and cat() promotes -- the first Linear then
+        # rejects the mixed input. The inference path already casts here.
+        inputs_embeds = torch.cat(
+            (torch.zeros_like(latent, dtype=text_embeddings.dtype), text_embeddings), 1
+        )
         target_layer = model.model.language_model.layers[16]
 
         def replace_prefix(_module, args):
@@ -86,10 +97,28 @@ def train(args: argparse.Namespace) -> dict:
     metadata = cache["metadata"]
     if metadata.get("protocol") != BRIDGE_CACHE_PROTOCOL:
         raise ValueError("reader cache protocol mismatch")
-    records_path = args.records or metadata["records"]
+    # Prefer the text carried by the cache. Resolving it from a jsonl by
+    # global_index only works for caches built from the BrowserGym records:
+    # WorldMemArena rows have no index into that file, and a merged cache fills
+    # theirs with -1, so the lookup raises on every cross-domain corpus.
     with np.load(args.cache, allow_pickle=False) as raw:
-        indices = np.asarray(raw["global_indices"], np.int64)
-    texts = _targets(records_path, indices)
+        carried = np.asarray(raw["target_text"]).astype(str) if "target_text" in raw.files else None
+        indices = (
+            np.asarray(raw["global_indices"], np.int64)
+            if "global_indices" in raw.files else None
+        )
+    if carried is not None and (carried != "").all():
+        texts = carried.tolist()
+        print(f"[reader] targets from the cache's target_text column ({len(texts)} rows)")
+    else:
+        if indices is None:
+            raise ValueError(
+                "cache has neither a usable target_text column nor global_indices; "
+                "rebuild it with a builder that writes target_text"
+            )
+        records_path = args.records or metadata["records"]
+        texts = _targets(records_path, indices)
+        print(f"[reader] targets resolved from {records_path} by global_index")
     sources = (
         [cache["xbar"], cache["a2_xbar"]]
         if args.representation == "both"
@@ -109,6 +138,8 @@ def train(args: argparse.Namespace) -> dict:
     connector.to(device).train()
     optimizer = torch.optim.AdamW(connector.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
+    # The numpy generator only seeds the batch sampler; connector init is torch's.
+    torch.manual_seed(args.seed)
     best, best_step, stale = math.inf, 0, 0
 
     def loss_for(source, rows, training):

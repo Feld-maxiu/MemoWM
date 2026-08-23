@@ -167,8 +167,36 @@ class Layer16Connector(nn.Module):
         return (self.restorer(xbar, valid) + self.adapter(xbar)) * valid[..., None]
 
 
+@dataclasses.dataclass(frozen=True)
+class MemorySegment:
+    """One retrieved row, carried in retrieval-rank order.
+
+    A row has a latent only if it came from the tokenizer -- the observation
+    rows. The round-text rows have none and are handed to the model as text.
+    Both kinds have to reach the reader: on WorldMemArena's web split only 0.30
+    of the ten retrieved rows per question is an observation row and 84% of
+    questions retrieve none at all, so a latent-only reader answers most
+    questions from an empty context.
+    """
+
+    latent: tuple[np.ndarray, np.ndarray] | None = None
+    text: str | None = None
+
+    def __post_init__(self):
+        if (self.latent is None) == (self.text is None):
+            raise ValueError("a memory segment carries either a latent or text, not both")
+
+
+def _as_segment(item) -> MemorySegment:
+    if isinstance(item, MemorySegment):
+        return item
+    if isinstance(item, str):
+        return MemorySegment(text=item)
+    return MemorySegment(latent=item)   # (xbar, valid), the pre-hybrid calling shape
+
+
 class Qwen35LatentReader:
-    """Native Qwen3.5 answer path conditioned on retrieved latent states."""
+    """Native Qwen3.5 answer path conditioned on retrieved memory."""
 
     def __init__(self, model, processor, connector: nn.Module, *, mode: str) -> None:
         if mode not in {"input", "layer16"}:
@@ -178,51 +206,102 @@ class Qwen35LatentReader:
         self.connector = connector
         self.mode = mode
 
+    def _encode_segments(self, segments, device):
+        """Embeddings, attention mask, and latent spans, in rank order.
+
+        Rank order is load-bearing. ``rank_embedding`` is ``(64, 4096)`` and
+        broadcasts the same values over every state, so after concatenation the
+        only thing separating state *i* from state *j* is its RoPE position --
+        reorder the segments and nothing recovers which was retrieved first.
+        """
+        embed = self.model.get_input_embeddings()
+        indices = [n for n, segment in enumerate(segments) if segment.latent is not None]
+        blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        if indices:
+            # One connector call for all of them; it is the only 4096-wide op here.
+            xbar = torch.as_tensor(
+                np.stack([segments[n].latent[0] for n in indices]), device=device
+            )
+            valid = torch.as_tensor(
+                np.stack([segments[n].latent[1] for n in indices]), device=device
+            )
+            with torch.inference_mode():
+                produced = self.connector(xbar, valid)
+            for position, n in enumerate(indices):
+                blocks[n] = (produced[position : position + 1], valid[position : position + 1])
+
+        pieces: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
+        spans: list[tuple[int, int]] = []
+        width = 0
+        for n, segment in enumerate(segments):
+            if segment.latent is not None:
+                block, valid = blocks[n]
+                spans.append((width, width + block.shape[1]))
+                pieces.append(block)
+                masks.append(valid)
+            else:
+                encoded = self.processor.tokenizer(
+                    segment.text, return_tensors="pt", add_special_tokens=False
+                )
+                ids = encoded["input_ids"].to(device)
+                pieces.append(embed(ids))
+                masks.append(encoded["attention_mask"].to(device))
+            width += pieces[-1].shape[1]
+        return pieces, masks, spans
+
     def answer(
         self,
         question: str,
-        states: list[tuple[np.ndarray, np.ndarray]],
+        segments,
         *,
         max_new_tokens: int = 96,
     ) -> str:
-        if not states:
+        segments = [_as_segment(item) for item in segments]
+        if not segments:
             return "Not mentioned in memory."
         device = next(self.model.parameters()).device
-        xbar = torch.as_tensor(np.stack([row[0] for row in states]), device=device)
-        valid = torch.as_tensor(np.stack([row[1] for row in states]), device=device)
-        with torch.inference_mode():
-            latent = self.connector(xbar, valid).reshape(1, -1, 4096)
-        latent_valid = valid.reshape(1, -1)
+        pieces, masks, spans = self._encode_segments(segments, device)
+        dtype = self.model.get_input_embeddings().weight.dtype
+        memory = torch.cat([piece.to(dtype) for piece in pieces], dim=1)
+        memory_mask = torch.cat([mask.to(torch.long) for mask in masks], dim=1)
+
         prompt = (
-            "Answer the question from the retrieved memory-state tokens. Keep the answer concise. "
+            "Answer the question from the retrieved memory. Keep the answer concise. "
             "If absent, say exactly 'Not mentioned in memory.'.\nQuestion: " + question
         )
         encoded = self.processor.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
         input_ids = encoded["input_ids"].to(device)
         attention = encoded["attention_mask"].to(device)
         embeddings = self.model.get_input_embeddings()(input_ids)
-        prefix_len = latent.shape[1]
-        full_attention = torch.cat((latent_valid.to(attention.dtype), attention), dim=1)
+        memory_len = memory.shape[1]
+        full_attention = torch.cat((memory_mask.to(attention.dtype), attention), dim=1)
         hook_handle = None
         if self.mode == "input":
-            inputs_embeds = torch.cat((latent.to(embeddings.dtype), embeddings), dim=1)
+            inputs_embeds = torch.cat((memory, embeddings), dim=1)
         else:
-            # Placeholder embeddings establish positions/cache.  At the input of
-            # layer 17, the first-pass prefix is replaced by restored layer-16
-            # states. Cached single-token decoding passes are left untouched.
-            placeholders = torch.zeros_like(latent, dtype=embeddings.dtype)
-            inputs_embeds = torch.cat((placeholders, embeddings), dim=1)
+            # Placeholders establish positions/cache for the latent spans only;
+            # text spans keep their real embeddings all the way down. At the
+            # input of layer 17 each latent span is replaced by its restored
+            # layer-16 states. Cached single-token passes are left untouched.
+            staged = memory.clone()
+            for start, stop in spans:
+                staged[:, start:stop] = 0
+            inputs_embeds = torch.cat((staged, embeddings), dim=1)
+            replacements = [(start, stop, pieces[n]) for n, (start, stop) in
+                            zip([i for i, s in enumerate(segments) if s.latent is not None], spans)]
             target_layer = self.model.model.language_model.layers[16]
 
-            def replace_prefix(_module, args):
+            def replace_spans(_module, args):
                 hidden = args[0]
-                if hidden.shape[1] < prefix_len:
+                if hidden.shape[1] < memory_len:
                     return None
                 updated = hidden.clone()
-                updated[:, :prefix_len] = latent.to(updated.dtype)
+                for start, stop, block in replacements:
+                    updated[:, start:stop] = block.to(updated.dtype)
                 return (updated, *args[1:])
 
-            hook_handle = target_layer.register_forward_pre_hook(replace_prefix)
+            hook_handle = target_layer.register_forward_pre_hook(replace_spans)
         try:
             with torch.inference_mode():
                 generated = self.model.generate(

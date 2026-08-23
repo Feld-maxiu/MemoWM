@@ -308,6 +308,11 @@ def build(args: argparse.Namespace) -> dict:
         xbar=xbar.astype(np.float32),
         valid=valid.astype(np.bool_),
         teacher_fused_embedding=teacher.astype(np.float32),
+        # What the reader connector reconstructs. Carrying it here rather than
+        # re-walking the records by global_index is what lets a merged
+        # cross-domain cache train the reader at all: WorldMemArena rows have no
+        # global_index into this jsonl, so the lookup raises on them.
+        target_text=np.asarray([browsergym_teacher_text(records[row]) for row in selected]),
         global_indices=np.asarray(global_indices, np.int64),
         split=np.asarray(split_labels),
         metadata=np.asarray(metadata),

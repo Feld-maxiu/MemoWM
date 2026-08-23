@@ -36,6 +36,8 @@ from residualmem.latent.instruct_bridge import (
 )
 
 REQUIRED = ("xbar", "valid", "teacher_fused_embedding", "split")
+# Optional because the caches that predate the reader work do not carry it.
+TARGET_TEXT = "target_text"
 
 
 def load(path: Path) -> tuple[dict[str, np.ndarray], dict]:
@@ -55,6 +57,13 @@ def load(path: Path) -> tuple[dict[str, np.ndarray], dict]:
             np.asarray(data["global_indices"]) if "global_indices" in data.files
             else np.full(len(arrays["xbar"]), -1, np.int64)
         )
+        # The reader trainer reconstructs this. Without it, it falls back to a
+        # global_index lookup into the BrowserGym jsonl -- which no
+        # WorldMemArena row can satisfy, so a merged cache would raise.
+        arrays[TARGET_TEXT] = (
+            np.asarray(data[TARGET_TEXT]).astype(str) if TARGET_TEXT in data.files
+            else np.full(len(arrays["xbar"]), "", dtype=object).astype(str)
+        )
     return arrays, metadata
 
 
@@ -62,6 +71,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", action="append", required=True,
                         help="repeatable; NAME=PATH labels the rows' domain")
+    parser.add_argument("--records",
+                        help="BrowserGym jsonl; fills target_text for rows that lack it "
+                             "but carry a real global_index, so a cache built before the "
+                             "reader work does not have to be rebuilt")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -71,6 +84,33 @@ def main() -> None:
         if not path:
             raise ValueError(f"--cache expects NAME=PATH, got {entry!r}")
         arrays, metadata = load(Path(path))
+        blank = arrays[TARGET_TEXT] == ""
+        if blank.any():
+            resolvable = blank & (arrays["global_indices"] >= 0)
+            if resolvable.any() and args.records:
+                from .build_instruct_bridge_cache import browsergym_teacher_text
+                from .common import iter_jsonl
+
+                by_index = {int(row["global_index"]): row for row in iter_jsonl(args.records)}
+                filled = arrays[TARGET_TEXT].astype(object)
+                for position in np.flatnonzero(resolvable):
+                    record = by_index.get(int(arrays["global_indices"][position]))
+                    if record is not None:
+                        filled[position] = browsergym_teacher_text(record)
+                arrays[TARGET_TEXT] = filled.astype(str)
+                print(f"[merge] {name}: filled {int(resolvable.sum())} target_text "
+                      f"rows from {args.records}", flush=True)
+            elif resolvable.any():
+                raise ValueError(
+                    f"{name} lacks target_text for {int(resolvable.sum())} rows that do "
+                    "carry a global_index; pass --records so they can be resolved"
+                )
+        still_blank = int((arrays[TARGET_TEXT] == "").sum())
+        if still_blank:
+            raise ValueError(
+                f"{name}: {still_blank} rows have no target_text and no way to resolve it; "
+                "the reader trainer would reconstruct empty strings for them"
+            )
         arrays["domain"] = np.full(len(arrays["xbar"]), name, dtype=object)
         parts.append(arrays)
         counts = collections.Counter(arrays["split"].tolist())
@@ -80,7 +120,8 @@ def main() -> None:
 
     merged = {
         key: np.concatenate([part[key] for part in parts])
-        for key in ("xbar", "valid", "teacher_fused_embedding", "split", "global_indices")
+        for key in ("xbar", "valid", "teacher_fused_embedding", "split",
+                    "global_indices", TARGET_TEXT)
     }
     merged["domain"] = np.concatenate([part["domain"] for part in parts]).astype(str)
 
@@ -115,6 +156,7 @@ def main() -> None:
         valid=merged["valid"].astype(bool),
         teacher_fused_embedding=teacher,
         split=merged["split"],
+        target_text=merged[TARGET_TEXT].astype(str),
         global_indices=merged["global_indices"].astype(np.int64),
         domain=merged["domain"],
         metadata=np.asarray(json.dumps(metadata)),
