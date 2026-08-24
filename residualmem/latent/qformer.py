@@ -68,7 +68,7 @@ class QFormerBlock(nn.Module):
     """Pre-norm cross-attention to ``H_t``, self-attention among queries, FFN."""
 
     def __init__(self, hidden: int, heads: int, mlp_ratio: int = 4,
-                 self_attention: bool = True) -> None:
+                 self_attention: bool = False) -> None:
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden {hidden} must be divisible by heads {heads}")
@@ -81,10 +81,12 @@ class QFormerBlock(nn.Module):
         self.cross_out = nn.Linear(hidden, hidden, bias=False)
         # Self-attention among the latents lets queries divide work -- and is
         # also a mixing operator: each query adds a weighted average of all the
-        # others, which pulls them together unless something opposes it. The
-        # JAX resample() this is ported from has no such sublayer, so it is a
-        # switch rather than a fixture: the measured query redundancy (64 slots
-        # spanning 9.5 dimensions instead of 40.7) may be caused by it.
+        # others. Measured at 16 queries, holding everything else fixed, it is
+        # the difference between an effective rank that falls to 4 and stays
+        # there and one that dips to 10 and climbs back to 26, at identical
+        # validation CE. So it costs 16.8M parameters to lose 6x the spread and
+        # buys nothing, and it is off by default. The JAX ``resample()`` this is
+        # ported from has no such sublayer either.
         self.self_attention = bool(self_attention)
         if self.self_attention:
             self.self_norm = nn.LayerNorm(hidden)
@@ -138,14 +140,14 @@ class StateQFormer(nn.Module):
     def __init__(
         self,
         *,
-        num_queries: int = 64,
+        num_queries: int = 16,
         output_dim: int = 512,
         input_dim: int = 4096,
         hidden: int = 1024,
         heads: int = 8,
         layers: int = 4,
         modalities: int = 3,
-        self_attention: bool = True,
+        self_attention: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)

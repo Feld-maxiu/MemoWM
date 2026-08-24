@@ -174,11 +174,11 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--queries", type=int, default=64)
+    parser.add_argument("--queries", type=int, default=16)
     parser.add_argument("--qformer-hidden", type=int, default=1024)
     parser.add_argument("--qformer-heads", type=int, default=8)
     parser.add_argument("--qformer-layers", type=int, default=4)
-    parser.add_argument("--no-self-attention", action="store_true",
+    parser.add_argument("--self-attention", action="store_true",
                         help="drop the latent self-attention sublayer. It lets "
                              "queries divide work but is also a mixing operator "
                              "that pulls them together; the JAX resample() this "
@@ -221,7 +221,7 @@ def main() -> None:
         StateQFormer(
             num_queries=args.queries, hidden=args.qformer_hidden,
             heads=args.qformer_heads, layers=args.qformer_layers,
-            modalities=NUM_MODALITIES, self_attention=not args.no_self_attention,
+            modalities=NUM_MODALITIES, self_attention=args.self_attention,
         ),
         InputSoftTokenConnector(slots=args.queries),
         MaskedAttentionRetrievalHead() if args.sem_weight > 0 else None,
