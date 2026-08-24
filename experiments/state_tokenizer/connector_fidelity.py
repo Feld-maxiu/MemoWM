@@ -181,45 +181,45 @@ class LatentSource:
         return int(self.connector.rank_embedding.shape[0])
 
 
-def answer_with_image(processor, model, question: str, text: str, screenshot: str,
-                      device, max_new_tokens: int = 96) -> str:
-    """What the official pipeline actually hands the reader for this row.
+def answer_with_image(processor, model, question: str, text: str,
+                      screenshot: str | None, device, max_new_tokens: int = 96) -> str:
+    """The chat-template path, with or without the screenshot attached.
 
     ``Qwen3-VL-Embedding-8B-FusedObs-RAG`` sets ``mm_mode: "image"``
-    (``eval_framework/config.yaml:71``), so its reader receives the screenshot
-    base64-inlined alongside the row's text -- 13.1% of its retrieved rows carry
-    an image path. Comparing a latent that encodes the screenshot against the
-    caption text *alone* measures "pixels versus a one-sentence caption", not
-    "a latent versus what the memory would have served". This is the peer.
+    (``eval_framework/config.yaml:71``), so the official reader receives the
+    screenshot base64-inlined next to the row's text. Comparing a latent that
+    encodes the screenshot against the caption alone measures pixels against a
+    caption, not a latent against the memory.
 
-    The prompt is the one ``Qwen35LatentReader.answer`` builds, verbatim, so the
-    only difference between conditions is how the memory arrived.
+    ``screenshot=None`` runs the same wrapper with no image, which is the only
+    way to read the image's contribution: the text and latent conditions use the
+    bare tokenizer the reader was built around, and this one *must* use the chat
+    template to place the image token. Measured, that wrapper is not neutral --
+    templated answers refuse far more often -- so image-versus-no-image is only
+    interpretable inside the template.
 
     ``enable_thinking=False`` matters and is not cosmetic: with the default the
     model spends its whole budget on a reasoning preamble and the answer never
     appears inside ``max_new_tokens``, which the judge then scores as an
-    omission. That is the setting the local answer server uses too
+    omission. That is the setting the answer server uses too
     (``local_openai_server.py:77``).
-
-    One asymmetry that cannot be removed: this condition has to go through the
-    chat template to place the image token, while the text and latent conditions
-    use the bare tokenizer the reader was built around. The instruction string
-    is identical; the wrapper is not.
     """
     prompt = (
         "Answer the question from the retrieved memory. Keep the answer concise. "
         "If absent, say exactly 'Not mentioned in memory.'.\nQuestion: " + question
     )
-    with Image.open(screenshot) as handle:
-        image = handle.convert("RGB")
-    messages = [{"role": "user", "content": [
-        {"type": "image"},
-        {"type": "text", "text": f"{text}\n\n{prompt}"},
-    ]}]
+    content = [{"type": "text", "text": f"{text}\n\n{prompt}"}]
+    images = []
+    if screenshot:
+        with Image.open(screenshot) as handle:
+            images.append(handle.convert("RGB"))
+        content.insert(0, {"type": "image"})
     rendered = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        [{"role": "user", "content": content}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False,
     )
-    inputs = processor(text=[rendered], images=[image], return_tensors="pt").to(device)
+    inputs = processor(text=[rendered], images=images or None,
+                       return_tensors="pt").to(device)
     with torch.no_grad():
         generated = model.generate(**inputs, max_new_tokens=max_new_tokens,
                                    do_sample=False)
@@ -298,13 +298,25 @@ def main() -> None:
         answering = Qwen35LatentReader(model, processor, connector, mode="input")
 
     rows = []
-    conditions_order = ("text", "text+image", "latent")
+    conditions_order = ("text", "text@template", "text+image", "latent", "latent-mismatched")
     labels = {name: collections.Counter() for name in conditions_order}
+    # A latent from a *different* observation, same question. If the latent
+    # condition scores just as well on these, its answers come from the question
+    # and the model's priors rather than from the state -- which would make the
+    # whole comparison meaningless. Drawn once, deterministically, from an
+    # observation in another sample so it cannot be coincidentally relevant.
+    others = np.random.default_rng(args.seed).permutation(len(questions))
     for position, entry in enumerate(questions, 1):
         observation = table[entry["key"]]
+        decoy_key = questions[int(others[position - 1])]["key"]
+        if decoy_key[0] == entry["key"][0]:
+            decoy_key = questions[int(others[(position * 7 + 3) % len(questions)])]["key"]
         answers = {
             "text": answering.answer(
                 entry["question"], [MemorySegment(text=observation.text)]
+            ),
+            "text@template": answer_with_image(
+                processor, model, entry["question"], observation.text, None, device,
             ),
             "text+image": answer_with_image(
                 processor, model, entry["question"], observation.text,
@@ -312,6 +324,9 @@ def main() -> None:
             ),
             "latent": answering.answer(
                 entry["question"], [source.segment(observation)]
+            ),
+            "latent-mismatched": answering.answer(
+                entry["question"], [source.segment(table[decoy_key])]
             ),
         }
         judged = {}
@@ -329,6 +344,7 @@ def main() -> None:
         rows.append({
             **{k: entry[k] for k in ("sample_id", "question", "rank")},
             "memory_id": entry["key"][1],
+            "decoy_memory_id": f"{decoy_key[0]}/{decoy_key[1]}",
             "text_tokens": text_tokens,
             "latent_tokens": source.slots,
             "judged": judged,
@@ -352,19 +368,23 @@ def main() -> None:
     # The image costs roughly 880 tokens on a 1280x720 screenshot; that is the
     # number the latent is actually competing against, not the caption's 87.
     image_tokens = 880
-    print("\n" + "=" * 64)
-    print(f"{'condition':14s}{'Correct':>10s}{'Halluc':>10s}{'Omission':>10s}{'tokens':>12s}")
-    print("-" * 64)
+    print("\n" + "=" * 70)
+    print(f"{'condition':20s}{'Correct':>10s}{'Halluc':>10s}{'Omission':>10s}{'tokens':>12s}")
+    print("-" * 70)
     average_text = float(np.mean([r["text_tokens"] for r in rows]))
-    costs = {"text": average_text, "text+image": average_text + image_tokens,
-             "latent": float(source.slots)}
+    costs = {"text": average_text, "text@template": average_text,
+             "text+image": average_text + image_tokens,
+             "latent": float(source.slots), "latent-mismatched": float(source.slots)}
     for name in conditions_order:
         counter = labels[name]
         total = max(sum(counter.values()), 1)
-        print(f"{name:14s}{counter['Correct'] / total:10.4f}"
+        print(f"{name:20s}{counter['Correct'] / total:10.4f}"
               f"{counter['Hallucination'] / total:10.4f}"
               f"{counter['Omission'] / total:10.4f}{costs[name]:12.1f}")
-    print("=" * 64)
+    print("=" * 70)
+    print("bare tokenizer:  text | latent | latent-mismatched")
+    print("chat template :  text@template | text+image")
+    print("compare only inside a wrapper -- the wrapper is not neutral")
     for reference in ("text", "text+image"):
         answerable = [r for r in rows if r["judged"][reference]["label"] == "Correct"]
         if answerable:
@@ -373,6 +393,11 @@ def main() -> None:
             print(f"{reference} answers {len(answerable)}/{len(rows)}; "
                   f"latent recovers {recovered}/{len(answerable)} = "
                   f"{recovered / len(answerable):.1%} of them")
+    real = labels["latent"]["Correct"]
+    decoy = labels["latent-mismatched"]["Correct"]
+    print(f"\nlatent {real}/{len(rows)} correct against {decoy}/{len(rows)} on a "
+          f"mismatched state: {real - decoy:+d}. Whatever the decoy scores is what "
+          "the question and the model's priors supply without the memory.")
     print(f"wrote {args.output}")
 
 
