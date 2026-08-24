@@ -1,0 +1,136 @@
+"""Does a retrieval head actually retrieve? Measured the way the benchmark asks.
+
+``train_retrieval_bridge`` reports loss, contrastive and cosine, and none of
+those says whether the right row comes back. Its own objective is also easier
+than the task: a batch of 64 drawn from 4,379 rows over 156 samples almost never
+contains two observations from the same session, so the in-batch negatives ask
+"which website is this" -- while WorldMemArena retrieval has to pick round 3
+from round 7 of one session.
+
+That distinction is not hypothetical here. The Q-Former's variance is dominated
+by a few website-identity directions: its effective rank measured over 23
+samples is 7.2 and over 6 samples is 33.8, the opposite of how the fixed pooling
+behaves. A global recall number would look fine and mean nothing.
+
+So the headline is ``same_sample_rank_metrics`` from ``wma_shift_attribution``,
+which ranks each state's own teacher against the *other rows of its own sample*.
+Global recall is reported next to it as a reference, not as the verdict.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from residualmem.latent.instruct_bridge import (
+    RETRIEVAL_BRIDGE_PROTOCOL,
+    MaskedAttentionRetrievalHead,
+    load_bridge,
+)
+
+from .wma_shift_attribution import same_sample_rank_metrics
+
+
+def global_rank_metrics(pred: np.ndarray, teacher: np.ndarray) -> dict:
+    """The easy version, for contrast: rank against every held-out row."""
+    teacher = teacher / np.maximum(np.linalg.norm(teacher, axis=1, keepdims=True), 1e-12)
+    scores = pred @ teacher.T
+    n = len(scores)
+    order = np.argsort(-scores, axis=1)
+    rank = (order == np.arange(n)[:, None]).argmax(axis=1) + 1
+    return {
+        "n_way": n,
+        "recall_at_1": float((rank <= 1).mean()),
+        "recall_at_10": float((rank <= 10).mean()),
+        "chance_recall_at_1": 1.0 / n,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--head", required=True)
+    parser.add_argument("--cache", required=True,
+                        help="must carry sample_id, or same-sample ranking is impossible")
+    parser.add_argument("--split", default="validation")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--output")
+    args = parser.parse_args()
+
+    with np.load(args.cache, allow_pickle=True) as data:
+        if "sample_id" not in data.files:
+            raise ValueError(
+                f"{args.cache} has no sample_id column, so rows cannot be grouped "
+                "by session and only the easy global ranking is available"
+            )
+        keep = data["split"].astype(str) == args.split
+        xbar = np.asarray(data["xbar"], np.float32)[keep]
+        valid = np.asarray(data["valid"], bool)[keep]
+        teacher = np.asarray(data["teacher_fused_embedding"], np.float32)[keep]
+        samples = data["sample_id"].astype(str)[keep]
+        domains = (data["domain"].astype(str)[keep] if "domain" in data.files
+                   else np.full(len(samples), "-"))
+
+    head = MaskedAttentionRetrievalHead()
+    load_bridge(args.head, head, expected_protocol=RETRIEVAL_BRIDGE_PROTOCOL)
+    device = torch.device(args.device)
+    head.to(device).eval()
+    with torch.no_grad():
+        predicted = head(
+            torch.as_tensor(xbar, device=device),
+            torch.as_tensor(valid, device=device),
+        ).float().cpu().numpy()
+
+    # Per sample, then averaged over samples weighted by their row count, so a
+    # 60-round session does not count the same as a 4-round one.
+    per_sample, weights = [], []
+    for name in sorted(set(samples)):
+        rows = samples == name
+        if int(rows.sum()) < 2:
+            continue        # a one-row sample has nothing to rank against
+        per_sample.append(same_sample_rank_metrics(predicted[rows], teacher[rows]))
+        weights.append(int(rows.sum()))
+    if not per_sample:
+        raise ValueError("no sample has two or more rows")
+    total = float(sum(weights))
+    within = {
+        key: float(sum(m[key] * w for m, w in zip(per_sample, weights)) / total)
+        for key in ("recall_at_1", "recall_at_5", "recall_at_10", "mrr",
+                    "chance_recall_at_1", "n_way")
+    }
+
+    report = {
+        "head": str(Path(args.head).resolve()),
+        "cache": str(Path(args.cache).resolve()),
+        "split": args.split,
+        "rows": int(len(xbar)),
+        "samples": len(per_sample),
+        "slots": int(xbar.shape[1]),
+        "within_sample": within,
+        "global": global_rank_metrics(predicted, teacher),
+        "by_domain": {
+            name: global_rank_metrics(predicted[domains == name], teacher[domains == name])
+            for name in sorted(set(domains.tolist())) if (domains == name).sum() > 1
+        } if len(set(domains.tolist())) > 1 else {},
+    }
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(report, indent=2))
+
+    print(f"{Path(args.head).name}  ({report['rows']} rows / {report['samples']} samples, "
+          f"{report['slots']} slots)")
+    w, g = report["within_sample"], report["global"]
+    print(f"  within-sample  R@1 {w['recall_at_1']:.4f}  R@5 {w['recall_at_5']:.4f}  "
+          f"R@10 {w['recall_at_10']:.4f}  MRR {w['mrr']:.4f}"
+          f"   (avg {w['n_way']:.1f}-way, chance R@1 {w['chance_recall_at_1']:.4f})")
+    print(f"  global         R@1 {g['recall_at_1']:.4f}  R@10 {g['recall_at_10']:.4f}"
+          f"   ({g['n_way']}-way, chance {g['chance_recall_at_1']:.5f})  <- reference only")
+    for name, metrics in report["by_domain"].items():
+        print(f"    [{name}] global R@1 {metrics['recall_at_1']:.4f} ({metrics['n_way']}-way)")
+
+
+if __name__ == "__main__":
+    main()

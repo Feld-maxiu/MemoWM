@@ -44,8 +44,11 @@ def load_cache(path: str | Path) -> dict[str, np.ndarray]:
         output = {name: np.asarray(data[name]) for name in required if name != "metadata"}
         metadata["representation"] = representation
         output["metadata"] = metadata
-    if output["xbar"].shape[1:] != (64, 512):
+    if output["xbar"].ndim != 3 or output["xbar"].shape[2] != 512:
         raise ValueError(f"unexpected xbar shape {output['xbar'].shape}")
+    # The slot count is no longer pinned to 64: the head pools over slots and is
+    # count-agnostic, and pinning it here blocked measuring whether 64 is the
+    # right budget. The width is still fixed -- that one is real.
     if output["teacher_fused_embedding"].shape[1:] != (4096,):
         raise ValueError("teacher embedding must be 4096-D")
     return output
