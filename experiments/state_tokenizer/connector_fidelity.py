@@ -181,6 +181,52 @@ class LatentSource:
         return int(self.connector.rank_embedding.shape[0])
 
 
+def answer_with_image(processor, model, question: str, text: str, screenshot: str,
+                      device, max_new_tokens: int = 96) -> str:
+    """What the official pipeline actually hands the reader for this row.
+
+    ``Qwen3-VL-Embedding-8B-FusedObs-RAG`` sets ``mm_mode: "image"``
+    (``eval_framework/config.yaml:71``), so its reader receives the screenshot
+    base64-inlined alongside the row's text -- 13.1% of its retrieved rows carry
+    an image path. Comparing a latent that encodes the screenshot against the
+    caption text *alone* measures "pixels versus a one-sentence caption", not
+    "a latent versus what the memory would have served". This is the peer.
+
+    The prompt is the one ``Qwen35LatentReader.answer`` builds, verbatim, so the
+    only difference between conditions is how the memory arrived.
+
+    ``enable_thinking=False`` matters and is not cosmetic: with the default the
+    model spends its whole budget on a reasoning preamble and the answer never
+    appears inside ``max_new_tokens``, which the judge then scores as an
+    omission. That is the setting the local answer server uses too
+    (``local_openai_server.py:77``).
+
+    One asymmetry that cannot be removed: this condition has to go through the
+    chat template to place the image token, while the text and latent conditions
+    use the bare tokenizer the reader was built around. The instruction string
+    is identical; the wrapper is not.
+    """
+    prompt = (
+        "Answer the question from the retrieved memory. Keep the answer concise. "
+        "If absent, say exactly 'Not mentioned in memory.'.\nQuestion: " + question
+    )
+    with Image.open(screenshot) as handle:
+        image = handle.convert("RGB")
+    messages = [{"role": "user", "content": [
+        {"type": "image"},
+        {"type": "text", "text": f"{text}\n\n{prompt}"},
+    ]}]
+    rendered = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+    inputs = processor(text=[rendered], images=[image], return_tensors="pt").to(device)
+    with torch.no_grad():
+        generated = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                   do_sample=False)
+    trimmed = generated[0][inputs["input_ids"].shape[1]:]
+    return processor.tokenizer.decode(trimmed, skip_special_tokens=True).strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pipeline", required=True, help="pipeline_qa.jsonl from a run")
@@ -252,29 +298,38 @@ def main() -> None:
         answering = Qwen35LatentReader(model, processor, connector, mode="input")
 
     rows = []
-    labels = {"text": collections.Counter(), "latent": collections.Counter()}
+    conditions_order = ("text", "text+image", "latent")
+    labels = {name: collections.Counter() for name in conditions_order}
     for position, entry in enumerate(questions, 1):
         observation = table[entry["key"]]
-        conditions = {
-            "text": MemorySegment(text=observation.text),
-            "latent": source.segment(observation),
+        answers = {
+            "text": answering.answer(
+                entry["question"], [MemorySegment(text=observation.text)]
+            ),
+            "text+image": answer_with_image(
+                processor, model, entry["question"], observation.text,
+                observation.screenshot, device,
+            ),
+            "latent": answering.answer(
+                entry["question"], [source.segment(observation)]
+            ),
         }
         judged = {}
-        for name, segment in conditions.items():
-            answer = answering.answer(entry["question"], [segment])
+        for name in conditions_order:
             verdict = evaluate_qa_llm(
                 entry["question"], entry["gold_answer"],
-                "\n".join(str(x) for x in entry["gold_contents"]), answer,
+                "\n".join(str(x) for x in entry["gold_contents"]), answers[name],
             )
             label = str(verdict.get("evaluation_result", "Omission"))
             labels[name][label] += 1
-            judged[name] = {"answer": answer, "label": label}
+            judged[name] = {"answer": answers[name], "label": label}
+        text_tokens = int(processor.tokenizer(
+            observation.text, return_tensors="pt", add_special_tokens=False
+        )["input_ids"].shape[1])
         rows.append({
             **{k: entry[k] for k in ("sample_id", "question", "rank")},
             "memory_id": entry["key"][1],
-            "text_tokens": int(processor.tokenizer(
-                observation.text, return_tensors="pt", add_special_tokens=False
-            )["input_ids"].shape[1]),
+            "text_tokens": text_tokens,
             "latent_tokens": source.slots,
             "judged": judged,
         })
@@ -282,7 +337,7 @@ def main() -> None:
             print(f"[stageC] {position}/{len(questions)}", flush=True)
 
     report = {
-        "protocol": "connector_fidelity_v2",
+        "protocol": "connector_fidelity_v3",
         "question_set": args.questions,
         "latent_source": "qformer" if args.qformer else "connector",
         "checkpoint": args.qformer or args.connector,
@@ -294,25 +349,30 @@ def main() -> None:
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print("\n" + "=" * 56)
-    print(f"{'condition':12s}{'Correct':>10s}{'Halluc':>10s}{'Omission':>10s}{'tokens':>10s}")
-    print("-" * 56)
-    for name in ("text", "latent"):
+    # The image costs roughly 880 tokens on a 1280x720 screenshot; that is the
+    # number the latent is actually competing against, not the caption's 87.
+    image_tokens = 880
+    print("\n" + "=" * 64)
+    print(f"{'condition':14s}{'Correct':>10s}{'Halluc':>10s}{'Omission':>10s}{'tokens':>12s}")
+    print("-" * 64)
+    average_text = float(np.mean([r["text_tokens"] for r in rows]))
+    costs = {"text": average_text, "text+image": average_text + image_tokens,
+             "latent": float(source.slots)}
+    for name in conditions_order:
         counter = labels[name]
         total = max(sum(counter.values()), 1)
-        cost = (np.mean([r["text_tokens"] for r in rows]) if name == "text"
-                else float(source.slots))
-        print(f"{name:12s}{counter['Correct'] / total:10.4f}"
+        print(f"{name:14s}{counter['Correct'] / total:10.4f}"
               f"{counter['Hallucination'] / total:10.4f}"
-              f"{counter['Omission'] / total:10.4f}{cost:10.1f}")
-    print("=" * 56)
-    # The subset that actually tests fidelity: rows the memory can answer.
-    answerable = [r for r in rows if r["judged"]["text"]["label"] == "Correct"]
-    if answerable:
-        recovered = sum(1 for r in answerable if r["judged"]["latent"]["label"] == "Correct")
-        print(f"text answers {len(answerable)}/{len(rows)}; "
-              f"latent recovers {recovered}/{len(answerable)} = "
-              f"{recovered / len(answerable):.1%} of them")
+              f"{counter['Omission'] / total:10.4f}{costs[name]:12.1f}")
+    print("=" * 64)
+    for reference in ("text", "text+image"):
+        answerable = [r for r in rows if r["judged"][reference]["label"] == "Correct"]
+        if answerable:
+            recovered = sum(1 for r in answerable
+                            if r["judged"]["latent"]["label"] == "Correct")
+            print(f"{reference} answers {len(answerable)}/{len(rows)}; "
+                  f"latent recovers {recovered}/{len(answerable)} = "
+                  f"{recovered / len(answerable):.1%} of them")
     print(f"wrote {args.output}")
 
 
