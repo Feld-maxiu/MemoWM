@@ -215,6 +215,65 @@ def _as_segment(item) -> MemorySegment:
     return MemorySegment(latent=item)   # (xbar, valid), the pre-hybrid calling shape
 
 
+# Copied verbatim from WorldMemArena ``eval_framework/cli.py`` (_ANSWER_SYSTEM_PROMPT
+# and _ANSWER_USER_TEMPLATE). Copied rather than imported because this package must
+# not depend on the benchmark repo; the adapter that bridges the two checks these
+# against the live originals at construction and refuses to run on a mismatch, so a
+# silent divergence is not possible.
+OFFICIAL_ANSWER_SYSTEM_PROMPT = """You are an intelligent memory assistant. Answer the user's question based on the retrieved memories provided.
+
+# Instructions:
+1. Carefully analyze all retrieved memories. Synthesize across multiple entries if a single memory is insufficient.
+2. Pay attention to timestamps. If memories conflict, prioritize the most recent.
+3. Convert relative time references ("last year", "two months ago") into absolute dates based on the memory timestamps. Example: a memory dated 2025-05-04 saying "went to India last year" means the trip was in 2024.
+4. Ground every claim in the retrieved memories. You may use world knowledge only to interpret content already present (e.g. identify a landmark from its description). Do NOT invent missing facts.
+5. If the question asks about an image, return the relevant image_id(s) found in the memory captions (e.g. "S04_img_4"). When multiple apply, list them comma-separated.
+6. Keep answers concise — a single short phrase or under 15 words. No introductory filler like "The answer is".
+7. Only if the retrieved memories truly contain NO information relevant to the question, reply exactly: "Not mentioned in memory."
+
+# Approach (think step by step before answering):
+1. Identify which memories are relevant to the question.
+2. Examine their timestamps and content.
+3. Synthesize across multiple memories if needed.
+4. Perform any required calculation (e.g. relative → absolute time).
+5. Formulate a precise, concise answer grounded in the evidence.
+
+Always respond in the requested JSON format."""
+
+
+OFFICIAL_ANSWER_USER_TEMPLATE = """Retrieved memories:
+{context}
+
+Question: {question}
+
+Respond in JSON:
+{{
+  "answer": "your concise answer (or exactly 'Not mentioned in memory.' only if truly absent)"
+}}"""
+
+
+def _parse_official_answer(raw: str) -> str:
+    """Pull ``answer`` out of the JSON the official prompt asks for.
+
+    Falls back to the raw text rather than raising: a malformed generation
+    should be scored as whatever the model actually said, not crash the run or
+    silently become an omission.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    start, stop = text.find("{"), text.rfind("}")
+    if start != -1 and stop > start:
+        try:
+            parsed = json.loads(text[start:stop + 1])
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, dict) and "answer" in parsed:
+                return str(parsed["answer"]).strip()
+    return text
+
+
 class Qwen35LatentReader:
     """Native Qwen3.5 answer path conditioned on retrieved memory."""
 
@@ -275,8 +334,39 @@ class Qwen35LatentReader:
         question: str,
         segments,
         *,
-        max_new_tokens: int = 96,
+        max_new_tokens: int = 512,
+        enable_thinking: bool = False,
+        system_prompt: str = OFFICIAL_ANSWER_SYSTEM_PROMPT,
+        user_template: str = OFFICIAL_ANSWER_USER_TEMPLATE,
     ) -> str:
+        """Answer under the *official* prompt, chat template and JSON contract.
+
+        The first version of this wrote its own twenty-word prompt with a bare
+        tokenizer, and that is not a defensible deviation: the latent memory
+        cannot travel through a chat-completions API, which forces the
+        generation to run locally, but it does not force a different prompt.
+        Measured, the differences line up with exactly how this arm failed --
+        its QA-Omission was 12.5 points above the raw-text arm while its
+        hallucination was the lowest of any arm, which is what "If absent, say
+        exactly ..." produces against the official "*Only if* the retrieved
+        memories truly contain NO information relevant". The official rule 5,
+        answering image questions with an ``image_id``, was missing outright.
+        Any QA number produced before this alignment is not comparable to the
+        official arms.
+
+        Screenshots stay out. In this arm the screenshot *is* the latent, so
+        inlining it as well would deliver the same observation twice and there
+        would be no compression claim left to make.
+
+        ``enable_thinking`` is off and the budget is 512 rather than 96 for the
+        same alignment reason. Qwen3.5 reasons before answering unless the chat
+        template says otherwise, and the official arms reach it through
+        ``local_openai_server``, which turns thinking off for the plain model id
+        and reserves the ``-think`` alias for the other case. Left on, the model
+        spends the whole budget narrating its approach and never emits the JSON
+        -- measured, exactly that: 96 tokens of "Thinking Process:" and no
+        answer.
+        """
         segments = [_as_segment(item) for item in segments]
         if not segments:
             return "Not mentioned in memory."
@@ -286,19 +376,42 @@ class Qwen35LatentReader:
         memory = torch.cat([piece.to(dtype) for piece in pieces], dim=1)
         memory_mask = torch.cat([mask.to(torch.long) for mask in masks], dim=1)
 
-        prompt = (
-            "Answer the question from the retrieved memory. Keep the answer concise. "
-            "If absent, say exactly 'Not mentioned in memory.'.\nQuestion: " + question
+        # Render the official template, then split it where the retrieved
+        # memories go so the latent block lands in that exact position with the
+        # system prompt and generation prefix intact around it.
+        sentinel = "\x00RETRIEVED_MEMORY\x00"
+        rendered = self.processor.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_template.format(
+                    context=sentinel, question=question)},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking,
         )
-        encoded = self.processor.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-        input_ids = encoded["input_ids"].to(device)
-        attention = encoded["attention_mask"].to(device)
-        embeddings = self.model.get_input_embeddings()(input_ids)
-        memory_len = memory.shape[1]
-        full_attention = torch.cat((memory_mask.to(attention.dtype), attention), dim=1)
+        if rendered.count(sentinel) != 1:
+            raise ValueError("the chat template did not preserve the context slot")
+        head, tail = rendered.split(sentinel)
+        embed = self.model.get_input_embeddings()
+
+        def encode(text: str):
+            ids = self.processor.tokenizer(
+                text, return_tensors="pt", add_special_tokens=False
+            )["input_ids"].to(device)
+            return embed(ids), torch.ones_like(ids)
+
+        prefix, prefix_mask = encode(head)
+        suffix, suffix_mask = encode(tail)
+        offset = prefix.shape[1]
+        spans = [(start + offset, stop + offset) for start, stop in spans]
+        memory_len = offset + memory.shape[1]
+        full_attention = torch.cat(
+            (prefix_mask, memory_mask.to(prefix_mask.dtype), suffix_mask), dim=1
+        )
         hook_handle = None
         if self.mode == "input":
-            inputs_embeds = torch.cat((memory, embeddings), dim=1)
+            inputs_embeds = torch.cat((prefix, memory, suffix), dim=1)
         else:
             # Placeholders establish positions/cache for the latent spans only;
             # text spans keep their real embeddings all the way down. At the
@@ -306,8 +419,8 @@ class Qwen35LatentReader:
             # layer-16 states. Cached single-token passes are left untouched.
             staged = memory.clone()
             for start, stop in spans:
-                staged[:, start:stop] = 0
-            inputs_embeds = torch.cat((staged, embeddings), dim=1)
+                staged[:, start - offset:stop - offset] = 0
+            inputs_embeds = torch.cat((prefix, staged, suffix), dim=1)
             replacements = [(start, stop, pieces[n]) for n, (start, stop) in
                             zip([i for i, s in enumerate(segments) if s.latent is not None], spans)]
             target_layer = self.model.model.language_model.layers[16]
@@ -333,7 +446,8 @@ class Qwen35LatentReader:
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
-        return self.processor.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+        raw = self.processor.tokenizer.decode(generated[0], skip_special_tokens=True).strip()
+        return _parse_official_answer(raw)
 
 
 class TorchA2Reconstructor(nn.Module):

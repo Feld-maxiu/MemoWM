@@ -31,6 +31,19 @@ student's memory is 64 soft tokens and the teacher's is variable-length text, so
 a real batch means aligning an answer span across two different paddings -- the
 same class of bug as the KL reduction this file's loss was just fixed for. The
 accumulated version reuses the single-sample forward unchanged and costs ~7%.
+
+``L_sem`` is the exception, and has to be. Its first version was
+``1 - cos(project(xbar), teacher)`` computed inside the micro-batch, which at
+batch 1 has no negative to contrast against -- an InfoNCE term written there
+would have been *identically* zero, since cross-entropy of a single logit
+against label 0 is zero. Cosine alone only asks the state to point at its
+teacher, and teachers point at each other too: measured, that projection scored
+0.8199 against its own teacher and 0.6491 against everyone else's, a gap of
+0.17, and reached R@1 of 0.045. So the term now runs as its own step with its
+own batch drawn from ONE session, which is the discrimination WorldMemArena
+actually asks for. The QA path keeps micro-batch 1 and keeps its
+observation-uniform sampler, so an improvement is attributable to the new loss
+rather than to session-correlated QA gradients.
 """
 from __future__ import annotations
 
@@ -59,6 +72,7 @@ from residualmem.latent.qformer import (
 
 from .extract_qwen import _load_model
 from .reader_losses import answer_ce_and_distill_kl
+from .train_retrieval_bridge import symmetric_infonce
 from .trunk_states import NUM_MODALITIES, collate, trunk_states
 
 PAIRS_PROTOCOL = "wma_qformer_qa_v1"
@@ -179,17 +193,41 @@ def main() -> None:
     parser.add_argument("--qformer-heads", type=int, default=8)
     parser.add_argument("--qformer-layers", type=int, default=4)
     parser.add_argument("--self-attention", action="store_true",
-                        help="drop the latent self-attention sublayer. It lets "
+                        help="ADD a latent self-attention sublayer (off by default). It lets "
                              "queries divide work but is also a mixing operator "
                              "that pulls them together; the JAX resample() this "
-                             "is ported from has none")
+                             "is ported from has none, and enabling it collapsed the "
+                             "queries to rank 4 at identical CE")
     parser.add_argument("--teacher-dir",
                         help="fused-observation teacher embeddings, enabling L_sem")
     parser.add_argument("--sem-weight", type=float, default=0.0,
-                        help="weight on 1 - cos(pool(xbar), teacher). The anchor "
-                             "against representation collapse: the answer losses "
-                             "need very little information, so nothing else stops "
-                             "the states from becoming interchangeable")
+                        help="weight on the same-session contrastive term. The "
+                             "anchor against representation collapse: the answer "
+                             "losses need very little information, so nothing "
+                             "else stops the states from becoming interchangeable")
+    parser.add_argument("--sem-mode", choices=("same-session", "cosine"),
+                        default="same-session",
+                        help="'cosine' reproduces the original term exactly: "
+                             "1 - cos(project(xbar), teacher) inside each QA "
+                             "micro-batch, where batch 1 leaves no negative. It "
+                             "is kept only so the same-session variant has a "
+                             "control run from this same script -- reverting the "
+                             "file to get one would vary more than the objective")
+    parser.add_argument("--sem-batch", type=int, default=4,
+                        help="observations drawn from ONE session per step for "
+                             "L_sem. This batch is sampled independently of the "
+                             "QA path so the two changes stay separable")
+    parser.add_argument("--sem-extra-negatives", type=int, default=-1,
+                        help="extra same-session teachers used as negatives on "
+                             "top of the batch. They are free -- the teachers "
+                             "are frozen and already cached, only the students "
+                             "cost a resampler forward -- so the default -1 "
+                             "means 'all of them'. 0 reproduces the run that "
+                             "tied the two counts together and had 3 negatives")
+    parser.add_argument("--sem-temperature", type=float, default=0.05,
+                        help="matches train_retrieval_bridge, so the jointly "
+                             "trained projection and the separately trained head "
+                             "optimize the same objective")
     parser.add_argument("--layer", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--accumulate", type=int, default=8,
@@ -254,6 +292,20 @@ def main() -> None:
 
     train_groups = grouped(np.flatnonzero(split == "train"))
     val_groups = grouped(np.flatnonzero(split == "validation"))
+
+    # L_sem's own index: session -> its train observations. Only sessions with
+    # two or more qualify, since a batch of one has no negative and the InfoNCE
+    # term would be identically zero -- which is exactly the defect this
+    # replaces. The QA sampler above is untouched.
+    by_session: dict[str, set] = collections.defaultdict(set)
+    for row in np.flatnonzero(split == "train"):
+        by_session[str(pairs["sample_id"][row])].add(int(pairs["record_index"][row]))
+    sem_sessions = [
+        (name, np.asarray(sorted(indices)))
+        for name, indices in sorted(by_session.items()) if len(indices) >= 2
+    ]
+    if args.sem_weight > 0 and not sem_sessions:
+        raise ValueError("no training session has two observations, so L_sem has no negatives")
     picker = np.random.default_rng(args.seed + 1)
     chosen_val = (
         val_groups if len(val_groups) <= args.validation_observations
@@ -266,6 +318,19 @@ def main() -> None:
           f"{len(chosen_val)} scored per eval", flush=True)
     print(f"[qformer] {trainable/1e6:.1f}M trainable, {args.queries} queries, "
           f"accumulate {args.accumulate}, distill weight {args.distill_weight}", flush=True)
+    if args.sem_weight > 0 and args.sem_mode == "same-session":
+        sizes = np.asarray([len(indices) for _, indices in sem_sessions])
+        pool = (sizes if args.sem_extra_negatives < 0
+                else np.minimum(sizes, args.sem_batch + args.sem_extra_negatives))
+        print(f"[qformer] L_sem weight {args.sem_weight}, batch {args.sem_batch} drawn from "
+              f"one of {len(sem_sessions)} sessions ({sizes.min()}-{sizes.max()} observations "
+              f"each, {int((sizes >= args.sem_batch).sum())} can fill the batch), "
+              f"temperature {args.sem_temperature}, "
+              f"{pool.mean() - 1:.1f} negatives on average "
+              f"(extra_negatives={args.sem_extra_negatives})", flush=True)
+    elif args.sem_weight > 0:
+        print(f"[qformer] L_sem weight {args.sem_weight}, mode cosine: one teacher per QA "
+              f"micro-batch, no negatives (the control)", flush=True)
 
     def latents_for(row: int):
         sample_id = str(pairs["sample_id"][row])
@@ -289,19 +354,86 @@ def main() -> None:
             max_answer_tokens=args.max_answer_tokens, weight=weight,
         )
         sem = 0.0
-        if sem_weight > 0 and teachers is not None:
+        if sem_weight > 0:
+            # --sem-mode cosine only. Pool the slots to one vector first, then
+            # compare; asking each slot to match the 4096-d target separately is
+            # what homogenizes them. There is no negative here -- that is the
+            # defect this mode exists to be the control for.
             target = torch.as_tensor(
                 teachers.get(sample_id, index, record.get("image_ids") or []),
                 dtype=torch.float32, device=device,
             )[None]
-            # Pool the slots to one vector *first*, then compare. Asking each
-            # slot to match the 4096-d target separately is what homogenizes
-            # them; the head's attention pooling is the pooling.
             projected = joint.project(xbar, valid)
             sem_loss = (1.0 - F.cosine_similarity(projected, F.normalize(target, dim=-1))).mean()
             loss = loss + sem_weight * sem_loss
             sem = float(sem_loss)
         return loss, ce, kl, sem, xbar
+
+    def sem_step(sem_weight: float) -> float:
+        """One same-session contrastive step, sampled independently of the QA path.
+
+        Two things are deliberate here. The batch is drawn from a *single*
+        session, because the negatives that matter are the ones WorldMemArena
+        retrieval faces -- round 3 against round 7 of one session, not one
+        website against another. And it is drawn independently of the QA
+        sampler, which stays observation-uniform: bundling "QA microbatches
+        become session-correlated" into the same run would make an improvement
+        unattributable between the new loss and the new sampling.
+
+        The QA path still backpropagates one observation at a time, so the
+        answer-span alignment that forced micro-batch 1 is untouched. This runs
+        its own forward: ``soft`` feeds a backward *through the frozen 9B*, and
+        retaining that graph across the accumulation loop would hold B copies of
+        it. Re-running the resampler costs 79M instead, two orders of magnitude
+        less, and the trunk states it consumes are ``no_grad`` either way.
+        """
+        session, indices = sem_sessions[int(rng.integers(len(sem_sessions)))]
+        chosen = rng.choice(indices, size=min(args.sem_batch, len(indices)), replace=False)
+        states, targets = [], []
+        for index in chosen:
+            record = store.observation(session, int(index))
+            with Image.open(record["screenshot"]) as handle:
+                image = handle.convert("RGB")
+            states.append(trunk_states(
+                processor, model, image, record["synthetic_axtree"],
+                layer=args.layer, device=device,
+            ))
+            targets.append(teachers.get(session, int(index), record.get("image_ids") or []))
+        # Every *other* observation of this session is a negative that costs
+        # nothing: the students must go through the resampler, but the teachers
+        # are frozen, precomputed, and already resident (TeacherStore caches the
+        # whole sample's array on first touch). Tying the two counts together at
+        # sem_batch left the term with three negatives when ~24 more were
+        # sitting in memory, and they are the negatives the benchmark poses --
+        # other rounds of the same session.
+        extra = [int(i) for i in indices if int(i) not in set(int(c) for c in chosen)]
+        if args.sem_extra_negatives >= 0:
+            extra = extra[: args.sem_extra_negatives] if args.sem_extra_negatives else []
+        extra_targets = [teachers.get(session, i, []) for i in extra]
+        xbar, valid = joint.encode(*collate(states))
+        student = joint.project(xbar, valid)
+        target = F.normalize(torch.as_tensor(
+            np.stack(targets), dtype=torch.float32, device=device), dim=-1)
+        # Strictly a superset of what train_retrieval_bridge does: the
+        # student->teacher direction gets the extra same-session teachers as
+        # additional negatives, while the teacher->student direction and the
+        # cosine stay on the square block, unchanged. Keeping the square block
+        # intact is what makes the two objectives comparable rather than merely
+        # similar; only teachers with a student in this batch can name one.
+        loss = symmetric_infonce(student, target, args.sem_temperature)
+        if extra_targets:
+            negatives = F.normalize(torch.as_tensor(
+                np.stack(extra_targets), dtype=torch.float32, device=device), dim=-1)
+            logits = student @ torch.cat([target, negatives]).T / args.sem_temperature
+            labels = torch.arange(len(student), device=device)
+            forward = F.cross_entropy(logits, labels)
+            backward = F.cross_entropy(
+                (student @ target.T / args.sem_temperature).T, labels
+            )
+            loss = 0.5 * (forward + backward)
+        loss = loss + (1.0 - (student * target).sum(-1)).mean()
+        (sem_weight * loss).backward()
+        return float(loss)
 
     best, best_step, stale, history = math.inf, 0, 0, []
     for step in range(1, args.max_steps + 1):
@@ -310,14 +442,20 @@ def main() -> None:
         totals = collections.Counter()
         for _ in range(args.accumulate):
             # Uniform over observations, then uniform over that observation's
-            # questions -- P(o) = 1/N, q ~ Q(o).
+            # questions -- P(o) = 1/N, q ~ Q(o). Identical in both sem modes.
             group = train_groups[int(rng.integers(len(train_groups)))]
             row = int(rng.choice(group))
-            loss, ce, kl, sem, _ = loss_for(row, args.distill_weight, args.sem_weight)
+            loss, ce, kl, sem, _ = loss_for(
+                row, args.distill_weight,
+                args.sem_weight if args.sem_mode == "cosine" else 0.0,
+            )
             (loss / args.accumulate).backward()
             totals["ce"] += ce
             totals["kl"] += kl
-            totals["sem"] += sem
+            if args.sem_mode == "cosine":
+                totals["sem"] += sem / args.accumulate
+        if args.sem_weight > 0 and args.sem_mode == "same-session":
+            totals["sem"] += sem_step(args.sem_weight)
         torch.nn.utils.clip_grad_norm_(joint.parameters(), args.clip_norm)
         optimizer.step()
 
@@ -353,6 +491,9 @@ def main() -> None:
             "step": step, "validation_answer_ce": validation,
             "train_ce": totals["ce"] / args.accumulate,
             "train_kl": totals["kl"] / args.accumulate,
+            # One draw per step, not one per micro-batch: L_sem has its own
+            # sampler and its own batch, so dividing by accumulate would be wrong.
+            "train_sem": totals["sem"],
             "monitors": monitors, "collapse_regressed": regressed,
         })
         flag = "  COLLAPSE-REGRESSED" if regressed else ""
@@ -360,7 +501,7 @@ def main() -> None:
             f"[qformer] step {step:5d}  val CE {validation:.4f}  "
             f"(train CE {totals['ce']/args.accumulate:.4f}, "
             f"KL {totals['kl']/args.accumulate:.4f}, "
-            f"sem {totals['sem']/args.accumulate:.4f})  "
+            f"sem {totals['sem']:.4f})  "
             f"cos {monitors['learned']['pairwise_cosine']:+.4f}"
             f"/{monitors['pooled']['pairwise_cosine']:+.4f}  "
             f"rank {monitors['learned']['effective_rank']:.1f}"
@@ -386,9 +527,20 @@ def main() -> None:
                 break
 
     report = {
-        "protocol": QFORMER_PROTOCOL, "objective": "answer_ce+distill_kl",
+        "protocol": QFORMER_PROTOCOL,
+        # Spelled out rather than a bare "answer_ce+distill_kl": the previous
+        # run's report recorded neither the sem weight nor its form, so which
+        # L_sem it used could not be recovered from the artifact afterwards.
+        "objective": ("answer_ce+distill_kl" if args.sem_weight <= 0 else
+                      f"answer_ce+distill_kl+sem[{args.sem_mode}]"),
         "queries": args.queries, "distill_weight": args.distill_weight,
         "accumulate": args.accumulate, "best_step": best_step,
+        "sem_mode": args.sem_mode,
+        "sem_weight": args.sem_weight, "sem_batch": args.sem_batch,
+        "sem_extra_negatives": args.sem_extra_negatives,
+        "sem_temperature": args.sem_temperature,
+        "sem_sessions": len(sem_sessions) if args.sem_weight > 0 else 0,
+        "learning_rate": args.learning_rate, "seed": args.seed,
         "best_validation_answer_ce": best, "pairs_metadata": metadata,
         "history": history,
     }
