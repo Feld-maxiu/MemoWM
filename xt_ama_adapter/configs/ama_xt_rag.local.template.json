@@ -1,0 +1,18 @@
+{
+  "top_k": 5,
+  "runtime": {
+    "residualmem_root": "/home/luzheng/workspace/iclr/czs/residual-mem",
+    "qwen35_model_path": "/home/luzheng/workspace/iclr/czs/residual-mem/models/Qwen3.5-9B",
+    "qformer_checkpoint": "/home/luzheng/workspace/iclr/czs/residual-mem/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/qformer-K16-nosa.pt",
+    "retrieval_head_checkpoint": "/home/luzheng/workspace/iclr/czs/residual-mem/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/retrieval-head-qformer-wma.pt",
+    "query_model_path": "/home/luzheng/workspace/iclr/czs/residual-mem/models/Qwen3-VL-Embedding-8B",
+    "device": "cpu",
+    "queries": 16,
+    "qformer_hidden": 1024,
+    "qformer_heads": 8,
+    "qformer_layers": 4,
+    "self_attention": false,
+    "layer": 16,
+    "max_length": 8192
+  }
+}
