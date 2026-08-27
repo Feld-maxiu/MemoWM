@@ -319,14 +319,23 @@ def main() -> None:
                              "run died; --init-from a bad checkpoint makes it "
                              "static and repeatable")
     parser.add_argument("--drop-microbatches", action=argparse.BooleanOptionalAction,
-                        default=True,
+                        default=False,
                         help="test each micro-batch's gradient on its own and "
                              "drop only the offending one, instead of discarding "
-                             "the whole step. On the w=1.0 arm 2.1% of rows were "
-                             "pathological and they cost 13% of steps; dropping "
-                             "per micro-batch turns that into 2.1% of samples. "
-                             "--no-drop-microbatches restores the old behaviour "
-                             "for a like-for-like comparison")
+                             "the whole step. OFF by default because it killed "
+                             "both K32c arms: --microbatch-max-norm below cannot "
+                             "be set from the bulk of the norm distribution. "
+                             "Sweeps on identical weights, x accumulate: a fresh "
+                             "model sits at median 158 / p99 971, and the K32b "
+                             "run that trained to 9000 steps and produced the "
+                             "best model so far sits at median 8.6 with p90 "
+                             "2.4e15 and 29.5%% of rows above 1e3. That tail is "
+                             "intrinsic and harmless -- clip_grad_norm_ "
+                             "renormalizes, so a raw 8 and a raw 1e15 apply the "
+                             "same update. Dropping the tail instead removed a "
+                             "third of every batch, and the K32c median moved "
+                             "from 8.6 to 6e4: the guard degraded the weights it "
+                             "was protecting, and the drop rate ran away")
     parser.add_argument("--microbatch-max-norm", type=float, default=1e3,
                         help="gradient norm above which a micro-batch is "
                              "dropped. Not redundant with a finiteness test: two "
@@ -938,6 +947,38 @@ def main() -> None:
                 verdict(found["row"])["finite"] for _ in range(args.sweep_repeats)
             ]
         stable = sum(1 for votes in repeats.values() if not any(votes))
+
+        # The abort message said 51 steps lost every micro-batch; it did not say
+        # whether those gradients were infinite or merely large, and the two
+        # imply opposite fixes. A finite 1e4 is something the old code clipped
+        # to 5.0 and stepped on without complaint, so if the drops are finite
+        # the guard is removing healthy training rather than a pathology.
+        # Training tests the norm unscaled while ``verdict`` backwards through
+        # ``/accumulate``; without the factor below the threshold looks four
+        # times further away than it is.
+        scale = float(args.accumulate)
+        final = [
+            (found["after_obs"] if "after_obs" in found else found["after_qa"]) * scale
+            for found in checked
+        ]
+        finite = sorted(value for value in final if math.isfinite(value))
+        non_finite = len(final) - len(finite)
+        over = [value for value in finite if value > args.microbatch_max_norm]
+
+        def quantile(fraction: float) -> float | None:
+            if not finite:
+                return None
+            return finite[min(len(finite) - 1, int(fraction * len(finite)))]
+
+        print(f"\n[sweep] micro-batch norm as training sees it (x{scale:g}), "
+              f"threshold {args.microbatch_max_norm:g}:")
+        print(f"    non-finite              {non_finite}/{len(final)} "
+              f"({100 * non_finite / max(len(final), 1):.1f}%)")
+        print(f"    finite but over         {len(over)}/{len(final)} "
+              f"({100 * len(over) / max(len(final), 1):.1f}%)")
+        if finite:
+            print(f"    median {quantile(0.5):.4g}  p90 {quantile(0.9):.4g}  "
+                  f"p99 {quantile(0.99):.4g}  max(finite) {finite[-1]:.4g}")
         report_path = Path(args.output).with_suffix(".sweep.json")
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps({
@@ -947,6 +988,14 @@ def main() -> None:
             "rate": len(offenders) / max(len(checked), 1),
             "reproduced_every_repeat": stable,
             "sweep_repeats": args.sweep_repeats,
+            "microbatch_max_norm": args.microbatch_max_norm,
+            "norm_scale_to_training": scale,
+            "norm_non_finite": non_finite,
+            "norm_finite_over_threshold": len(over),
+            "norm_quantiles": {
+                "p50": quantile(0.5), "p90": quantile(0.9),
+                "p99": quantile(0.99), "max": finite[-1] if finite else None,
+            },
             "obs_weight": args.obs_weight,
             "distill_weight": args.distill_weight,
             "offenders": offenders,
@@ -987,6 +1036,22 @@ def main() -> None:
               f"{args.microbatch_max_norm:g} "
               f"({sum(b.numel() for b in accumulator) * 4 / 2**20:.0f} MB buffer)",
               flush=True)
+
+    # Whether a micro-batch backwards scaled depends on which path restores the
+    # mean afterwards. With the guard on, ``.grad`` is emptied and tested after
+    # every micro-batch and ``buffer / kept`` takes the mean at the end, so the
+    # backward must be unscaled -- dividing by a fixed ``accumulate`` there
+    # would quietly shrink every step that dropped something. With the guard off
+    # nothing divides at the end, so the backward has to carry the 1/accumulate
+    # itself or the four micro-batches arrive as a *sum*. That is not a harmless
+    # rescale: L_sem backwards once per step into the same ``.grad`` and is not
+    # part of the sum, so leaving it out multiplied CE+KL+obs by 4 relative to
+    # L_sem. clip_grad_norm_ renormalizes the total and cannot restore an
+    # internal proportion. Both K32d arms ran 1.1h with an effective sem weight
+    # of 0.25 before this was caught: at step 250 their effective rank was 8.6
+    # against K32b's 20.2 on the same seed, which is exactly the spread L_sem
+    # exists to hold up.
+    microbatch_scale = 1.0 if accumulator is not None else 1.0 / args.accumulate
 
     def microbatch_norm() -> float:
         """Total norm of the gradient currently in ``.grad``, in float64.
@@ -1044,32 +1109,30 @@ def main() -> None:
                 args.sem_weight if args.sem_mode == "cosine" else 0.0,
             )
             # Unscaled: the mean is taken at the end over the micro-batches that
-            # survived, not over the ones that were drawn. Dividing by a fixed
-            # ``accumulate`` here would quietly shrink every step that dropped
-            # something, which is a learning-rate cut applied exactly to the
-            # batches containing the pathological rows.
-            loss.backward()
+            # survived, not over the ones that were drawn. See
+            # ``microbatch_scale`` above for why that is 1.0 with the guard on
+            # and 1/accumulate with it off.
+            (loss * microbatch_scale).backward()
             if args.locate_nonfinite:
                 after_qa = grad_norm_now()
                 if not math.isfinite(after_qa):
                     print(f"[qformer] step {step:5d}  NON-FINITE after CE+KL_q  "
                           f"({after_qa}); {drawn[-1]}", flush=True)
             if args.obs_weight > 0:
-                obs_value = obs_step(row, args.obs_weight, 1.0)
+                obs_value = obs_step(row, args.obs_weight, microbatch_scale)
                 if args.locate_nonfinite:
                     after_obs = grad_norm_now()
                     if math.isfinite(after_qa) and not math.isfinite(after_obs):
                         print(f"[qformer] step {step:5d}  NON-FINITE after L_obs  "
                               f"({after_obs}); {drawn[-1]}", flush=True)
             if accumulator is not None:
-                # Drop the micro-batch, not the step. 2.1% of rows produce a
-                # gradient 13 orders of magnitude above the rest; under the old
-                # guard one of them discarded all four micro-batches, which cost
-                # 13% of steps on the w=1.0 arm. The magnitude test is not
-                # redundant with the finiteness test: two of the offenders
-                # measured 1.85e19 and 1.9e15, both *finite*, and a finite 1e19
-                # survives clipping to take the entire step budget in its own
-                # direction while annihilating the other micro-batches to 1e-26.
+                # Kept for diagnosis, off by default. The reasoning that put it
+                # on -- "2.1% of rows are pathological, drop those instead of
+                # the step" -- read the bulk of the norm distribution as the
+                # whole of it. The bulk is 7.6-83; the same sweep also has p90
+                # at 2.4e15 and 29.5% of rows above 1e3, so a threshold placed
+                # above the bulk discards a third of every batch. See the
+                # --drop-microbatches help for the four-way sweep.
                 norm = microbatch_norm()
                 if math.isfinite(norm) and norm <= args.microbatch_max_norm:
                     for buffer, parameter in zip(accumulator, joint.parameters()):
@@ -1267,8 +1330,22 @@ def main() -> None:
                         )))
                     mismatch_soft, mismatch_valid = soft, valid_o
         validation = float(np.mean(losses))
-        gap = (float(np.mean(held_out_mismatched)) - float(np.mean(held_out[:-1]))
-               if held_out_mismatched else None)
+        # held_out_mismatched[j] pairs latent_j against teacher_{j+1}, so it
+        # covers teachers 1..n-1. The matched mean has to cover the same
+        # teachers or the difference is not paired. [:-1] took teachers 0..n-2,
+        # which dropped the one hard observation at the end of the probe set
+        # from the matched side while leaving it on the mismatched side -- the
+        # validation set is fixed, so it was the same observation every eval of
+        # every run, matched ~2.59 against a typical 1.41. That inflated the
+        # printed gap by ~1.18/24 nats: over 59 logged evals it exceeded the
+        # honest mismatched-minus-matched difference 59 times, median +0.0436
+        # against -0.0080. Trends survived (the offset is near constant) but the
+        # level did not, and .gapbest.pt was selected on it.
+        # observation_kl_precheck.py:262-277 pairs cyclically, n against n, and
+        # was never affected -- the numbers in the results table come from there.
+        matched_paired = float(np.mean(held_out[1:])) if len(held_out) > 1 else None
+        gap = (float(np.mean(held_out_mismatched)) - matched_paired
+               if held_out_mismatched and matched_paired is not None else None)
         # Same observations, both representations -- the comparison is paired.
         monitors = {"learned": spread(np.stack(learned)),
                     "pooled": spread(np.stack(pooled))}
@@ -1297,10 +1374,9 @@ def main() -> None:
             f"KL {totals['kl']/args.accumulate:.4f}, "
             f"sem {totals['sem']:.4f}, obs {totals['obs']:.4f})  "
             + (f"headmin {head_norm['min']:.4f}  " if "min" in head_norm else "")
-            + (f"P4 {np.mean(held_out):.4f}" if held_out else "")
-            + (f"/{np.mean(held_out_mismatched):.4f} gap "
-               f"{np.mean(held_out_mismatched) - np.mean(held_out[:-1]):+.4f}  "
-               if held_out_mismatched else "  " if held_out else "")
+            + (f"P4 {matched_paired:.4f}/{np.mean(held_out_mismatched):.4f} "
+               f"gap {gap:+.4f}  " if gap is not None
+               else f"P4 {np.mean(held_out):.4f}  " if held_out else "")
             + f"cos {monitors['learned']['pairwise_cosine']:+.4f}"
             f"/{monitors['pooled']['pairwise_cosine']:+.4f}  "
             f"rank {monitors['learned']['effective_rank']:.1f}"
