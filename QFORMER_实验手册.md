@@ -176,8 +176,8 @@ done; wait
 用现成的 `outputs/logs/p1/run-arm.sh`（`$1` = obs 权重，`$2` = 卡号）：
 
 ```bash
-nohup bash outputs/logs/p1/run-arm.sh 0.5 0 > outputs/logs/p1/k32d-obs0.5.log 2>&1 &
-nohup bash outputs/logs/p1/run-arm.sh 1.0 2 > outputs/logs/p1/k32d-obs1.0.log 2>&1 &
+nohup bash outputs/logs/p1/run-arm.sh 0.5 0 > outputs/logs/p1/k32e-obs0.5.log 2>&1 &
+nohup bash outputs/logs/p1/run-arm.sh 1.0 2 > outputs/logs/p1/k32e-obs1.0.log 2>&1 &
 ```
 
 展开后的完整命令：
@@ -186,8 +186,8 @@ nohup bash outputs/logs/p1/run-arm.sh 1.0 2 > outputs/logs/p1/k32d-obs1.0.log 2>
 python -u -m experiments.state_tokenizer.train_qformer_joint \
   --pairs "$D/qformer-qa-pairs.npz" --xbar-dir "$D/wma-xbar-fitcorpus-axtree" \
   --teacher-dir "$D/wma-teacher-fitcorpus" --teacher-cache "$D/wma-observation-teacher" \
-  --model models/Qwen3.5-9B --output "$D/qformer-K32d-obs${W}.pt" --device "cuda:$2" \
-  --queries 32 --qformer-layers 4 --accumulate 4 \
+  --model models/Qwen3.5-9B --output "$D/qformer-K32e-obs${W}.pt" --device "cuda:$2" \
+  --queries 32 --qformer-layers 4 --accumulate 4 --qk-norm \
   --distill-weight 0.3 --distill-teacher observation --obs-weight "$W" \
   --sem-weight 1.0 --sem-mode same-session --sem-batch 4 --sem-extra-negatives 0 \
   --learning-rate 1e-4 --clip-norm 5.0 --seed 35 --no-drop-microbatches \
@@ -202,15 +202,16 @@ python -u -m experiments.state_tokenizer.train_qformer_joint \
 
 | 参数 | 值 | 为什么 |
 |---|---|---|
+| `--qk-norm` | **开** | 根因修复，消除梯度病态，见 §6.1 |
 | `--no-drop-microbatches` | 关 | 开了会杀死训练，见 §6.1 |
 | `--min-lr-fraction 0.25` | | 学习率地板，防冻结，见 §6.2 |
 | `--lr-recover-steps 10` | | 干净 10 步涨回一档 |
-| `--clip-norm 5.0` | | **梯度范数会到 1e15，这是正常的**，见 §6.1 |
+| `--clip-norm 5.0` | | QK-norm 之后梯度中位 1.73，**裁剪基本不再触发**，见 §6.1 |
 | `--seed 35` | | 全部历史 run 都用它，改了就没法比 |
 
 ### 4.3 下游评测
 
-训完一条臂之后四步，`{CKPT}` 是 `qformer-K32d-obs0.5.pt` 这类：
+训完一条臂之后四步，`{CKPT}` 是 `qformer-K32e-obs0.5.pt` 这类：
 
 **① 抽状态缓存**（`--queries` 默认 16，**必须改成 32**）
 
@@ -323,7 +324,45 @@ python -u -m eval_framework.cli \
 
 这一节是本文最值钱的部分。每一条都真实地烧掉过至少一整轮实验。
 
-### 6.1 ☠️ 梯度范数会到 1e15，**这是正常的，别去掐它**
+### 6.1 ☠️ 梯度范数会到 1e15 —— 根因已找到（2026-08-27）
+
+**结论先说：这是 cross-attention 打分路径缺少 QK-norm 造成的，`--qk-norm` 能完全消除它。**
+
+同一份 checkpoint、同样 1000 行、只切换那一个开关：
+
+```
+             非有限        >1e3        median      p90        p99        max
+无 QK-norm  20 (2.0%)  295 (29.5%)     8.558   2.374e15  4.144e19  8.406e19
+有 QK-norm   0 (0.0%)    0 (0.0%)      1.73    3.363     8.364     14.86
+```
+
+**19 个数量级的重尾整体消失。** 定位链条：反向钩子测出梯度到 latent 是 ~1e-3、到 context 是
+1e13–inf，**16 个数量级出现在 Q-Former 的四层内部而不是任何损失项里**；范围限于
+`blocks.0` 的 `cross_q`/`cross_k`、queries 和输入侧，`blocks 1-3` 正常；`cross_v` 从不出现
+（它的梯度是 `p^T @ grad_out`，`p` 是概率分布，天然有界）——所以爆炸在 softmax 雅可比那一侧。
+
+实现是**参数无关**的：`state_dict` 键不变（58 个），历史 checkpoint 开关任意都能加载，
+所以上面那个对比是**同一个权重向量**的受控比较，不是两个模型。
+
+**这也解释了为什么之前所有努力都无效**：调 `w_o`、换 teacher、加微批守卫、调学习率，
+全都在故障层之上一层使劲。
+
+⚠️ **「`w_o=0.5` 不稳定」是噪声，别信。** 十条臂里 0.0 到 2.0 每个权重都既活过也死过；
+`k32-obs1.0` 在 532 步最早死，而 `k32-obs0.5` 干净跑到 2250。
+
+被逐一证伪的（每条都是量出来的，不是论证出来的）：fp16 teacher 缓存、massive
+activations（offender 与干净行的 trunk `|max|` 都是 73）、LayerNorm 的 `1/std`
+（最小方差 0.0971 vs 0.1002）、Fourier 位置编码（范数恒为 22.627，与下标无关）、
+`modality_embedding`（全部 checkpoint 0.07–0.61，**从不发散的臂反而最大**）。
+
+**两个要盯的代价**，都还没有结论：
+
+1. 中位梯度 8.56 → 1.73，累积后低于 `--clip-norm 5.0`，**裁剪基本不再触发**——
+   有效步长从恒定 `5.0×lr` 变成约 `2×lr`。250 步 val CE 明显变差就是这里。
+2. logits 被限幅在 `±sqrt(128) ≈ 11.3`，**限制注意力能有多尖锐**。对 32 个 query
+   覆盖 ~2800 token，这是真实约束，不是白拿的。用 val CE 和 gap 检验。
+
+#### 6.1.1 历史：在 QK-norm 之前，我曾经试图直接掐掉这条尾巴（失败）
 
 同一把工具在四个状态下量的逐微批梯度范数（口径已折算到训练所见）：
 
@@ -343,7 +382,7 @@ python -u -m eval_framework.cli \
 - 中位数从 8.56 被推到 6e4，**守卫弄坏了它要保护的权重**
 - w=1.0 在 805 步、w=0.5 在 1746 步双双中止
 
-**`--drop-microbatches` 现在默认为 False，别打开。** 正确的做法就是 `clip_grad_norm_` + 非有限跳步，K32b 已经验证过。
+**`--drop-microbatches` 现在默认为 False，别打开。** 这段留在这里是因为它示范了一个反复出现的错误：**在故障层之上一层做补偿**。真正的修法是 `--qk-norm`，它让这张表里的整条重尾从源头消失，阈值和守卫都变得无关紧要。
 
 ### 6.2 ☠️ 学习率衰减会把 run 冻死
 
@@ -466,21 +505,25 @@ v12 gapbest vs v6               p=5.39e-07   ***
 **在跑**（2026-08-27 起，约 13 小时）：
 
 ```
-K32d w=0.5  → GPU 0   outputs/logs/p1/k32d-obs0.5.log
-K32d w=1.0  → GPU 2   outputs/logs/p1/k32d-obs1.0.log
+K32e w=0.5  → GPU 0   outputs/logs/p1/k32e-obs0.5.log
+K32e w=1.0  → GPU 2   outputs/logs/p1/k32e-obs1.0.log
 ```
 
-守卫关闭、GradScaler 完整逻辑。
+**`--qk-norm` 开**，守卫关闭，GradScaler 完整逻辑（后两者在 QK-norm 下应当是惰性的）。
 
-**验证点（很重要，已经抓到过一个 bug）**：K32d w=1.0 与 K32b w=1.0 同 seed 同配置，而 K32b 首次跳步在 1833 步，所以 **250–1750 步的七次 eval 应当重现 K32b**：
+**要盯的三件事**，按重要性：
 
-```
-K32b w=1.0  step 250   val CE 2.0684   headmin 12.0433   rank 20.2
-```
+1. **跳步数应当接近 0。** 这是 QK-norm 的直接预测。上一轮同配置无 QK-norm 时，
+   w=0.5 在 1383 步已跳 289 次、w=1.0 跳 38 次。`grep -c 'non-finite gradient'`。
+2. **250 步的 val CE 不应明显差于上一轮**（w=0.5 `2.0677` / w=1.0 `2.0564`）。
+   若明显更差，原因大概率是有效步长从 `5.0×lr` 掉到约 `2×lr`（§6.1 代价 1），
+   对策是调低 `--clip-norm` 让裁剪重新生效，而不是调 `--learning-rate`。
+3. **能不能跑过 4000 步。** K32b 在 4000 步早停，best_step 1750、val CE 1.9527——
+   那不是收敛，是 1911 步冻结之后的余温。K=16 两条臂跑到 8000/8750、val CE 到
+   1.72–1.76。**跑过 4000 步且 val CE 明显低于 1.9527，才算冻结问题真的解决了。**
 
-（`train CE` / `KL` 会差 4 倍，那是汇总口径从"求和"改成"除以 kept"；`gap` 口径也已改，见 §6.3。**看 `val CE` / `headmin` / `rank`。**）
-
-第一次 K32d 尝试在这里就没通过——`rank` 读到 8.6 而不是 20.2，`headmin` 却对得上（12.0431 vs 12.0433，说明初始权重是同一个）。顺着这个差异找到了 §6.4 的缩放 bug。**这个对照点值得每次重写训练循环之后都跑一遍。**
+⚠️ **不要指望它逐位重现 K32b**：QK-norm 改了前向，这是不同的模型类。
+历史对照关系要在论文里重新说明。
 
 **待办**：
 
