@@ -318,6 +318,20 @@ def main() -> None:
                              "failure to happen live and lost the state when the "
                              "run died; --init-from a bad checkpoint makes it "
                              "static and repeatable")
+    parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="RMS-normalize q and k over the head dimension "
+                             "before the cross-attention dot product. "
+                             "Parameter-free, so it adds nothing to the "
+                             "state_dict and any checkpoint can be loaded with "
+                             "it on or off -- which is the point: --init-from a "
+                             "trained checkpoint and --sweep-nonfinite it twice "
+                             "to test whether the score path is the amplifier. "
+                             "The gradient arriving at the latents is ~1e-3 and "
+                             "the gradient leaving into the context is 1e13-inf, "
+                             "so 16 orders of magnitude appear inside the four "
+                             "blocks; the blow-up is confined to blocks.0's "
+                             "cross_q/cross_k and never touches cross_v")
     parser.add_argument("--drop-microbatches", action=argparse.BooleanOptionalAction,
                         default=False,
                         help="test each micro-batch's gradient on its own and "
@@ -435,6 +449,7 @@ def main() -> None:
             num_queries=args.queries, hidden=args.qformer_hidden,
             heads=args.qformer_heads, layers=args.qformer_layers,
             modalities=NUM_MODALITIES, self_attention=args.self_attention,
+            qk_norm=args.qk_norm,
         ),
         InputSoftTokenConnector(slots=args.queries),
         MaskedAttentionRetrievalHead() if args.sem_weight > 0 else None,

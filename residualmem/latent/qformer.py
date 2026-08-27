@@ -68,7 +68,7 @@ class QFormerBlock(nn.Module):
     """Pre-norm cross-attention to ``H_t``, self-attention among queries, FFN."""
 
     def __init__(self, hidden: int, heads: int, mlp_ratio: int = 4,
-                 self_attention: bool = False) -> None:
+                 self_attention: bool = False, qk_norm: bool = False) -> None:
         super().__init__()
         if hidden % heads:
             raise ValueError(f"hidden {hidden} must be divisible by heads {heads}")
@@ -88,6 +88,28 @@ class QFormerBlock(nn.Module):
         # buys nothing, and it is off by default. The JAX ``resample()`` this is
         # ported from has no such sublayer either.
         self.self_attention = bool(self_attention)
+        # Parameter-free RMS norm on q and k before the dot product. Off by
+        # default and deliberately parameter-free: it adds nothing to the
+        # state_dict, so every checkpoint trained without it still loads and the
+        # same weights can be swept with it on and off.
+        #
+        # It exists because the amplification is localized and nothing else
+        # explains it. Backward hooks put the gradient arriving at the latents
+        # at ~1e-3 and the gradient leaving into the context at 1e13-inf: 16
+        # orders of magnitude appear inside these four blocks, not in any loss
+        # term, which is why every attempt to fix this by reweighting the
+        # objective failed. It is confined to blocks.0's cross_q/cross_k, the
+        # queries and the input side; blocks 1-3 are normal and cross_v never
+        # appears -- its gradient is p^T @ grad_out with p a probability
+        # distribution, so it cannot amplify, which places the blow-up on the
+        # softmax jacobian side. Falsified on the way here: fp16 teacher cache,
+        # massive trunk activations (|max| 73 on offenders and clean rows
+        # alike), LayerNorm's 1/std (min variance 0.0971 vs 0.1002), the
+        # position encoding (norm is a constant 22.627, independent of index),
+        # the modality embedding (0.07-0.61 across every checkpoint, largest on
+        # the arms that never diverged), and any dependence on the observation
+        # weight (all ten arms have both survived and died).
+        self.qk_norm = bool(qk_norm)
         if self.self_attention:
             self.self_norm = nn.LayerNorm(hidden)
             self.self_q = nn.Linear(hidden, hidden, bias=False)
@@ -109,11 +131,18 @@ class QFormerBlock(nn.Module):
         batch, _, length, _ = value.shape
         return value.transpose(1, 2).reshape(batch, length, self.heads * self.head_dim)
 
+    def _scores(self, value: torch.Tensor) -> torch.Tensor:
+        """RMS-normalize a split q or k over the head dimension, if enabled."""
+        if not self.qk_norm:
+            return value
+        scale = torch.rsqrt(value.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+        return (value.float() * scale).to(value.dtype)
+
     def forward(self, latents, context, key_mask):
         normed = self.cross_norm(latents)
         attended = F.scaled_dot_product_attention(
-            self._split(self.cross_q(normed)),
-            self._split(self.cross_k(context)),
+            self._scores(self._split(self.cross_q(normed))),
+            self._scores(self._split(self.cross_k(context))),
             self._split(self.cross_v(context)),
             # (batch, 1, 1, tokens): broadcasts over heads and queries.
             attn_mask=key_mask[:, None, None, :],
@@ -123,8 +152,8 @@ class QFormerBlock(nn.Module):
         if self.self_attention:
             normed = self.self_norm(latents)
             attended = F.scaled_dot_product_attention(
-                self._split(self.self_q(normed)),
-                self._split(self.self_k(normed)),
+                self._scores(self._split(self.self_q(normed))),
+                self._scores(self._split(self.self_k(normed))),
                 self._split(self.self_v(normed)),
             )
             latents = latents + self.self_out(self._merge(attended))
@@ -148,12 +177,14 @@ class StateQFormer(nn.Module):
         layers: int = 4,
         modalities: int = 3,
         self_attention: bool = False,
+        qk_norm: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = int(num_queries)
         self.output_dim = int(output_dim)
         self.input_dim = int(input_dim)
         self.self_attention = bool(self_attention)
+        self.qk_norm = bool(qk_norm)
         self.queries = nn.Parameter(torch.empty(self.num_queries, hidden))
         nn.init.normal_(self.queries, std=0.02)
         self.input_projection = nn.Linear(input_dim, hidden)
@@ -162,7 +193,8 @@ class StateQFormer(nn.Module):
         nn.init.zeros_(self.modality_embedding.weight)
         self.position_encoding = FourierPositionEncoding(hidden)
         self.blocks = nn.ModuleList(
-            QFormerBlock(hidden, heads, self_attention=self.self_attention)
+            QFormerBlock(hidden, heads, self_attention=self.self_attention,
+                         qk_norm=self.qk_norm)
             for _ in range(layers)
         )
         self.output_projection = nn.Linear(hidden, self.output_dim, bias=False)
