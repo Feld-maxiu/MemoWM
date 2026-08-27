@@ -1,9 +1,11 @@
 # WMA-RAG 线工作日志
 
 WorldMemArena 检索/QA 线的施工记录。世界模型线（bits/transition）见
-`WORLD_MODEL_WORKLOG.md`；tokenizer 本体的历史见 `STATE_TOKENIZER_WORKLOG.md`；
-交接与坐标树规矩见 `TOKENIZER_WM_HANDOVER.md`；诊断结论的正式版见
-`WORLDMEMARENA_TOKENIZER_RAG.md`（本文件是过程记录，那里是结论）。
+`WORLD_MODEL_WORKLOG.md`；当前 Q-Former 线见 `QFORMER_实验手册.md`。
+tokenizer 本体的历史、移植交接与本线的结论文档（`STATE_TOKENIZER_WORKLOG.md`、
+`TOKENIZER_WM_HANDOVER.md`、`WORLDMEMARENA_TOKENIZER_RAG.md`）记录的方法已作废，
+于 2026-08-27 移出，全文见 `git show aa9e5a7:<文件名>`；仍在服役的 PCA 基底口径与
+slot layout 规矩已抄入 `QFORMER_实验手册.md` 附录 A。
 
 ---
 

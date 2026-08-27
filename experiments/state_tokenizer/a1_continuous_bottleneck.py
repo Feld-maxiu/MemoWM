@@ -55,7 +55,8 @@ from .common import iter_jsonl, sha256_file, write_json
 from .slot_layout import KEY64_LAYOUT
 
 FORMAT_VERSION = 1
-# A0 slot-key reference on the same 64 train states (STATE_TOKENIZER_WORKLOG.md).
+# A0 slot-key reference on the same 64 train states (that worklog was removed
+# 2026-08-27; see `git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md`).
 A0_SLOTKEY_MSE = 8.27e-5
 A0_SLOTKEY_R2 = 0.999918
 A0_SLOTKEY_RAW_RMSE = 0.00751
@@ -447,7 +448,8 @@ def quality_gates(args, selection_metrics: dict, train_metrics: dict) -> dict:
 def run(args: argparse.Namespace) -> dict:
     if len(args.stage_steps) != len(args.stage_learning_rates):
         raise ValueError("stage-steps and stage-learning-rates must have equal length")
-    # Numerics protocol (STATE_TOKENIZER_WORKLOG.md §0): TF32 costs A1 ~20% of its
+    # Numerics protocol (`git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md` §0; the file
+    # was removed 2026-08-27): TF32 costs A1 ~20% of its
     # reconstruction error and makes results batch-order sensitive at the ~1%
     # level, which is the same order as the capacity effects under test.
     jax.config.update("jax_default_matmul_precision", args.matmul_precision)

@@ -1,7 +1,8 @@
 # ResidualMem v8 离散 World Model 实验日志
 
 > 本文件记录冻结 v8 tokenizer 之后的 World Model 实验。tokenizer 的训练与
-> A1/A2 率失真结果见 `STATE_TOKENIZER_WORKLOG.md`；运行环境见 `README.md`。
+> A1/A2 率失真结果随 `STATE_TOKENIZER_WORKLOG.md` 于 2026-08-27 移出（方法作废），
+> 见 `git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md`；运行环境见 `README.md`。
 >
 > **第一轮（§0–§6）已被第二轮大幅推翻**，此处只保留仍然有效的定义、协议与基线
 > 数值；第一轮的假设讨论、门控决策与「可写入报告的结论」已删除，其结论见 §7 与

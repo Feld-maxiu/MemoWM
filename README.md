@@ -4,7 +4,7 @@ ResidualMem 是一个面向 GUI/Web 与交互轨迹的外部记忆方法原型�
 
 完整实验结论见：
 
-- `STATE_TOKENIZER_WORKLOG.md`
+- `QFORMER_实验手册.md`（当前 Q-Former 线：怎么跑、坑在哪、数字能说什么）
 - `WORLD_MODEL_WORKLOG.md`
 - `技术报告_ResidualMem.md`
 
@@ -22,7 +22,7 @@ test 未打开，且不存在 test freeze manifest。
 
 ## 当前方法状态
 
-**冻结状态：v8 / AXTree / `(32,16,16,0)` / 10 万状态。** 详细过程与判据见 `STATE_TOKENIZER_WORKLOG.md`，下一步计划见 `WORLD_MODEL_WORKLOG.md`。
+**冻结状态：v8 / AXTree / `(32,16,16,0)` / 10 万状态。** 该状态属于已作废的固定池化路线；其过程与判据随 `STATE_TOKENIZER_WORKLOG.md` 于 2026-08-27 移出，全文见 `git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md`。当前路线见 `QFORMER_实验手册.md`。
 
 Qwen 的输入是**三个模态**：
 
@@ -381,7 +381,7 @@ outputs/a0_slot_reconstruction_slotkey/comparison_all.json
 
 ### A1-Wide 结构控制（N=64, d_e=512，无标量压缩）
 
-数值协议：matmul precision `highest`、FP32 activations、FP64 host 指标累加、固定 eval batch 与 device（见 `STATE_TOKENIZER_WORKLOG.md` §0）。A0 Slot-key 已在同协议下重训作为锚点。
+数值协议：matmul precision `highest`、FP32 activations、FP64 host 指标累加、固定 eval batch 与 device（该协议对 jax 侧的 A1/A2 生效，两者均已作废；见 `git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md` §0）。A0 Slot-key 已在同协议下重训作为锚点。
 
 ```text
 Natural MSE: 5.13e-5          (A0 Slot-key 同协议 6.84e-5 的 0.75×)

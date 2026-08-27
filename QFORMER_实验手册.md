@@ -493,3 +493,58 @@ K32b w=1.0  step 250   val CE 2.0684   headmin 12.0433   rank 20.2
 **可选提速**（未做）：`latents_for` 每个微批都重跑一次 trunk 前向，而 trunk 是冻结模型对固定输入的确定性函数，9000 步 × 4 微批分摊到 2741 条观察上**每条被重复编码约 13 次**。缓存下来数值完全等价，约 31 GB 磁盘，估计快 1.5–2 倍。需要改代码 + 预计算 + 重启，**不要在信任度要紧的 run 跑着的时候做**。
 
 （`flash-linear-attention` / `causal-conv1d` 没装，Qwen3.5 的门控 delta rule 层在跑纯 PyTorch 回退。装上会更快，但**换核就换数值**，会毁掉与历史 run 的逐位对照。不推荐。）
+
+---
+
+## 附录 A：从已删文档抢救出来的两件事
+
+2026-08-27 删掉了 `STATE_TOKENIZER_WORKLOG.md` / `TOKENIZER_WM_HANDOVER.md` /
+`WORLDMEMARENA_TOKENIZER_RAG.md`——它们记录的方法（A1/A2 bottleneck、world model、
+固定池化时代的检索协议、jax 侧的数值协议）已经作废。**全文仍在 git history 里**：
+
+```bash
+git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md
+git show aa9e5a7:TOKENIZER_WM_HANDOVER.md
+git show aa9e5a7:WORLDMEMARENA_TOKENIZER_RAG.md
+```
+
+下面两件事当时还在服役，所以抄过来。
+
+### A.1 PCA / normalization 基底的拟合口径
+
+`wma_extract_xbar.py:309-310` 把 `--pca` 和 `--normalization` 声明为 **required**，
+当前训练输入 `wma-xbar-fitcorpus-axtree` 就是用它们抽的：
+
+```
+outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca.npz               8.5 MB
+outputs/state_tokenizer/v9-instruct-pca20k-balanced/key64-static-pca-normalization.npz  27 KB
+```
+
+拟合口径（换数据集或换 AXTree 风格需要重拟合时照这个来）：
+
+- **只在 train split 上拟合**——`key64_pca fit` 与 `fit_normalization` 都硬性过滤，不是约定
+- **PCA**：2 万 train 状态，4096 → 512
+- **normalization**：group×channel，70,018 train 状态。三个真实组的 scale 分别为
+  image 0.151–4.054、detail 0.278–6.288、context 0.074–2.166，**比值 85.3**
+- 零宽 prompt 组允许存在但 sigma 被钳到下限，是永不被索引的哑值；加载器只对
+  「有槽却无有效数据」的组报错
+
+⚠️ **换了 `--axtree-style` 就换了 H16，一个风格下拟合的 PCA 不是另一个风格的合法基底**
+（`wma_extract_xbar.py:321-322`）。
+
+### A.2 slot layout 的单一来源
+
+layout 曾经被硬编码在**五处**：`fit_normalization`、`rebuild_static_key64` 的清单、
+`a0`、`a1`、两个 bottleneck 的默认值。prompt 槽回收之后它们**全都继续按
+`(32,12,16,4)` 切分**，归一化把 detail 的后 4 个槽当成 prompt 统计，报告了 4890 个
+「有效 prompt 槽」——**一个异常都没抛**。
+
+现在单一来源是 `experiments/state_tokenizer/slot_layout.py`（**无第三方依赖**，torch 与
+jax 两侧都能 import；`key_pooling` 再导出它以保持既有引用）。目前仍有 12 个文件依赖它。
+
+`residualmem` 不得 import `experiments`，所以两侧一致性由
+`tests/state_tokenizer/test_slot_layout.py` 断言——**该测试刻意不 import torch 或 jax**，
+两个解释器下都能跑。
+
+（相关的硬约束：抽取管线只有 torch、bottleneck 只有 jax、采集只有 playwright，三者互不可
+导入。跨环境共享的常量必须放在无第三方依赖的模块里。）

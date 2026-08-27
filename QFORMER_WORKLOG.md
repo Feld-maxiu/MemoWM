@@ -1,7 +1,9 @@
 # Q-Former 状态 tokenizer 工作日志
 
-> 承接 `WMA_RAG_WORKLOG.md`（记到 Phase 3 reader connector）。结论沉淀在
-> `WORLDMEMARENA_TOKENIZER_RAG.md`；这里记过程、实现与被推翻的判断。
+> 承接 `WMA_RAG_WORKLOG.md`（记到 Phase 3 reader connector）。这里记过程、实现与被推翻的判断；
+> 供他人上手的运行手册见 `QFORMER_实验手册.md`。旧的结论文档
+> `WORLDMEMARENA_TOKENIZER_RAG.md` 已于 2026-08-27 移出（方法作废），
+> 全文见 `git show aa9e5a7:WORLDMEMARENA_TOKENIZER_RAG.md`。
 >
 > 2026-08-23 起，末次更新 2026-08-25
 
