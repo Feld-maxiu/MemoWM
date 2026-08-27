@@ -109,6 +109,42 @@ def logits_over(model, embed, prefix_embeds, prefix_mask, probe_ids, continuatio
     return out.logits[:, -length - 1 : -1].float()
 
 
+def continuation_overlap(continuations, tokenizer):
+    """How much of the target is boilerplate rather than observation content.
+
+    The gap between matched and mismatched KL is an average over every position
+    of the teacher's continuation. If most of those positions are a house style
+    the model uses for any screen -- "The screen shows a web page with..." --
+    then the content-bearing positions are a small minority and the mean is
+    diluted by the rest. A small gap would then say nothing about how much the
+    latent encodes; it would say the target is mostly boilerplate.
+
+    Measured two ways, both over token ids so no tokenizer round-trip is
+    involved: the fraction of each continuation's tokens that also appear in a
+    *different observation's* continuation, and the length of the common prefix
+    between consecutive pairs.
+    """
+    ids = [c[0].tolist() for c in continuations]
+    shared, prefixes = [], []
+    for i, own in enumerate(ids):
+        other = ids[(i + 1) % len(ids)]
+        shared.append(len(set(own) & set(other)) / max(len(set(own)), 1))
+        common = 0
+        for a, b in zip(own, other):
+            if a != b:
+                break
+            common += 1
+        prefixes.append(common)
+    distinct = [len(set(c)) / max(len(c), 1) for c in ids]
+    return {
+        "median_token_overlap_with_other_observation": statistics.median(shared),
+        "median_distinct_token_ratio": statistics.median(distinct),
+        "median_common_prefix_tokens": statistics.median(prefixes),
+        "max_common_prefix_tokens": max(prefixes),
+        "median_length": statistics.median(len(c) for c in ids),
+    }
+
+
 def per_position_kl(student_logits, teacher_logits):
     """KL(teacher || student) at each position, in nats. No reduction."""
     student = F.log_softmax(student_logits, -1)
@@ -119,8 +155,17 @@ def per_position_kl(student_logits, teacher_logits):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--xbar-dir", required=True)
-    parser.add_argument("--checkpoint", required=True, help="a joint Q-Former checkpoint")
+    parser.add_argument("--checkpoint", help="a joint Q-Former checkpoint")
+    parser.add_argument("--pooling-connector",
+                        help="score the fixed pooling's 64 slots instead of a "
+                             "resampler. Its xbar is already cached in the "
+                             "extraction, so only the connector runs. Neither "
+                             "representation was ever trained on this objective, "
+                             "so a larger gap here isolates slot budget from "
+                             "everything else")
     parser.add_argument("--model", required=True)
+    parser.add_argument("--queries", type=int, default=16,
+                        help="query count of the --checkpoint being scored")
     parser.add_argument("--probe", default="P1", choices=sorted(PROBES))
     parser.add_argument("--observations", type=int, default=64)
     parser.add_argument("--pad-student", action="store_true",
@@ -133,11 +178,29 @@ def main() -> None:
     parser.add_argument("--output")
     args = parser.parse_args()
 
-    tokenizer = QFormerInstructTokenizer(
-        model_path=args.model, checkpoint=args.checkpoint, device=args.device,
-    )
-    processor, model = tokenizer.processor, tokenizer.model
-    device = tokenizer.device
+    if bool(args.checkpoint) == bool(args.pooling_connector):
+        parser.error("pass exactly one of --checkpoint or --pooling-connector")
+    if args.pooling_connector:
+        from residualmem.latent.instruct_bridge import (
+            READER_BRIDGE_PROTOCOL, InputSoftTokenConnector, load_bridge,
+        )
+
+        from .extract_qwen import _load_model
+        device = torch.device(args.device)
+        processor, model = _load_model(args.model, device, False)
+        connector = InputSoftTokenConnector()
+        load_bridge(args.pooling_connector, connector,
+                    expected_protocol=READER_BRIDGE_PROTOCOL)
+        connector.to(device).eval()
+        tokenizer = None
+    else:
+        tokenizer = QFormerInstructTokenizer(
+            model_path=args.model, checkpoint=args.checkpoint,
+            queries=args.queries, device=args.device,
+        )
+        processor, model = tokenizer.processor, tokenizer.model
+        device = tokenizer.device
+        connector = None
     embed = model.get_input_embeddings()
     probe = PROBES[args.probe]
     probe_ids = processor.tokenizer(
@@ -175,9 +238,20 @@ def main() -> None:
             embed(inputs["input_ids"]), inputs["attention_mask"],
             probe_ids, continuation,
         )
-        states = trunk_states(processor, model, image, dom, device=device)
-        with torch.no_grad():
-            soft, _xbar, valid = tokenizer.reader(*collate([states]))
+        if connector is not None:
+            # The pooling's xbar is already on disk from the extraction; the
+            # trunk never has to run again for this side.
+            with np.load(Path(args.xbar_dir) / f"{sample_id}.npz",
+                         allow_pickle=False) as data:
+                pooled = np.asarray(data[f"m11/xbar/{index:04d}"], np.float32)
+            xbar = torch.as_tensor(pooled[None], device=device)
+            valid = torch.ones(xbar.shape[:-1], dtype=torch.bool, device=device)
+            with torch.no_grad():
+                soft = connector(xbar, valid)
+        else:
+            states = trunk_states(processor, model, image, dom, device=device)
+            with torch.no_grad():
+                soft, _xbar, valid = tokenizer.reader(*collate([states]))
         latents.append((soft, valid))
         teachers.append(teacher_logits)
         continuations.append(continuation)
@@ -214,13 +288,21 @@ def main() -> None:
             1 for a, b in zip(matched, mismatched) if a < b
         ) / max(len(matched), 1),
         "per_position_kl": curve.tolist(),
-        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "continuations": continuation_overlap(continuations, processor.tokenizer),
+        "samples": [
+            processor.tokenizer.decode(c[0], skip_special_tokens=True)
+            for c in continuations[:6]
+        ],
+        "representation": ("pooling-64" if args.pooling_connector else "qformer"),
+        "slots": int(latents[0][0].shape[1]) if latents else 0,
+        "checkpoint": str(Path(args.checkpoint or args.pooling_connector).resolve()),
     }
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         Path(args.output).write_text(json.dumps(report, indent=2))
 
-    print(f"\n[{args.probe}]  {report['observations']} observations"
+    print(f"\n[{args.probe}]  {report['representation']} ({report['slots']} slots)  "
+          f"{report['observations']} observations"
           f"{'  (student padded to teacher position)' if args.pad_student else ''}")
     print(f"  matched     KL {report['matched_kl_mean']:.4f}")
     print(f"  mismatched  KL {report['mismatched_kl_mean']:.4f}")
@@ -228,6 +310,16 @@ def main() -> None:
           f"matched lower on {report['matched_beats_mismatched']:.1%} of observations")
     print("  per-position KL (matched): " +
           " ".join(f"{v:.2f}" for v in curve[:16]) + (" ..." if width > 16 else ""))
+    c = report["continuations"]
+    print(f"\n  target text: median {c['median_length']:.0f} tokens, "
+          f"{c['median_distinct_token_ratio']:.1%} distinct")
+    print(f"    token overlap with ANOTHER observation's continuation: "
+          f"{c['median_token_overlap_with_other_observation']:.1%}   "
+          f"<- high means the target is boilerplate, not content")
+    print(f"    common prefix with it: median {c['median_common_prefix_tokens']:.0f} tokens, "
+          f"max {c['max_common_prefix_tokens']}")
+    for n, text in enumerate(report["samples"][:3]):
+        print(f"    [{n}] {text[:150]!r}")
     if report["gap"] <= 0:
         print("\n  VERDICT: the term does not separate content. Do not train on it.")
     elif report["matched_beats_mismatched"] < 0.9:

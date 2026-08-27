@@ -26,6 +26,11 @@ RETRIEVAL_HEAD_TYPE = "qwen_vl_retrieval_v1"
 RETRIEVAL_BRIDGE_PROTOCOL = "qwen35_instruct_retrieval_bridge_v1"
 READER_BRIDGE_PROTOCOL = "qwen35_instruct_reader_bridge_v1"
 
+# A teacher that read the *raw observation* -- screenshot, AXTree and a probe --
+# rather than the caption. Carries greedy continuations and their per-position
+# top-k distributions, so distillation costs no teacher forward at train time.
+OBSERVATION_TEACHER_PROTOCOL = "wma_observation_teacher_v1"
+
 
 def _check_latents(
     xbar: torch.Tensor, valid: torch.Tensor, *, slots: int | None = 64

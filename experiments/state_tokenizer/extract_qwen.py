@@ -257,10 +257,19 @@ def _open_array(path: Path, dtype, shape, resume: bool):
     return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
 
 
-def _load_model(model_path: str, device: torch.device, use_kernels: bool):
+def _load_model(model_path: str, device: torch.device, use_kernels: bool,
+                dtype: torch.dtype = torch.bfloat16):
+    """``dtype`` exists to test one hypothesis and should stay bfloat16 otherwise.
+
+    Every divergence in the joint trainer has been a non-finite *gradient* at an
+    unpredictable step, and after the loss functions were proved bounded by
+    construction the only shared path left is the backward through the frozen
+    9B itself. Running it in fp32 doubles the memory and settles that: if the
+    skips vanish it is numerical, if they persist the hypothesis is dead.
+    """
     processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
     kwargs = {
-        "dtype": torch.bfloat16,
+        "dtype": dtype,
         "low_cpu_mem_usage": True,
         "local_files_only": True,
         "attn_implementation": "sdpa",

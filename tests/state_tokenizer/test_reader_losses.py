@@ -20,7 +20,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from experiments.state_tokenizer.reader_losses import answer_ce_and_distill_kl
+from experiments.state_tokenizer.reader_losses import (
+    LOGPROB_FLOOR,
+    answer_ce_and_distill_kl,
+    topk_kl,
+)
 
 VOCAB, DIM = 11, 6
 
@@ -153,3 +157,127 @@ def test_an_empty_answer_is_rejected():
     except ValueError:
         return
     raise AssertionError("an empty answer produced a loss")
+
+
+def test_topk_kl_equals_the_full_kl_when_nothing_is_truncated():
+    """The truncation is an approximation; at k=vocab it must be exact.
+
+    Without this the top-k path could be systematically off -- a renormalization
+    dropped, a log/prob confusion -- and every downstream number would inherit
+    it with nothing to compare against.
+    """
+    torch.manual_seed(3)
+    length = 7
+    student = torch.randn(1, length, VOCAB)
+    teacher = F.log_softmax(torch.randn(1, length, VOCAB), -1)
+    index = torch.arange(VOCAB).expand(1, length, VOCAB)
+
+    full = (teacher.exp() * (teacher - F.log_softmax(student, -1))).sum(-1).mean()
+    got = topk_kl(student, index, teacher.gather(-1, index))
+    assert abs(float(got) - float(full)) < 1e-6, (float(got), float(full))
+
+    # And truncation has to actually change the number, or the test above is
+    # measuring nothing.
+    logprob, narrow = teacher.topk(3, -1)
+    assert abs(float(topk_kl(student, narrow, logprob)) - float(full)) > 1e-4
+
+
+def test_topk_kl_is_a_per_position_mean_not_a_sum():
+    """Same defect class as the KL this module's docstring is about.
+
+    A sum would make the caller's weight secretly mean "weight times the span
+    length", and the spans here vary from 1 to 96 tokens.
+    """
+    torch.manual_seed(4)
+    length = 5
+    student = torch.randn(1, length, VOCAB)
+    teacher = F.log_softmax(torch.randn(1, length, VOCAB), -1)
+    index = torch.arange(VOCAB).expand(1, length, VOCAB)
+    once = topk_kl(student, index, teacher.gather(-1, index))
+
+    doubled = topk_kl(
+        torch.cat([student, student], 1),
+        torch.arange(VOCAB).expand(1, 2 * length, VOCAB),
+        torch.cat([teacher, teacher], 1).gather(
+            -1, torch.arange(VOCAB).expand(1, 2 * length, VOCAB)),
+    )
+    assert abs(float(once) - float(doubled)) < 1e-5, (float(once), float(doubled))
+    # Guard: a summing implementation would have doubled, so the assertion above
+    # is only meaningful if the value is far from zero.
+    assert float(once) > 1e-3
+
+
+def test_a_cached_teacher_replaces_the_text_one_and_reaches_the_latent():
+    """``teacher_topk`` must both change the loss and carry gradient.
+
+    The cached teacher read the screenshot; the text one reads a caption that is
+    embedded verbatim in the student's own DOM span. If the keyword were
+    silently ignored the run would look fine and train against the weaker
+    target -- exactly the failure this parameter exists to end.
+    """
+    torch.manual_seed(5)
+    model, processor, latent, (loss_text, ce_text, kl_text) = _call(1.0)
+
+    answer_len = len("hello world")
+    index = torch.arange(VOCAB).expand(1, answer_len, VOCAB)
+    logprob = F.log_softmax(torch.randn(1, answer_len, VOCAB), -1)
+    loss, ce, kl = answer_ce_and_distill_kl(
+        model, processor, latent, torch.ones(1, 64, dtype=torch.bool),
+        "what is it?", "hello world", "a memory row",
+        weight=1.0, teacher_topk=(index, logprob),
+    )
+    assert abs(ce - ce_text) < 1e-5          # the CE must not move
+    assert abs(kl - kl_text) > 1e-4          # the KL must
+    loss.backward()
+    assert latent.grad is not None and torch.isfinite(latent.grad).all()
+    assert float(latent.grad.abs().sum()) > 0
+
+
+def test_a_cached_teacher_that_disagrees_on_the_span_is_refused():
+    """A silent length mismatch would score the wrong positions.
+
+    The cache is keyed by pairs row; if it were rebuilt from a different pairs
+    file the spans would drift and the KL would compare unrelated tokens.
+    """
+    model, processor, latent, _ = _call(0.0)
+    wrong = len("hello world") + 3
+    try:
+        answer_ce_and_distill_kl(
+            model, processor, latent, torch.ones(1, 64, dtype=torch.bool),
+            "what is it?", "hello world", "a memory row", weight=1.0,
+            teacher_topk=(torch.zeros(1, wrong, 4, dtype=torch.long),
+                          torch.zeros(1, wrong, 4)),
+        )
+    except ValueError:
+        return
+    raise AssertionError("a span-length mismatch was accepted")
+
+
+def test_a_confident_student_mistake_cannot_produce_an_unbounded_loss():
+    """The floor that ended four runs' worth of divergences.
+
+    Forward KL is ``sum_v p_t(v) [log p_t(v) - log p_s(v)]`` and ``log p_s`` has
+    no lower bound, so one token the teacher supports and the student has
+    written off contributes arbitrarily much. Measured before the floor: 2090
+    nats from a single such token, which backpropagates into "xbar contains
+    non-finite values" at a random step -- the shape of every divergence in this
+    project, at K=32 and K=64 alike, including arms where the new objective was
+    switched off entirely.
+    """
+    torch.manual_seed(6)
+    width, length, k = 2000, 3, 8
+    logprob, index = F.log_softmax(torch.randn(1, length, width), -1).topk(k, -1)
+
+    ordinary = torch.randn(1, length, width)
+    baseline = float(topk_kl(ordinary, index, logprob))
+
+    collapsed = ordinary.clone()
+    collapsed.scatter_(-1, index[..., :1], -1e4)
+    bounded = float(topk_kl(collapsed, index, logprob))
+
+    # Bounded, but not clamped to nothing: the mistake still costs more than a
+    # correct student, or the floor would have destroyed the signal.
+    assert bounded < 10 * abs(LOGPROB_FLOOR), bounded
+    assert bounded > baseline, (bounded, baseline)
+    # An ordinary student is untouched by the floor -- e^-30 is 1e-13.
+    assert abs(baseline - float(topk_kl(ordinary, index, logprob))) < 1e-9

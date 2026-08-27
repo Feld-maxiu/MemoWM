@@ -59,6 +59,7 @@ from PIL import Image
 from torch.nn import functional as F
 
 from residualmem.latent.instruct_bridge import (
+    OBSERVATION_TEACHER_PROTOCOL,
     InputSoftTokenConnector,
     MaskedAttentionRetrievalHead,
     save_bridge,
@@ -71,7 +72,8 @@ from residualmem.latent.qformer import (
 )
 
 from .extract_qwen import _load_model
-from .reader_losses import answer_ce_and_distill_kl
+from .observation_kl_precheck import PROBES
+from .reader_losses import answer_ce_and_distill_kl, observation_distill_kl
 from .train_retrieval_bridge import symmetric_infonce
 from .trunk_states import NUM_MODALITIES, collate, trunk_states
 
@@ -149,6 +151,64 @@ class TeacherStore:
         return teacher[index]
 
 
+class ObservationTeacherStore:
+    """The precomputed teacher that read the screenshot, keyed like the pairs file.
+
+    Two lookups, one cache. ``continuation`` serves ``L_obs`` -- the teacher's
+    own greedy output under a task-independent probe, so that term touches no
+    benchmark label at all. ``answer_topk`` serves ``L_q``, replacing a teacher
+    whose entire input (the caption) was already embedded verbatim in the
+    student's DOM span.
+
+    Held on CPU and moved per use: the whole corpus is 1.6 GB and only a few
+    spans are live at a time.
+    """
+
+    def __init__(self, directory: str | Path) -> None:
+        self._directory = Path(directory)
+        self._cache: dict[str, dict[str, np.ndarray]] = {}
+
+    def _load(self, sample_id: str) -> dict[str, np.ndarray]:
+        if sample_id not in self._cache:
+            path = self._directory / f"{sample_id}.npz"
+            with np.load(path, allow_pickle=False) as data:
+                metadata = json.loads(str(np.asarray(data["metadata"])))
+                if metadata.get("protocol") != OBSERVATION_TEACHER_PROTOCOL:
+                    raise ValueError(f"{sample_id}: teacher protocol {metadata.get('protocol')!r}")
+                self._cache[sample_id] = {name: np.asarray(data[name]) for name in data.files
+                                          if name != "metadata"}
+        return self._cache[sample_id]
+
+    def continuation(self, sample_id: str, index: int, probe: str):
+        arrays = self._load(sample_id)
+        key = f"obs/{index:04d}/{probe}"
+        if f"{key}/ids" not in arrays:
+            raise ValueError(f"{sample_id}[{index}] has no cached probe {probe!r}")
+        return (
+            torch.as_tensor(arrays[f"{key}/ids"], dtype=torch.long)[None],
+            torch.as_tensor(arrays[f"{key}/index"], dtype=torch.long)[None],
+            torch.as_tensor(arrays[f"{key}/logprob"], dtype=torch.float32)[None],
+        )
+
+    def answer_topk(self, sample_id: str, row: int):
+        """``(index, logprob)`` for one QA pair.
+
+        Keyed by ``sample_id`` rather than searched across loaded samples: the
+        row index is global to the pairs file, so scanning whatever happens to
+        be cached would find it only by luck and return None the rest of the
+        time -- a silent fallback to the caption teacher on most steps.
+        """
+        arrays = self._load(sample_id)
+        key = f"qa/{row:05d}/index"
+        if key not in arrays:
+            raise ValueError(
+                f"{sample_id} has no cached teacher for pairs row {row}; the "
+                "cache and the pairs file were built from different inputs"
+            )
+        return (torch.as_tensor(arrays[key], dtype=torch.long)[None],
+                torch.as_tensor(arrays[f"qa/{row:05d}/logprob"], dtype=torch.float32)[None])
+
+
 def spread(states: np.ndarray) -> dict[str, float]:
     """Report 5.4's monitors: how distinguishable are these states from each other.
 
@@ -205,6 +265,53 @@ def main() -> None:
                              "anchor against representation collapse: the answer "
                              "losses need very little information, so nothing "
                              "else stops the states from becoming interchangeable")
+    parser.add_argument("--teacher-cache",
+                        help="build_observation_teacher output. Required by "
+                             "--obs-weight and by --distill-teacher observation")
+    parser.add_argument("--obs-weight", type=float, default=0.0,
+                        help="weight on the observation-distillation term: make "
+                             "the latent reproduce what the raw screenshot would "
+                             "have produced under a task-independent probe. "
+                             "Default 0 reproduces every run to date")
+    parser.add_argument("--distill-teacher", choices=("fused_text", "observation"),
+                        default="fused_text",
+                        help="what L_q's teacher reads. 'fused_text' is the "
+                             "caption, which is embedded verbatim in the "
+                             "student's own DOM span -- the teacher's whole "
+                             "input is a subset of the student's, so the term "
+                             "teaches reproducing text it already holds. "
+                             "'observation' is the screenshot. Default keeps "
+                             "the old behaviour so this change is measurable")
+    parser.add_argument("--trunk-fp32", action="store_true",
+                        help="load the frozen trunk in fp32. Doubles memory; "
+                             "exists only to test whether the non-finite "
+                             "gradients are bf16 numerics in the backward")
+    parser.add_argument("--min-lr-fraction", type=float, default=0.01,
+                        help="floor for the learning rate decayed on each "
+                             "non-finite gradient, as a fraction of the initial "
+                             "rate. Without a floor a bad stretch decays the run "
+                             "into a no-op that still burns GPU hours")
+    parser.add_argument("--locate-nonfinite", action="store_true",
+                        help="sample the gradient norm between the three "
+                             "backward calls so a non-finite total can be "
+                             "attributed to a term instead of guessed at")
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                        help="linear warmup on the learning rate. 0 reproduces "
+                             "every run to date, which had no scheduler at all")
+    parser.add_argument("--max-skipped-steps", type=int, default=50,
+                        help="tolerated non-finite gradients before giving up. "
+                             "A handful is a bad batch; dozens means the loss "
+                             "or the data is wrong and skipping hides it")
+    parser.add_argument("--probe-observations", type=int, default=24,
+                        help="observations scored for the held-out probe gap. "
+                             "Far fewer than --validation-observations on "
+                             "purpose: the gap is a difference of two means and "
+                             "converges quickly, while each one costs a vision "
+                             "forward plus two scoring passes")
+    parser.add_argument("--held-out-probe", default="P4", choices=sorted(PROBES),
+                        help="never sampled for training; its KL is the eval "
+                             "number that separates a general substitute from a "
+                             "memorised continuation")
     parser.add_argument("--sem-mode", choices=("same-session", "cosine"),
                         default="same-session",
                         help="'cosine' reproduces the original term exactly: "
@@ -252,7 +359,10 @@ def main() -> None:
         raise ValueError("the evaluation subcategory must be excluded from the pairs")
 
     device = torch.device(args.device)
-    processor, model = _load_model(args.model, device, False)
+    processor, model = _load_model(
+        args.model, device, False,
+        dtype=torch.float32 if args.trunk_fp32 else torch.bfloat16,
+    )
     # Seed before construction; both modules draw from the global generator.
     torch.manual_seed(args.seed)
     joint = QFormerStateReader(
@@ -270,6 +380,13 @@ def main() -> None:
     if args.sem_weight > 0 and not args.teacher_dir:
         raise ValueError("--sem-weight needs --teacher-dir")
     teachers = TeacherStore(args.teacher_dir) if args.teacher_dir else None
+    needs_cache = args.obs_weight > 0 or args.distill_teacher == "observation"
+    if needs_cache and not args.teacher_cache:
+        raise ValueError("--obs-weight / --distill-teacher observation need --teacher-cache")
+    teachers_obs = ObservationTeacherStore(args.teacher_cache) if needs_cache else None
+    train_probes = [n for n in sorted(PROBES) if n != args.held_out_probe]
+    if args.obs_weight > 0 and not train_probes:
+        raise ValueError("every probe is held out, so L_obs has nothing to train on")
 
     split = pairs["split"].astype(str)
     # Group by observation before sampling. The encoder is observation-level, so
@@ -342,8 +459,52 @@ def main() -> None:
             processor, model, image, record["synthetic_axtree"],
             layer=args.layer, device=device,
         )
+        # The trunk is frozen and its output carries no graph, so the two terms
+        # that need this observation can share one 9B vision forward. Not doing
+        # so doubled the cost of every micro-batch with L_obs on -- the same
+        # saving sem_step already makes, and for the same reason.
+        trunk_cache[(sample_id, index)] = states
         soft, xbar, valid = joint(*collate([states]))
         return soft, xbar, valid, record, sample_id, index
+
+    trunk_cache: dict[tuple[str, int], object] = {}
+
+    head_norm: dict[str, float] = {}
+    sem_forward: dict[str, object] = {}
+    if joint.retrieval_head is not None:
+        def _watch(_module, _inputs, output):
+            # Both ends, and finiteness. Recording only the minimum norm was a
+            # blind spot: an infinite row makes norm(dim=-1) infinite for that
+            # row and .min() then reports the healthy ones, so a head that had
+            # already produced inf read as "denominator 12.01, fine".
+            norms = output.detach().norm(dim=-1)
+            finite = bool(torch.isfinite(norms).all())
+            value = float(norms[torch.isfinite(norms)].min()) if finite else 0.0
+            head_norm["min"] = min(head_norm.get("min", value), value)
+            head_norm["max"] = max(head_norm.get("max", 0.0), float(norms[torch.isfinite(norms)].max()) if finite else float("inf"))
+            head_norm["finite"] = head_norm.get("finite", True) and finite
+        joint.retrieval_head.projection.register_forward_hook(_watch)
+
+    def grad_norm_now() -> float:
+        """Total gradient norm accumulated so far, without touching the grads.
+
+        The guard below only learns that the *sum* went non-finite, which after
+        five wrong diagnoses is not enough. Sampling between the three backward
+        calls says which term produced it -- ``CE+KL_q``, ``L_obs`` or
+        ``L_sem`` -- and the last of those runs the retrieval head, whose
+        ``F.normalize`` has no eps and whose pre-normalisation norm was measured
+        at 2.71 for a trained K=32 against 4.13 for the K=16 that never
+        diverged. A norm that dips toward zero there is an unbounded gradient
+        nobody has bounded.
+        """
+        total = 0.0
+        for parameter in joint.parameters():
+            if parameter.grad is not None:
+                value = float(parameter.grad.detach().norm())
+                if not math.isfinite(value):
+                    return value
+                total += value * value
+        return math.sqrt(total)
 
     def loss_for(row: int, weight: float, sem_weight: float = 0.0):
         soft, xbar, valid, record, sample_id, index = latents_for(row)
@@ -352,6 +513,9 @@ def main() -> None:
             str(pairs["question"][row]), str(pairs["answer"][row]),
             str(record.get("fused_text", "")),
             max_answer_tokens=args.max_answer_tokens, weight=weight,
+            teacher_topk=(teachers_obs.answer_topk(sample_id, row)
+                          if args.distill_teacher == "observation" and weight > 0
+                          else None),
         )
         sem = 0.0
         if sem_weight > 0:
@@ -432,38 +596,171 @@ def main() -> None:
             )
             loss = 0.5 * (forward + backward)
         loss = loss + (1.0 - (student * target).sum(-1)).mean()
+        if args.locate_nonfinite:
+            # The forward values at the moment of failure. If these are all
+            # finite and the gradient is not, the fault is in the backward
+            # arithmetic rather than in anything this function computed.
+            report = {
+                "xbar": bool(torch.isfinite(xbar).all()),
+                "student": bool(torch.isfinite(student).all()),
+                "target": bool(torch.isfinite(target).all()),
+                "loss": bool(torch.isfinite(loss).all()),
+                "xbar_absmax": float(xbar.abs().max()),
+                "student_absmax": float(student.abs().max()),
+                "loss_value": float(loss),
+                "lengths": [int(len(x)) for x in states],
+            }
+            if not all(report[k] for k in ("xbar", "student", "target", "loss")):
+                print(f"[qformer] L_sem forward already non-finite: {report}", flush=True)
+            sem_forward.clear()
+            sem_forward.update(report)
         (sem_weight * loss).backward()
         return float(loss)
 
-    best, best_step, stale, history = math.inf, 0, 0, []
+    def obs_step(row: int, obs_weight: float, scale: float = 1.0) -> float:
+        """One observation-distillation step: no benchmark label anywhere.
+
+        The teacher read the screenshot, the AXTree and a task-independent
+        probe, then generated its own continuation; the student sees the latent
+        and the same probe and is scored on the same span. The span is the
+        teacher's own output, so unlike ``CE_gold`` this term never consults an
+        annotation.
+
+        One probe per micro-batch, drawn from the training set only. ``P4`` is
+        held out for eval: reporting a gap on a probe the run trained on would
+        not distinguish "behavioural substitute for the observation" from
+        "memorised one prompt's continuation".
+        """
+        sample_id = str(pairs["sample_id"][row])
+        index = int(pairs["record_index"][row])
+        probe = train_probes[int(rng.integers(len(train_probes)))]
+        continuation, topk_index, topk_logprob = teachers_obs.continuation(
+            sample_id, index, probe
+        )
+        states = trunk_cache.get((sample_id, index))
+        if states is None:
+            record = store.observation(sample_id, index)
+            with Image.open(record["screenshot"]) as handle:
+                image = handle.convert("RGB")
+            states = trunk_states(processor, model, image, record["synthetic_axtree"],
+                                  layer=args.layer, device=device)
+        soft, _xbar, valid = joint(*collate([states]))
+        kl = observation_distill_kl(
+            model, processor, soft, valid, PROBES[probe],
+            continuation, topk_index, topk_logprob,
+        )
+        # ``scale`` is 1/accumulate. sem_step runs once per optimizer step so it
+        # needs no scaling; this one runs inside the accumulation loop, and
+        # backpropagating full weight on every micro-batch made --obs-weight 1.0
+        # behave as 4.0. That is why the arms diverged in order of their weight
+        # -- 1.0 at step 532, 0.8 at 756, 0.5 not at all -- and why w=2.0's val
+        # CE collapsed to 2.71: it was running at an effective 8.0.
+        (obs_weight * scale * kl).backward()
+        return float(kl)
+
+    best, best_step, stale, history, skipped = math.inf, 0, 0, [], 0
+    best_gap, best_gap_step = -math.inf, 0
     for step in range(1, args.max_steps + 1):
+        if args.warmup_steps and step <= args.warmup_steps and skipped == 0:
+            # There was no scheduler at all: the first update took the full
+            # learning rate against a resampler initialised at std 0.02. The
+            # divergences all share a shape -- hundreds of clean steps, then a
+            # cluster of infinite gradients from which the run never recovers --
+            # which is what an optimizer that has already walked somewhere bad
+            # looks like. Intermediate activations were separately measured
+            # climbing monotonically from 4.3 to 59.5 over 900 steps.
+            for group in optimizer.param_groups:
+                group["lr"] = args.learning_rate * min(1.0, step / args.warmup_steps)
         joint.train()
         optimizer.zero_grad(set_to_none=True)
+        # Entries hold a (~1100, 4096) bf16 trunk output each. They are only
+        # useful within one step, and keeping them would be ~9 MB x 4 x 9000.
+        trunk_cache.clear()
         totals = collections.Counter()
+        drawn = []
         for _ in range(args.accumulate):
             # Uniform over observations, then uniform over that observation's
             # questions -- P(o) = 1/N, q ~ Q(o). Identical in both sem modes.
             group = train_groups[int(rng.integers(len(train_groups)))]
             row = int(rng.choice(group))
+            drawn.append((str(pairs["sample_id"][row]), int(pairs["record_index"][row])))
             loss, ce, kl, sem, _ = loss_for(
                 row, args.distill_weight,
                 args.sem_weight if args.sem_mode == "cosine" else 0.0,
             )
             (loss / args.accumulate).backward()
+            if args.locate_nonfinite:
+                after_qa = grad_norm_now()
+                if not math.isfinite(after_qa):
+                    print(f"[qformer] step {step:5d}  NON-FINITE after CE+KL_q  "
+                          f"({after_qa}); {drawn[-1]}", flush=True)
             totals["ce"] += ce
             totals["kl"] += kl
             if args.sem_mode == "cosine":
                 totals["sem"] += sem / args.accumulate
+            if args.obs_weight > 0:
+                totals["obs"] += obs_step(
+                    row, args.obs_weight, 1.0 / args.accumulate) / args.accumulate
+                if args.locate_nonfinite:
+                    after_obs = grad_norm_now()
+                    if math.isfinite(after_qa) and not math.isfinite(after_obs):
+                        print(f"[qformer] step {step:5d}  NON-FINITE after L_obs  "
+                              f"({after_obs}); {drawn[-1]}", flush=True)
         if args.sem_weight > 0 and args.sem_mode == "same-session":
+            before_sem = grad_norm_now() if args.locate_nonfinite else 0.0
             totals["sem"] += sem_step(args.sem_weight)
-        torch.nn.utils.clip_grad_norm_(joint.parameters(), args.clip_norm)
+            if args.locate_nonfinite:
+                after_sem = grad_norm_now()
+                if math.isfinite(before_sem) and not math.isfinite(after_sem):
+                    print(f"[qformer] step {step:5d}  NON-FINITE after L_sem  "
+                          f"({after_sem}); head pre-norm "
+                          f"min {head_norm.get('min', float('nan')):.4f} "
+                          f"max {head_norm.get('max', float('nan')):.4f} "
+                          f"finite {head_norm.get('finite')}; forward {sem_forward}",
+                          flush=True)
+        grad_norm = torch.nn.utils.clip_grad_norm_(joint.parameters(), args.clip_norm)
+        if not torch.isfinite(grad_norm):
+            # Every divergence in this project has looked the same: losses in
+            # normal ranges at the last eval, then "xbar contains non-finite
+            # values" at a step nobody can predict. That shape says one
+            # micro-batch produced a bad gradient, the weights went non-finite,
+            # and the *next* forward reported it -- so the traceback has always
+            # pointed at the symptom rather than the cause. Skipping the update
+            # is what every mixed-precision trainer does, and it turns a fatal
+            # run into a logged event with the offending observations attached.
+            skipped += 1
+            # Skipping alone has no escape: the weights do not move, so the next
+            # batch meets the same model and the run stalls in a cluster of
+            # skips until it hits the cap. Halving on each skip is what a
+            # GradScaler does, and it works without knowing the cause -- which
+            # matters here, because six hypotheses for that cause have now been
+            # falsified (slot count, L_sem's form, the learning rate, unbounded
+            # forward KL, the missing warmup, the retrieval head's normalise)
+            # and the event reproduces only stochastically: the same config and
+            # seed diverged at step 447 once and ran clean past 450 the next
+            # time. The floor keeps a run from decaying into a no-op.
+            for group in optimizer.param_groups:
+                group["lr"] = max(group["lr"] * 0.5, args.learning_rate * args.min_lr_fraction)
+            print(f"[qformer] step {step:5d}  non-finite gradient "
+                  f"({float(grad_norm)}), update skipped, lr -> "
+                  f"{optimizer.param_groups[0]['lr']:.3g}; drawn={drawn}", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            if skipped > args.max_skipped_steps:
+                raise ValueError(
+                    f"{skipped} non-finite gradients: this is not an occasional "
+                    "bad batch, it is the objective or the data"
+                )
+            continue
         optimizer.step()
 
         if step % args.eval_every and step != args.max_steps:
             continue
 
         joint.eval()
-        losses, learned, pooled = [], [], []
+        trunk_cache.clear()
+        losses, learned, pooled, held_out = [], [], [], []
+        held_out_mismatched: list[float] = []
+        mismatch_soft = mismatch_valid = None
         with torch.no_grad():
             for group in chosen_val:
                 # Every question of the observation, averaged inside it before
@@ -479,7 +776,47 @@ def main() -> None:
                 pooled.append(store.pooled_xbar(
                     str(pairs["sample_id"][group[0]]), int(pairs["record_index"][group[0]])
                 ))
+                if teachers_obs is not None and len(held_out) < args.probe_observations:
+                    # The held-out probe, never sampled during training. This is
+                    # the first KL in this block: loss_for is called with
+                    # weight=0.0 above, so the distillation term is off at eval.
+                    sample_id = str(pairs["sample_id"][group[0]])
+                    index = int(pairs["record_index"][group[0]])
+                    continuation, ti, tl = teachers_obs.continuation(
+                        sample_id, index, args.held_out_probe
+                    )
+                    states = trunk_cache.get((sample_id, index))
+                    if states is None:
+                        record = store.observation(sample_id, index)
+                        with Image.open(record["screenshot"]) as handle:
+                            image = handle.convert("RGB")
+                        states = trunk_states(processor, model, image,
+                                              record["synthetic_axtree"],
+                                              layer=args.layer, device=device)
+                    soft, _x, valid_o = joint(*collate([states]))
+                    held_out.append(float(observation_distill_kl(
+                        model, processor, soft, valid_o,
+                        PROBES[args.held_out_probe], continuation, ti, tl,
+                    )))
+                    # The same teacher scored against the *previous*
+                    # observation's latent. The matched KL alone cannot say
+                    # whether the state carries this screen: most of it is the
+                    # generic cost of a 32-slot prefix standing in for ~1100
+                    # real tokens, and that part is identical either way.
+                    # Subtracting gives the observation-specific part, which is
+                    # the quantity this whole line is about -- and which, being
+                    # the conditional rather than the marginal, is exactly what
+                    # appears late in training. Without the trajectory we would
+                    # only see it at step 9000.
+                    if mismatch_soft is not None:
+                        held_out_mismatched.append(float(observation_distill_kl(
+                            model, processor, mismatch_soft, mismatch_valid,
+                            PROBES[args.held_out_probe], continuation, ti, tl,
+                        )))
+                    mismatch_soft, mismatch_valid = soft, valid_o
         validation = float(np.mean(losses))
+        gap = (float(np.mean(held_out_mismatched)) - float(np.mean(held_out[:-1]))
+               if held_out_mismatched else None)
         # Same observations, both representations -- the comparison is paired.
         monitors = {"learned": spread(np.stack(learned)),
                     "pooled": spread(np.stack(pooled))}
@@ -494,6 +831,11 @@ def main() -> None:
             # One draw per step, not one per micro-batch: L_sem has its own
             # sampler and its own batch, so dividing by accumulate would be wrong.
             "train_sem": totals["sem"],
+            "train_obs": totals["obs"],
+            "held_out_probe_kl": (float(np.mean(held_out)) if held_out else None),
+            "held_out_probe_kl_mismatched": (float(np.mean(held_out_mismatched))
+                                             if held_out_mismatched else None),
+            "held_out_probe_gap": gap,
             "monitors": monitors, "collapse_regressed": regressed,
         })
         flag = "  COLLAPSE-REGRESSED" if regressed else ""
@@ -501,8 +843,13 @@ def main() -> None:
             f"[qformer] step {step:5d}  val CE {validation:.4f}  "
             f"(train CE {totals['ce']/args.accumulate:.4f}, "
             f"KL {totals['kl']/args.accumulate:.4f}, "
-            f"sem {totals['sem']:.4f})  "
-            f"cos {monitors['learned']['pairwise_cosine']:+.4f}"
+            f"sem {totals['sem']:.4f}, obs {totals['obs']:.4f})  "
+            + (f"headmin {head_norm['min']:.4f}  " if "min" in head_norm else "")
+            + (f"P4 {np.mean(held_out):.4f}" if held_out else "")
+            + (f"/{np.mean(held_out_mismatched):.4f} gap "
+               f"{np.mean(held_out_mismatched) - np.mean(held_out[:-1]):+.4f}  "
+               if held_out_mismatched else "  " if held_out else "")
+            + f"cos {monitors['learned']['pairwise_cosine']:+.4f}"
             f"/{monitors['pooled']['pairwise_cosine']:+.4f}  "
             f"rank {monitors['learned']['effective_rank']:.1f}"
             f"/{monitors['pooled']['effective_rank']:.1f}  "
@@ -510,37 +857,65 @@ def main() -> None:
             f"/{monitors['pooled']['mean_to_deviation']:.1f}{flag}",
             flush=True,
         )
-        if validation < best:
-            best, best_step, stale = validation, step, 0
+        def keep(path: str, why: str) -> None:
             save_bridge(
-                args.output, joint, protocol=QFORMER_PROTOCOL,
+                path, joint, protocol=QFORMER_PROTOCOL,
                 queries=args.queries, layer=args.layer,
                 best_step=step, validation_answer_ce=validation,
-                distill_weight=args.distill_weight,
+                held_out_probe_gap=gap, selected_by=why,
+                distill_weight=args.distill_weight, obs_weight=args.obs_weight,
                 objective="answer_ce+distill_kl",
                 qformer_sha256=qformer_hash(joint.qformer),
                 monitors=monitors,
             )
+
+        # Two checkpoints, because the two numbers peak at different steps and
+        # only one of them is what this experiment is about. On the w=0.5 arm
+        # val CE bottomed at 1250 while the held-out gap peaked at 1500, and
+        # keeping only the CE-best threw away the better representation. Early
+        # stopping still watches CE -- that keeps the stopping rule comparable
+        # with every run before this one -- but the artifact selected on the gap
+        # is now preserved alongside it.
+        if validation < best:
+            best, best_step, stale = validation, step, 0
+            keep(args.output, "validation_answer_ce")
         else:
             stale += 1
-            if stale >= args.patience_evals:
-                break
+        if gap is not None and gap > best_gap:
+            best_gap, best_gap_step = gap, step
+            keep(str(Path(args.output).with_suffix(".gapbest.pt")), "held_out_probe_gap")
+        if stale >= args.patience_evals:
+            break
 
     report = {
         "protocol": QFORMER_PROTOCOL,
         # Spelled out rather than a bare "answer_ce+distill_kl": the previous
         # run's report recorded neither the sem weight nor its form, so which
         # L_sem it used could not be recovered from the artifact afterwards.
-        "objective": ("answer_ce+distill_kl" if args.sem_weight <= 0 else
-                      f"answer_ce+distill_kl+sem[{args.sem_mode}]"),
+        "objective": "+".join(filter(None, [
+            "answer_ce", f"distill_kl[{args.distill_teacher}]",
+            f"sem[{args.sem_mode}]" if args.sem_weight > 0 else None,
+            "observation_kl" if args.obs_weight > 0 else None,
+        ])),
         "queries": args.queries, "distill_weight": args.distill_weight,
         "accumulate": args.accumulate, "best_step": best_step,
+        "obs_weight": args.obs_weight, "distill_teacher": args.distill_teacher,
+        "held_out_probe": args.held_out_probe,
+        "teacher_cache": (str(Path(args.teacher_cache).resolve())
+                          if args.teacher_cache else None),
+        "skipped_steps": skipped,
+        "final_learning_rate": optimizer.param_groups[0]["lr"],
+        "min_lr_fraction": args.min_lr_fraction,
+        "best_gap": (best_gap if best_gap > -math.inf else None),
+        "best_gap_step": best_gap_step,
         "sem_mode": args.sem_mode,
         "sem_weight": args.sem_weight, "sem_batch": args.sem_batch,
         "sem_extra_negatives": args.sem_extra_negatives,
         "sem_temperature": args.sem_temperature,
         "sem_sessions": len(sem_sessions) if args.sem_weight > 0 else 0,
-        "learning_rate": args.learning_rate, "seed": args.seed,
+        "trunk_dtype": "float32" if args.trunk_fp32 else "bfloat16",
+        "learning_rate": args.learning_rate, "warmup_steps": args.warmup_steps,
+        "seed": args.seed,
         "best_validation_answer_ce": best, "pairs_metadata": metadata,
         "history": history,
     }
