@@ -62,6 +62,7 @@ from residualmem.latent.instruct_bridge import (
     OBSERVATION_TEACHER_PROTOCOL,
     InputSoftTokenConnector,
     MaskedAttentionRetrievalHead,
+    load_bridge,
     save_bridge,
 )
 from residualmem.latent.qformer import (
@@ -291,6 +292,61 @@ def main() -> None:
                              "non-finite gradient, as a fraction of the initial "
                              "rate. Without a floor a bad stretch decays the run "
                              "into a no-op that still burns GPU hours")
+    parser.add_argument("--lr-recover-steps", type=int, default=0,
+                        help="consecutive clean steps that restore the learning "
+                             "rate by 2x, capped at the scheduled rate. This is "
+                             "the half of GradScaler's logic the decay above was "
+                             "missing -- it backs off on every skip and grows "
+                             "again once the run is behaving, so one bad stretch "
+                             "cannot hold the rate down for the rest of training. "
+                             "0 keeps the decay-only behaviour of every run to "
+                             "date. Measured on the w=1.0 arm this fires for no "
+                             "value above 46: its 286 skips arrive a median 5 "
+                             "steps apart and never once leave a 50-step gap, so "
+                             "on that failure it is a no-op and the input sweep "
+                             "below is the diagnostic that applies")
+    parser.add_argument("--init-from",
+                        help="load Q-Former + connector (+ head) weights before "
+                             "training or sweeping. Needed to interrogate a "
+                             "checkpoint saved mid-failure rather than only "
+                             "reproduce the failure from scratch")
+    parser.add_argument("--sweep-nonfinite", type=int, default=0,
+                        help="skip training; instead push N training rows through "
+                             "the exact loss path one at a time, on frozen "
+                             "weights, and report which produce a non-finite "
+                             "gradient. 0 disables. Every previous hunt needed the "
+                             "failure to happen live and lost the state when the "
+                             "run died; --init-from a bad checkpoint makes it "
+                             "static and repeatable")
+    parser.add_argument("--drop-microbatches", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="test each micro-batch's gradient on its own and "
+                             "drop only the offending one, instead of discarding "
+                             "the whole step. On the w=1.0 arm 2.1% of rows were "
+                             "pathological and they cost 13% of steps; dropping "
+                             "per micro-batch turns that into 2.1% of samples. "
+                             "--no-drop-microbatches restores the old behaviour "
+                             "for a like-for-like comparison")
+    parser.add_argument("--microbatch-max-norm", type=float, default=1e3,
+                        help="gradient norm above which a micro-batch is "
+                             "dropped. Not redundant with a finiteness test: two "
+                             "measured offenders were a *finite* 1.85e19 and "
+                             "1.9e15, and a finite 1e19 survives clipping to "
+                             "consume the entire step budget in its own "
+                             "direction. Clean micro-batches measured 1.9 to "
+                             "20.8 and the offenders 1e15 and above, so the "
+                             "threshold sits in a thirteen-decade empty gap "
+                             "rather than on a distribution's shoulder")
+    parser.add_argument("--dissect-rows", type=int, nargs="*", default=None,
+                        help="with --sweep-nonfinite, take these specific rows "
+                             "apart instead of sweeping: CE alone against CE+KL, "
+                             "the latent and teacher magnitudes, and the "
+                             "parameter carrying the largest gradient")
+    parser.add_argument("--sweep-repeats", type=int, default=3,
+                        help="times each offending row is re-run during the "
+                             "sweep. Identical verdicts every time means the "
+                             "trigger is the input; verdicts that vary on "
+                             "unchanged weights and inputs mean it is the kernels")
     parser.add_argument("--locate-nonfinite", action="store_true",
                         help="sample the gradient norm between the three "
                              "backward calls so a non-finite total can be "
@@ -374,6 +430,13 @@ def main() -> None:
         InputSoftTokenConnector(slots=args.queries),
         MaskedAttentionRetrievalHead() if args.sem_weight > 0 else None,
     ).to(device)
+    if args.init_from:
+        loaded = load_bridge(args.init_from, joint, expected_protocol=QFORMER_PROTOCOL)
+        print(f"[qformer] loaded {args.init_from}: "
+              f"step {loaded.metadata.get('best_step')}, "
+              f"val CE {loaded.metadata.get('validation_answer_ce')}, "
+              f"gap {loaded.metadata.get('held_out_probe_gap')}, "
+              f"selected_by {loaded.metadata.get('selected_by')!r}", flush=True)
     optimizer = torch.optim.AdamW(joint.parameters(), lr=args.learning_rate)
     rng = np.random.default_rng(args.seed)
     store = ObservationStore(args.xbar_dir)
@@ -658,7 +721,292 @@ def main() -> None:
         (obs_weight * scale * kl).backward()
         return float(kl)
 
+    if args.sweep_nonfinite:
+        # Every earlier hunt for these gradients needed the failure to happen
+        # live, and the run died with the state in it. The w=1.0 arm ended
+        # differently: the rate hit its floor at step 1911 and 280 further skips
+        # arrived over the next 2088 steps with the weights effectively frozen,
+        # so the failing state is not a transient -- it is a checkpoint on disk.
+        # Loading it and pushing rows through one at a time turns a stochastic
+        # event into a static question: which inputs, and always the same ones?
+        rows = [int(row) for group in train_groups for row in group]
+        order = rng.permutation(len(rows))[:args.sweep_nonfinite]
+        print(f"[sweep] {len(order)} of {len(rows)} training rows on frozen "
+              f"weights, obs_weight {args.obs_weight}, repeats {args.sweep_repeats}",
+              flush=True)
+
+        def verdict(row: int) -> dict:
+            """Finiteness after each backward, in training's exact order."""
+            optimizer.zero_grad(set_to_none=True)
+            trunk_cache.clear()
+            result = {"row": row,
+                      "sample_id": str(pairs["sample_id"][row]),
+                      "record_index": int(pairs["record_index"][row])}
+            loss, _ce, _kl, _sem, _xbar = loss_for(
+                row, args.distill_weight,
+                args.sem_weight if args.sem_mode == "cosine" else 0.0,
+            )
+            (loss / args.accumulate).backward()
+            result["after_qa"] = grad_norm_now()
+            if args.obs_weight > 0:
+                obs_step(row, args.obs_weight, 1.0 / args.accumulate)
+                result["after_obs"] = grad_norm_now()
+            result["finite"] = all(
+                math.isfinite(result[k]) for k in ("after_qa", "after_obs")
+                if k in result
+            )
+            return result
+
+        if args.dissect_rows:
+            # The sweep answers "which rows"; this answers "what about them".
+            # 19 of 21 offenders were already non-finite after CE+KL_q, so the
+            # new L_obs is not the term to instrument -- and one of them carried
+            # a *finite* 1.85e19, whose square (3.4e38) is exactly where fp32
+            # ends. That is a different failure from an infinite gradient: the
+            # norm reduction overflows on a large-but-representable gradient,
+            # and clip_grad_norm_ then reports inf for something the guard could
+            # in principle have clipped.
+            for row in args.dissect_rows:
+                optimizer.zero_grad(set_to_none=True)
+                trunk_cache.clear()
+                sample_id = str(pairs["sample_id"][row])
+                answer = str(pairs["answer"][row])
+                question = str(pairs["question"][row])
+                print(f"\n=== row {row}  {sample_id}[{int(pairs['record_index'][row])}]")
+                print(f"    Q {question[:110]!r}")
+                print(f"    A {answer[:110]!r}")
+
+                soft, xbar, valid, record, sid, index = latents_for(row)
+                states = trunk_cache[(sid, index)]
+                flat = states.hidden.float()
+                # input_projection is the first thing the trunk output meets, and
+                # it is where every offender's gradient blows up. grad_W is
+                # grad_out^T @ input, so a normal loss and a huge input give a
+                # huge weight gradient with nothing non-finite anywhere in the
+                # forward -- which is exactly what the loss values here show.
+                print(f"    trunk   |max| {float(flat.abs().max()):.6g}  "
+                      f"p99.9 {float(flat.abs().flatten().quantile(0.999)):.4g}  "
+                      f"median {float(flat.abs().median()):.4g}  "
+                      f"shape {tuple(flat.shape)}")
+                print(f"    latent  |max| {float(soft.abs().max()):.4g}  "
+                      f"mean {float(soft.mean()):+.4g}  "
+                      f"finite {bool(torch.isfinite(soft).all())}")
+                print(f"    xbar    |max| {float(xbar.abs().max()):.4g}  "
+                      f"finite {bool(torch.isfinite(xbar).all())}")
+
+                cached = (teachers_obs.answer_topk(sid, row)
+                          if args.distill_teacher == "observation" else None)
+                if cached is not None:
+                    tindex, tlogprob = cached
+                    lp = tlogprob.float()
+                    print(f"    teacher {tuple(tindex.shape)}  logprob "
+                          f"[{float(lp.min()):.2f}, {float(lp.max()):.2f}]  "
+                          f"retained mass {float(lp.exp().sum(-1).median()):.6f}  "
+                          f"finite {bool(torch.isfinite(lp).all())}")
+
+                # CE alone, then CE+KL, each from a clean slate, so the term
+                # that carries the magnitude is named rather than inferred.
+                # Parameter gradients say which module is extreme but not where
+                # the amplification happened -- a huge weight gradient can be a
+                # huge incoming gradient or a huge input. Hooking the tensors
+                # between modules ranks the backward path itself, so the step
+                # where the norm jumps is read off rather than inferred.
+                traces: dict[str, float] = {}
+
+                def watch(name):
+                    def hook(_module, grad_input, grad_output):
+                        value = grad_output[0]
+                        if value is not None:
+                            traces[name] = float(value.detach().norm())
+                    return hook
+
+                handles = [joint.connector.register_full_backward_hook(watch("connector"))]
+                q = joint.qformer
+                handles.append(q.output_projection.register_full_backward_hook(
+                    watch("qformer.output_projection")))
+                for depth, block in enumerate(q.blocks):
+                    handles.append(block.register_full_backward_hook(
+                        watch(f"qformer.blocks.{depth}")))
+                handles.append(q.input_norm.register_full_backward_hook(
+                    watch("qformer.input_norm")))
+                handles.append(q.input_projection.register_full_backward_hook(
+                    watch("qformer.input_projection")))
+                optimizer.zero_grad(set_to_none=True)
+                # The graph has to be built *after* the hooks exist: backward
+                # hooks fire only for forwards that ran while they were
+                # registered, and the first attempt reused the ``soft`` computed
+                # above, so every trace came back empty.
+                trunk_cache.clear()
+                soft2, _xbar2, valid2, _rec2, _sid2, _idx2 = latents_for(row)
+                loss, ce, _kl = answer_ce_and_distill_kl(
+                    model, processor, soft2, valid2, question, answer,
+                    str(record.get("fused_text", "")),
+                    max_answer_tokens=args.max_answer_tokens, weight=0.0,
+                )
+                loss.backward()
+                for handle in handles:
+                    handle.remove()
+                print("    反传路径（梯度流向：从下往上）")
+                order = ["qformer.input_projection", "qformer.input_norm",
+                         "qformer.blocks.0", "qformer.blocks.1", "qformer.blocks.2",
+                         "qformer.blocks.3", "qformer.output_projection", "connector"]
+                previous = None
+                for name in reversed(order):
+                    if name not in traces:
+                        continue
+                    value = traces[name]
+                    jump = "" if previous is None or previous == 0 else f"  x{value / previous:.3g}"
+                    print(f"        |grad_out| {value:12.4g}  {name}{jump}")
+                    previous = value
+
+                # LayerNorm's backward carries a 1/std factor, so the amplifier
+                # the trace points at is a token whose projection is nearly
+                # constant across the hidden dimension. Rank the per-token
+                # variance to see whether such a token exists and what it is.
+                with torch.no_grad():
+                    pre = joint.qformer.input_projection(
+                        states.hidden.to(joint.qformer.input_projection.weight.dtype))
+                    variance = pre.var(-1, unbiased=False)
+                    worst = int(variance.argmin())
+                    names = {0: "IMAGE", 1: "DOM", 2: "INSTRUCTION", 3: "WRAPPER"}
+                    print(f"    input_norm 输入方差  min {float(variance.min()):.4g}  "
+                          f"p1 {float(variance.quantile(0.01)):.4g}  "
+                          f"median {float(variance.median()):.4g}")
+                    print(f"        最小方差 token #{worst}/{len(variance)}  "
+                          f"modality {names.get(int(states.modality_ids[worst]), '?')}  "
+                          f"1/sqrt(var+1e-5) = "
+                          f"{1.0 / math.sqrt(float(variance[worst]) + 1e-5):.4g}  "
+                          f"trunk |x| {float(states.hidden[worst].abs().max()):.4g}")
+                    below = int((variance < 1e-5).sum())
+                    print(f"        方差 < eps(1e-5) 的 token 数: {below}/{len(variance)}")
+
+                for label, weight in (("CE only", 0.0), ("CE+KL_q", args.distill_weight)):
+                    optimizer.zero_grad(set_to_none=True)
+                    loss, ce, kl = answer_ce_and_distill_kl(
+                        model, processor, soft, valid, question, answer,
+                        str(record.get("fused_text", "")),
+                        max_answer_tokens=args.max_answer_tokens, weight=weight,
+                        teacher_topk=cached if weight > 0 else None,
+                    )
+                    loss.backward(retain_graph=True)
+                    total = grad_norm_now()
+                    biggest = max(
+                        ((n, float(p.grad.detach().abs().max()))
+                         for n, p in joint.named_parameters() if p.grad is not None),
+                        key=lambda item: (math.isfinite(item[1]), item[1]),
+                        default=("-", 0.0),
+                    )
+                    print(f"    {label:8s}  loss {float(loss):.4f}  CE {ce:.4f}  "
+                          f"KL {kl:.4f}  |grad| {total:.4g}  "
+                          f"largest {biggest[0]} {biggest[1]:.4g}")
+                    if label == "CE only":
+                        # input_projection is the *first* layer, so a huge weight
+                        # gradient there means the gradient arriving at its output
+                        # was already huge -- the explosion is downstream and
+                        # propagated back. Ranking every parameter says how far
+                        # downstream: if only the earliest layers are extreme the
+                        # amplifier sits between them, and input_norm is a
+                        # LayerNorm whose backward divides by a standard
+                        # deviation nobody has bounded away from zero.
+                        ranked = sorted(
+                            ((n, float(p.grad.detach().norm()))
+                             for n, p in joint.named_parameters() if p.grad is not None),
+                            key=lambda item: -item[1],
+                        )
+                        for name, value in ranked[:8]:
+                            print(f"        {value:12.4g}  {name}")
+                        print(f"        ... {len(ranked) - 8} more, smallest "
+                              f"{ranked[-1][1]:.4g} ({ranked[-1][0]})")
+            return
+
+        offenders, checked = [], []
+        for position, index in enumerate(order, 1):
+            found = verdict(rows[int(index)])
+            checked.append(found)
+            if not found["finite"]:
+                offenders.append(found)
+            if position % 100 == 0 or position == len(order):
+                print(f"[sweep] {position}/{len(order)}  non-finite so far "
+                      f"{len(offenders)} ({100 * len(offenders) / position:.1f}%)",
+                      flush=True)
+
+        # Same weights, same input, N more times. Identical verdicts implicate
+        # the input; verdicts that vary implicate the kernels.
+        repeats = {}
+        for found in offenders:
+            repeats[found["row"]] = [
+                verdict(found["row"])["finite"] for _ in range(args.sweep_repeats)
+            ]
+        stable = sum(1 for votes in repeats.values() if not any(votes))
+        report_path = Path(args.output).with_suffix(".sweep.json")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps({
+            "init_from": args.init_from,
+            "swept": len(checked),
+            "non_finite": len(offenders),
+            "rate": len(offenders) / max(len(checked), 1),
+            "reproduced_every_repeat": stable,
+            "sweep_repeats": args.sweep_repeats,
+            "obs_weight": args.obs_weight,
+            "distill_weight": args.distill_weight,
+            "offenders": offenders,
+            "repeat_votes": {str(k): v for k, v in repeats.items()},
+        }, indent=2, sort_keys=True))
+        print(f"\n[sweep] {len(offenders)}/{len(checked)} rows non-finite "
+              f"({100 * len(offenders) / max(len(checked), 1):.2f}%); "
+              f"{stable}/{len(offenders)} reproduced on all "
+              f"{args.sweep_repeats} repeats -> {report_path}", flush=True)
+        return
+
+
+    def scheduled_lr(step: int) -> float:
+        """The rate warmup alone would set -- the ceiling recovery may climb to.
+
+        Capping at this rather than at ``args.learning_rate`` matters only in one
+        case, but it is a case the decay-only code got wrong: warmup below stops
+        applying once anything has been skipped, so a skip inside the warmup
+        window would otherwise let recovery restore the *full* rate at a step
+        warmup had deliberately held down.
+        """
+        if not args.warmup_steps:
+            return args.learning_rate
+        return args.learning_rate * min(1.0, step / args.warmup_steps)
+
     best, best_step, stale, history, skipped = math.inf, 0, 0, [], 0
+    clean_run = 0
+    dropped = dropped_sem = 0
+    drop_log: list[tuple] = []
+    accumulator = None
+    if args.drop_microbatches:
+        # One buffer mirroring the trainable parameters (78.9M x 4 bytes ~ 316
+        # MB). Each micro-batch backwards into a cleared ``.grad``, is tested on
+        # its own, and is added here only if it passes; the mean at the end is
+        # over the survivors.
+        accumulator = [torch.zeros_like(p) for p in joint.parameters()]
+        print(f"[qformer] per-micro-batch guard on: drop above norm "
+              f"{args.microbatch_max_norm:g} "
+              f"({sum(b.numel() for b in accumulator) * 4 / 2**20:.0f} MB buffer)",
+              flush=True)
+
+    def microbatch_norm() -> float:
+        """Total norm of the gradient currently in ``.grad``, in float64.
+
+        float64 for one reason: an offender measured 1.85e19, whose square is
+        3.4e38 -- exactly where float32 ends. Summing squares in float32 turns a
+        large-but-finite gradient into inf, so the guard could not tell "the
+        gradient is infinite" from "my own reduction overflowed". In float64 the
+        same sum is 3.4e38 with 270 orders of magnitude to spare, and the value
+        that comes back is the real one.
+        """
+        total = 0.0
+        for parameter in joint.parameters():
+            if parameter.grad is None:
+                continue
+            value = float(parameter.grad.detach().double().norm())
+            if not math.isfinite(value):
+                return value
+            total += value * value
+        return math.sqrt(total)
     best_gap, best_gap_step = -math.inf, 0
     for step in range(1, args.max_steps + 1):
         if args.warmup_steps and step <= args.warmup_steps and skipped == 0:
@@ -678,6 +1026,13 @@ def main() -> None:
         trunk_cache.clear()
         totals = collections.Counter()
         drawn = []
+        kept = 0
+        if accumulator is not None:
+            # Allocated once and reused, so it has to be cleared here. Without
+            # this the buffer sums every micro-batch of every step and the run
+            # walks off after a few dozen updates.
+            for buffer in accumulator:
+                buffer.zero_()
         for _ in range(args.accumulate):
             # Uniform over observations, then uniform over that observation's
             # questions -- P(o) = 1/N, q ~ Q(o). Identical in both sem modes.
@@ -688,27 +1043,83 @@ def main() -> None:
                 row, args.distill_weight,
                 args.sem_weight if args.sem_mode == "cosine" else 0.0,
             )
-            (loss / args.accumulate).backward()
+            # Unscaled: the mean is taken at the end over the micro-batches that
+            # survived, not over the ones that were drawn. Dividing by a fixed
+            # ``accumulate`` here would quietly shrink every step that dropped
+            # something, which is a learning-rate cut applied exactly to the
+            # batches containing the pathological rows.
+            loss.backward()
             if args.locate_nonfinite:
                 after_qa = grad_norm_now()
                 if not math.isfinite(after_qa):
                     print(f"[qformer] step {step:5d}  NON-FINITE after CE+KL_q  "
                           f"({after_qa}); {drawn[-1]}", flush=True)
-            totals["ce"] += ce
-            totals["kl"] += kl
-            if args.sem_mode == "cosine":
-                totals["sem"] += sem / args.accumulate
             if args.obs_weight > 0:
-                totals["obs"] += obs_step(
-                    row, args.obs_weight, 1.0 / args.accumulate) / args.accumulate
+                obs_value = obs_step(row, args.obs_weight, 1.0)
                 if args.locate_nonfinite:
                     after_obs = grad_norm_now()
                     if math.isfinite(after_qa) and not math.isfinite(after_obs):
                         print(f"[qformer] step {step:5d}  NON-FINITE after L_obs  "
                               f"({after_obs}); {drawn[-1]}", flush=True)
+            if accumulator is not None:
+                # Drop the micro-batch, not the step. 2.1% of rows produce a
+                # gradient 13 orders of magnitude above the rest; under the old
+                # guard one of them discarded all four micro-batches, which cost
+                # 13% of steps on the w=1.0 arm. The magnitude test is not
+                # redundant with the finiteness test: two of the offenders
+                # measured 1.85e19 and 1.9e15, both *finite*, and a finite 1e19
+                # survives clipping to take the entire step budget in its own
+                # direction while annihilating the other micro-batches to 1e-26.
+                norm = microbatch_norm()
+                if math.isfinite(norm) and norm <= args.microbatch_max_norm:
+                    for buffer, parameter in zip(accumulator, joint.parameters()):
+                        if parameter.grad is not None:
+                            buffer.add_(parameter.grad)
+                    kept += 1
+                    totals["ce"] += ce
+                    totals["kl"] += kl
+                    totals["obs"] += obs_value if args.obs_weight > 0 else 0.0
+                    if args.sem_mode == "cosine":
+                        totals["sem"] += sem
+                else:
+                    dropped += 1
+                    drop_log.append((step, drawn[-1], norm))
+                optimizer.zero_grad(set_to_none=True)
+            else:
+                kept += 1
+                totals["ce"] += ce
+                totals["kl"] += kl
+                totals["obs"] += obs_value if args.obs_weight > 0 else 0.0
+                if args.sem_mode == "cosine":
+                    totals["sem"] += sem
+        if accumulator is not None:
+            if kept == 0:
+                skipped += 1
+                clean_run = 0
+                print(f"[qformer] step {step:5d}  every micro-batch dropped; "
+                      f"drawn={drawn}", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                if skipped > args.max_skipped_steps:
+                    raise ValueError(
+                        f"{skipped} steps lost every micro-batch: this is not a "
+                        "handful of bad rows, it is the objective or the data"
+                    )
+                continue
+        for key in ("ce", "kl", "obs"):
+            if totals[key]:
+                totals[key] /= max(kept, 1)
+        if args.sem_mode == "cosine" and totals["sem"]:
+            totals["sem"] /= max(kept, 1)
         if args.sem_weight > 0 and args.sem_mode == "same-session":
+            # L_sem runs once per step rather than per micro-batch, so it gets
+            # the same treatment on its own terms: computed into a cleared
+            # buffer, tested, and admitted or dropped by itself. Letting it
+            # backward into the surviving average would put the whole step back
+            # at the mercy of the one term this guard cannot otherwise isolate.
+            if accumulator is not None:
+                optimizer.zero_grad(set_to_none=True)
             before_sem = grad_norm_now() if args.locate_nonfinite else 0.0
-            totals["sem"] += sem_step(args.sem_weight)
+            sem_value = sem_step(args.sem_weight)
             if args.locate_nonfinite:
                 after_sem = grad_norm_now()
                 if math.isfinite(before_sem) and not math.isfinite(after_sem):
@@ -718,6 +1129,21 @@ def main() -> None:
                           f"max {head_norm.get('max', float('nan')):.4f} "
                           f"finite {head_norm.get('finite')}; forward {sem_forward}",
                           flush=True)
+            if accumulator is not None:
+                norm = microbatch_norm()
+                if math.isfinite(norm) and norm <= args.microbatch_max_norm:
+                    totals["sem"] += sem_value
+                    for buffer, parameter in zip(accumulator, joint.parameters()):
+                        if parameter.grad is not None:
+                            buffer.add_(parameter.grad, alpha=float(kept))
+                else:
+                    dropped_sem += 1
+                    drop_log.append((step, "L_sem", norm))
+            else:
+                totals["sem"] += sem_value
+        if accumulator is not None:
+            for buffer, parameter in zip(accumulator, joint.parameters()):
+                parameter.grad = buffer / kept
         grad_norm = torch.nn.utils.clip_grad_norm_(joint.parameters(), args.clip_norm)
         if not torch.isfinite(grad_norm):
             # Every divergence in this project has looked the same: losses in
@@ -739,6 +1165,17 @@ def main() -> None:
             # and the event reproduces only stochastically: the same config and
             # seed diverged at step 447 once and ran clean past 450 the next
             # time. The floor keeps a run from decaying into a no-op.
+            #
+            # It did not work, and the w=1.0 log says why: 7 skips carried the
+            # rate from 1e-4 to the 1e-6 floor in 63 steps, and then 280 more
+            # skips arrived at that floor over the next 2088 steps, one every
+            # 7.5. A 100x cut in the rate left the skip rate unchanged. At 1e-6
+            # the weights move by at most ~2e-3 in total, so the model is frozen
+            # and the only thing varying between steps is the input -- which is
+            # what --sweep-nonfinite exists to interrogate. Keep the decay
+            # (skipping still needs *some* escape and it costs little), but stop
+            # believing it is the fix.
+            clean_run = 0
             for group in optimizer.param_groups:
                 group["lr"] = max(group["lr"] * 0.5, args.learning_rate * args.min_lr_fraction)
             print(f"[qformer] step {step:5d}  non-finite gradient "
@@ -752,6 +1189,21 @@ def main() -> None:
                 )
             continue
         optimizer.step()
+        clean_run += 1
+        if args.lr_recover_steps and clean_run >= args.lr_recover_steps:
+            # The other half of GradScaler: back off immediately on a bad step,
+            # grow again only after the run has behaved for a while. The
+            # asymmetry is the point -- decay is one step, recovery is
+            # --lr-recover-steps of them -- so an occasional bad batch costs a
+            # transient dip instead of holding the rate down permanently.
+            ceiling = scheduled_lr(step)
+            current = optimizer.param_groups[0]["lr"]
+            if current < ceiling:
+                for group in optimizer.param_groups:
+                    group["lr"] = min(group["lr"] * 2.0, ceiling)
+                print(f"[qformer] step {step:5d}  {clean_run} clean steps, "
+                      f"lr -> {optimizer.param_groups[0]['lr']:.3g}", flush=True)
+            clean_run = 0
 
         if step % args.eval_every and step != args.max_steps:
             continue
@@ -904,6 +1356,16 @@ def main() -> None:
         "teacher_cache": (str(Path(args.teacher_cache).resolve())
                           if args.teacher_cache else None),
         "skipped_steps": skipped,
+        "dropped_microbatches": dropped,
+        "dropped_sem_steps": dropped_sem,
+        "drop_microbatches": bool(args.drop_microbatches),
+        "microbatch_max_norm": args.microbatch_max_norm,
+        # Which rows never contributed. 2.1% of them is a small number and a
+        # real selection bias -- they cluster on the longer observations -- so
+        # the paper has to disclose it rather than call the training set whole.
+        "dropped_rows": [
+            {"step": s, "row": r, "norm": n} for s, r, n in drop_log[:500]
+        ],
         "final_learning_rate": optimizer.param_groups[0]["lr"],
         "min_lr_fraction": args.min_lr_fraction,
         "best_gap": (best_gap if best_gap > -math.inf else None),
