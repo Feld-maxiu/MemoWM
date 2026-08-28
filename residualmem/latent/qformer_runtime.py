@@ -61,6 +61,7 @@ class QFormerInstructTokenizer:
         heads: int = 8,
         layers: int = 4,
         self_attention: bool = False,
+        qk_norm: bool | None = None,
         device: str = "cuda:0",
         layer: int = 16,
         max_length: int = 8192,
@@ -83,6 +84,16 @@ class QFormerInstructTokenizer:
                 f"expected {QFORMER_PROTOCOL!r}"
             )
         state = payload["state_dict"]
+        # QK-norm is parameter-free, which is what makes it safe to sweep on and
+        # off -- and also what makes it dangerous here: a checkpoint trained with
+        # it loads without complaint into a module built without it, and the
+        # forward is then silently wrong. strict=True cannot catch this because
+        # there is no key to miss. So the checkpoint carries the flag and the
+        # loader honours it; the explicit argument is only an override for
+        # checkpoints written before the field existed.
+        saved_metadata = dict(payload.get("metadata") or {})
+        resolved_qk_norm = (bool(saved_metadata.get("qk_norm", False))
+                            if qk_norm is None else bool(qk_norm))
         # The retrieval head is trained jointly, as L_sem's projection. Without
         # it the states are in a coordinate system no head was ever fitted to,
         # and the one on disk was fitted to the PCA path -- feeding it these
@@ -98,7 +109,8 @@ class QFormerInstructTokenizer:
         module = QFormerStateReader(
             StateQFormer(num_queries=queries, hidden=hidden, heads=heads,
                          layers=layers, modalities=NUM_MODALITIES,
-                         self_attention=self_attention),
+                         self_attention=self_attention,
+                         qk_norm=resolved_qk_norm),
             InputSoftTokenConnector(slots=queries),
             MaskedAttentionRetrievalHead(),
         )

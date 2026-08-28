@@ -1407,6 +1407,8 @@ def main() -> None:
                 best_step=step, validation_answer_ce=validation,
                 held_out_probe_gap=gap, selected_by=why,
                 distill_weight=args.distill_weight, obs_weight=args.obs_weight,
+                qk_norm=bool(args.qk_norm),
+                self_attention=bool(args.self_attention),
                 objective="answer_ce+distill_kl",
                 qformer_sha256=qformer_hash(joint.qformer),
                 monitors=monitors,

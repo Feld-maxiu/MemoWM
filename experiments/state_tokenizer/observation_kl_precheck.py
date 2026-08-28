@@ -164,6 +164,16 @@ def main() -> None:
                              "so a larger gap here isolates slot budget from "
                              "everything else")
     parser.add_argument("--model", required=True)
+    parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="override the checkpoint's own qk_norm setting. "
+                             "Leave unset: the loader reads it from the "
+                             "checkpoint metadata, which is the only reliable "
+                             "source -- QK-norm adds no parameters, so a "
+                             "checkpoint trained with it loads silently into a "
+                             "module built without it and the forward is wrong "
+                             "with nothing to raise on. Needed explicitly only "
+                             "for checkpoints written before the field existed")
     parser.add_argument("--queries", type=int, default=16,
                         help="query count of the --checkpoint being scored")
     parser.add_argument("--probe", default="P1", choices=sorted(PROBES))
@@ -196,7 +206,7 @@ def main() -> None:
     else:
         tokenizer = QFormerInstructTokenizer(
             model_path=args.model, checkpoint=args.checkpoint,
-            queries=args.queries, device=args.device,
+            queries=args.queries, qk_norm=args.qk_norm, device=args.device,
         )
         processor, model = tokenizer.processor, tokenizer.model
         device = tokenizer.device

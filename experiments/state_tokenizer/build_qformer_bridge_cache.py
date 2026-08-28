@@ -45,6 +45,12 @@ def main() -> None:
     parser.add_argument("--qformer-layers", type=int, default=4)
     parser.add_argument("--self-attention", action="store_true")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--qk-norm", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="override the checkpoint's own qk_norm setting; "
+                             "unset means read it from the checkpoint metadata. "
+                             "QK-norm adds no parameters, so getting this wrong "
+                             "loads cleanly and encodes with the wrong forward")
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=35)
     args = parser.parse_args()
@@ -52,7 +58,7 @@ def main() -> None:
     tokenizer = QFormerInstructTokenizer(
         model_path=args.model, checkpoint=args.checkpoint, queries=args.queries,
         layers=args.qformer_layers, self_attention=args.self_attention,
-        device=args.device,
+        qk_norm=args.qk_norm, device=args.device,
     )
     processor, model, reader = tokenizer.processor, tokenizer.model, tokenizer.reader
 
