@@ -224,7 +224,7 @@ D=outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar
 ### 3.3 训练
 
 ```bash
-nohup bash outputs/logs/p1/run-arm.sh 0.5 0 > outputs/logs/p1/k32e-obs0.5.log 2>&1 &
+nohup bash scripts_qformer_train_arm.sh 0.5 0 > outputs/logs/p1/k32e-obs0.5.log 2>&1 &
 ```
 
 展开（`$1` = obs 权重，`$2` = 卡号）：
@@ -260,7 +260,7 @@ python -u -m experiments.state_tokenizer.train_qformer_joint \
 前四步一条命令：
 
 ```bash
-bash outputs/logs/p1/run-downstream.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
+bash scripts_qformer_downstream.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
 ```
 
 依次是：① `build_qformer_bridge_cache` 抽状态缓存 → ② `train_retrieval_bridge` 训检索头 → ③ `head_recall` 检索闸 → ④ `observation_kl_precheck` 算 48 条 gap。两条臂并行约 26 分钟。
@@ -272,7 +272,7 @@ bash outputs/logs/p1/run-downstream.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.g
 第五步官方 QA：
 
 ```bash
-bash outputs/logs/p1/run-official.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
+bash scripts_qformer_official_eval.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
 ```
 
 **Q-Former 通过环境变量插入，不是 CLI 参数**（`residualmem_instruct_adapter.py:113-120`）。脚本已固化四个坑：
@@ -282,7 +282,7 @@ bash outputs/logs/p1/run-official.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gap
 - `RESIDUALMEM_INPUT_CONNECTOR` **不能**和 `RESIDUALMEM_QFORMER` 同设（`:199-204` 会 raise）
 - 加了 checkpoint / head 存在性预检，缺文件立刻退出而不是烧两小时
 
-⚠️ **两条臂并行时把 `--max-eval-workers` 和 `LLM_MAX_CONCURRENT` 各降到 24。** 各设 48 时 96 路并发把服务打爆，实测 OOM 重试 1400/1465 次（重试全成功、无掉题，但这是它跑 2h28m 的原因）。单条约 2.5 小时。
+⚠️ **`WORKERS` 默认 24，不是单条臂时用的 48。** 两条臂各设 48 时 96 路并发把判分服务打爆，实测 OOM 重试 1400/1465 次（重试全成功、无掉题，但这是它跑 2h28m 的原因）。只跑一条臂时 `WORKERS=48 bash scripts_qformer_official_eval.sh ...`。单条约 2.5 小时。
 
 **出数**：顶层 `aggregate_metrics.json` 的 `question_answering.{correct_ratio, hallucination_ratio, omission_ratio}` = QA-C/H/O，**这是 27 样本池化的 micro 值，直接用**。
 
