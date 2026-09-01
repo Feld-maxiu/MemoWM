@@ -16,10 +16,11 @@ from experiments.state_tokenizer.common import sha256_file, write_json
 
 from .cache import CACHE_FILES, FrozenCache
 from .config import load_config
-from .model import predict
+from .model import actions_from_batch, predict
 from .schema import ACTION_TYPE_IDS, REF_PAD_ID, TAG_PAD_ID
 from .train import (
     DeterministicSampler,
+    model_batch_keys,
     _decay_mask,
     _device_batch,
     _save_checkpoint,
@@ -31,11 +32,7 @@ from .train import (
 
 def _make_greedy(variant, model_config):
     def greedy(params, batch):
-        actions = {
-            "types": batch["action_types"], "tags": batch["action_tags"],
-            "refs": batch["action_refs"], "payloads": batch["action_payloads"],
-            "lengths": batch["action_lengths"],
-        }
+        actions = actions_from_batch(batch, model_config)
         mask_logits, code_logits = predict(
             params, batch["history_codes"], batch["history_valid"], actions,
             batch["task_ids"], variant, model_config,
@@ -45,7 +42,7 @@ def _make_greedy(variant, model_config):
     return jax.jit(greedy)
 
 
-def scheduled_sample_batch(params, host, ratio, key, greedy):
+def scheduled_sample_batch(params, host, ratio, key, greedy, batch_keys):
     """Replace eligible history states by recursive greedy model predictions."""
     codes = host["history_codes"].copy()
     valid = host["history_valid"].copy()
@@ -81,7 +78,7 @@ def scheduled_sample_batch(params, host, ratio, key, greedy):
             ):
                 prefix[name][row, destination] = host[name][row, source_positions]
         predicted_codes, predicted_valid = jax.device_get(
-            greedy(params, _device_batch(prefix))
+            greedy(params, _device_batch(prefix, batch_keys))
         )
         key, draw_key = jax.random.split(key)
         replace = np.asarray(
@@ -149,6 +146,7 @@ def main() -> None:
     # Optax state structure is unchanged; only the scalar schedule is replaced.
     update = make_update(optimizer, variant, config.model, overfit=False)
     greedy = _make_greedy(variant, config.model)
+    batch_keys = model_batch_keys(config.model)
     validation_rows = cache.indices_for_split("validation")
     before, _ = evaluate_model(
         cache, validation_rows, params, variant, config, keep_per_transition=False
@@ -158,10 +156,12 @@ def main() -> None:
             args.end_ratio - args.start_ratio
         ) * local_step / max(args.steps - 1, 1)
         host = cache.batch(sampler.next())
-        host, key = scheduled_sample_batch(params, host, ratio, key, greedy)
+        host, key = scheduled_sample_batch(
+                params, host, ratio, key, greedy, batch_keys
+            )
         key, update_key = jax.random.split(key)
         params, opt_state, _loss, _metrics = update(
-            params, opt_state, _device_batch(host), update_key
+            params, opt_state, _device_batch(host, batch_keys), update_key
         )
     after, per_transition = evaluate_model(
         cache, validation_rows, params, variant, config, keep_per_transition=True

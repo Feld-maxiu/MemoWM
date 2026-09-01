@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 from .model import ModelConfig
+from .cache import ACCEPTED_PROTOCOLS
 from .schema import MAX_HISTORY, MAX_PAYLOAD_BYTES, PROTOCOL, validate_variant
 
 
@@ -71,8 +72,11 @@ class ExperimentConfig:
 
 def load_config(path: str | Path, *, num_tasks: int | None = None) -> ExperimentConfig:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("protocol") != PROTOCOL:
-        raise ValueError(f"config must declare protocol: {PROTOCOL}")
+    if not isinstance(raw, dict) or raw.get("protocol") not in ACCEPTED_PROTOCOLS:
+        raise ValueError(
+            f"config must declare one of {sorted(ACCEPTED_PROTOCOLS)}, "
+            f"got {raw.get('protocol') if isinstance(raw, dict) else raw!r}"
+        )
     model_values = dict(raw.get("model") or {})
     if num_tasks is not None:
         configured = model_values.get("num_tasks", num_tasks)
@@ -86,17 +90,34 @@ def load_config(path: str | Path, *, num_tasks: int | None = None) -> Experiment
     evaluation_values = dict(raw.get("evaluation") or {})
     evaluation = EvaluationConfig(**evaluation_values)
     action = dict(raw.get("action") or {})
-    expected_action = {
-        "exclude_policy": True,
-        "max_ref": 63,
-        "payload_bytes": MAX_PAYLOAD_BYTES,
-        "select_option_uses_parent": True,
-    }
+    # What the action block must declare depends on the action space. `max_ref`
+    # and `select_option_uses_parent` describe an AXTree element id and a
+    # SELECT_OPTION canonicalisation, neither of which exists for a coordinate
+    # agent; demanding them there would be asserting a property of the wrong
+    # thing.
+    if model.use_coordinate_channel:
+        expected_action = {
+            "exclude_policy": True,
+            "payload_bytes": MAX_PAYLOAD_BYTES,
+            "coordinate_bits": 10,
+        }
+    else:
+        expected_action = {
+            "exclude_policy": True,
+            "max_ref": 63,
+            "payload_bytes": MAX_PAYLOAD_BYTES,
+            "select_option_uses_parent": True,
+        }
     for key, expected in expected_action.items():
         if action.get(key) != expected:
             raise ValueError(f"action.{key} must be {expected!r}")
-    if model.max_history != MAX_HISTORY:
-        raise ValueError(f"formal v8 config requires max_history={MAX_HISTORY}")
+    if raw["protocol"] == PROTOCOL and model.max_history != MAX_HISTORY:
+        # Pinned for v8, where 7 is part of the frozen protocol. The web corpus
+        # averages 17.5 states per trajectory against MiniWoB's much shorter
+        # ones -- a 7-step window sees all of only 15.8% of them -- so there the
+        # window is a configured quantity and the cache is built wide enough to
+        # serve whichever value is asked for.
+        raise ValueError(f"a formal config requires max_history={MAX_HISTORY}")
     return ExperimentConfig(
         protocol=raw["protocol"], model=model, training=training,
         evaluation=evaluation, action=action,

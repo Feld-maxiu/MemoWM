@@ -1,0 +1,91 @@
+# C=64 on the full MolmoWeb corpus. Same model as web_h16_C64.yaml; only the
+# budget and the selection split differ, because both were derived from a
+# corpus 11.65x smaller and neither survives the move.
+#
+# What this is for: the pilot measured 1.23x compression at C=64 (6,176 fixed
+# width against 5,027.1 bits, 2 seeds, spread 30.3). The data-scaling slope of
+# -160 bits/doubling was measured on MolmoWeb -- not on MiniWoB++, whose slope
+# is +297 and points the other way -- but it was measured at C=256, and all four
+# of its points (3,656 / 7,598 / 15,162 / 31,508 transitions) sit inside the
+# pilot's 38,840. Predicting C=64 at 452,495 means extrapolating 3.54 doublings
+# past the last measured point, on a curve fitted at a different alphabet. That
+# is what this run is for: measuring it instead.
+#
+# Report the COMPRESSION RATIO (6,144 / bits), not absolute bits. The absolute
+# number moves with the corpus; the ratio is the claim.
+protocol: residualmem_web_discrete_wm_v1
+
+model:
+  # num_tasks is deliberately absent -- config.load_config adopts the cache's.
+  max_history: 16
+  num_latent_tokens: 32
+  num_observation_slots: 32
+  num_subspaces: 32
+  num_categories: 64
+  code_embedding_dim: 8
+  d_model: 256
+  num_layers: 12
+  num_heads: 8
+  mlp_dim: 4096
+  # 0.3 was tuned against 31,508 fit transitions, where the C=256 budget runs
+  # peaked at step 22,500 and then collapsed to 13,279 bits by step 242,500 --
+  # a 2x degradation, so the regulariser was doing real work. At 433,438 the
+  # model sees 13.8x more unique transitions per epoch. Left unchanged so this
+  # run differs from the pilot in data and budget only; if the dev curve never
+  # turns over, the corpus has outgrown the regulariser and that is the finding.
+  dropout: 0.1
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  use_coordinate_channel: true
+  num_action_types: 17
+  coordinate_bins: 64
+  use_copy_gate: true
+  use_target_channel: false
+  max_payload_bytes: 40
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  # Sized from where the pilot actually stopped, not from this file's committed
+  # 300,000 -- which was never used. Every pilot run was CLI-overridden to
+  # max_steps 60,000-80,000 and every one of them early-stopped on
+  # validation_patience at step 15,000-22,500.
+  #
+  # C=64 seed 0 peaked at step 17,500 on 31,508 fit transitions = 17.8 epochs;
+  # the C=256 budget runs peaked at 22,500 = 22.9 epochs. At --dev-fraction 0.05
+  # the fit set is 433,438 transitions, so an epoch is 13,545 steps and 22.9
+  # epochs would be ~310,000. Terminating on patience rather than on the cap
+  # needs max_steps >= best + patience, hence 400,000.
+  max_steps: 400000
+  min_steps: 30000
+  eval_every: 5000
+  # Six evaluations without improvement. The run-to-run noise floor is 31 bits
+  # (two identical runs, same seed, differed by 30.7 -- XLA GPU is not
+  # bit-deterministic), so a single flat evaluation means nothing.
+  patience_steps: 30000
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  # rollout.py selects transitions by `steps == horizon - 1`. Shards 14-19
+  # average 25 steps per trajectory against 18 in shards 02-12, so at full scale
+  # these seven horizons cover even less of a session than they did in the
+  # pilot. A rollout number from this range describes an opening, not a session.
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  payload_bytes: 40
+  coordinate_bits: 10
+  # Recorded, not read. The pilot's values were measured over its own 49,679
+  # transitions; these must be re-measured on the full cache before they are
+  # quoted anywhere, and are left at the pilot's numbers only so that a stale
+  # value is obviously stale rather than plausibly wrong.
+  structural_bill_bits: 20.45
+  full_bill_bits: 73.86
+  task_bill_bits_per_episode: 0

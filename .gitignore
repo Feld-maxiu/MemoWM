@@ -13,3 +13,7 @@ browsergym-venv/
 third_party/
 *.incomplete
 .tmp/
+gate/
+cache/
+run/
+testset/

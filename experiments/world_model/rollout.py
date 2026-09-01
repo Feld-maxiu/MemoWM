@@ -15,19 +15,13 @@ from experiments.state_tokenizer.common import sha256_file, write_json
 
 from .cache import FrozenCache
 from .config import load_config
-from .model import codelength_bits, predict
-from .train import _device_batch, load_checkpoint
+from .model import actions_from_batch, codelength_bits, predict
+from .train import model_batch_keys, _device_batch, load_checkpoint
 
 
 def _make_rollout_step(variant, config):
     def step(params, batch):
-        actions = {
-            "types": batch["action_types"],
-            "tags": batch["action_tags"],
-            "refs": batch["action_refs"],
-            "payloads": batch["action_payloads"],
-            "lengths": batch["action_lengths"],
-        }
+        actions = actions_from_batch(batch, config.model)
         mask_logits, code_logits = predict(
             params,
             batch["history_codes"], batch["history_valid"], actions,
@@ -231,6 +225,7 @@ def main() -> None:
     )
     baseline = _baseline_lookup(args.baseline_per_transition)
     rollout_step = _make_rollout_step(variant, config)
+    batch_keys = model_batch_keys(config.model)
     predicted = {}
     parts = defaultdict(list)
     for horizon in config.evaluation.rollout_horizons:
@@ -239,7 +234,9 @@ def main() -> None:
             selected = rows[start:start + args.batch_size]
             host = cache.batch(selected)
             _replace_prefix(cache, host, predicted)
-            result = jax.device_get(rollout_step(params, _device_batch(host)))
+            result = jax.device_get(
+                rollout_step(params, _device_batch(host, batch_keys))
+            )
             for local, target in enumerate(host["target_indices"]):
                 predicted[int(target)] = (
                     np.asarray(result["predicted_codes"][local], np.uint8),

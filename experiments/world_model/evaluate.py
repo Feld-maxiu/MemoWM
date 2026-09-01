@@ -1,4 +1,3 @@
-"""Evaluate a frozen WM checkpoint on validation or one-time unlocked test."""
 from __future__ import annotations
 
 import argparse
@@ -29,6 +28,7 @@ def main() -> None:
 
     cache = FrozenCache(args.cache)
     config = load_config(args.config, num_tasks=len(cache.task_names))
+    cache.max_history = config.model.max_history
     jax.config.update("jax_default_matmul_precision", config.training.matmul_precision)
     device = jax.devices(args.platform)[args.device_index]
     checkpoint = load_checkpoint(args.checkpoint)

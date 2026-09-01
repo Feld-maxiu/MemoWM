@@ -1,0 +1,82 @@
+{
+  "bits_per_transition": {
+    "copy": {
+      "code_bits_per_transition": 6051.422213304739,
+      "mask_bits_by_observation_group": {
+        "band0": 4.662392507118532e-05
+      },
+      "mask_bits_per_transition": 4.662392507118532e-05,
+      "task_billed_total_bits_per_transition": 6051.422259928663,
+      "total_bits_per_transition": 6051.422259928663
+    },
+    "marginal": {
+      "code_bits_per_transition": 6381.996688446863,
+      "mask_bits_by_observation_group": {
+        "band0": 4.662392507118532e-05
+      },
+      "mask_bits_per_transition": 4.662392507118532e-05,
+      "task_billed_total_bits_per_transition": 6381.996735070788,
+      "total_bits_per_transition": 6381.996735070788
+    },
+    "source": {
+      "code_bits_per_transition": 5420.842261169798,
+      "mask_bits_per_transition": 4.662392507118532e-05,
+      "task_billed_total_bits_per_transition": 5420.842307793723,
+      "total_bits_per_transition": 5420.842307793723
+    }
+  },
+  "cache_manifest_sha256": "6a235395aecf5de6258fcf1cb2896352885c0073ea715231a54cc8a294202c06",
+  "change_rate": {
+    "consecutive": {
+      "code": 0.8712622877141983,
+      "mask": 0.0,
+      "mask_by_observation_group": {
+        "band0": 0.0
+      }
+    },
+    "global_random": {
+      "code": 0.9695341187270502,
+      "mask": 0.0
+    },
+    "note": "A2 latent code axes are distributed and are not observation groups; only mask changes are grouped as image/detail/context/prompt.",
+    "same_task_random": {
+      "code": 0.9704640644124847,
+      "mask": 0.0
+    }
+  },
+  "code_grouping_warning": "All 2048 distributed A2 codes are charged. Observation validity never removes code loss, and code axes are not sliced into semantic groups.",
+  "eval_split": "validation",
+  "eval_transitions": 817,
+  "fit_split": "train",
+  "fit_transitions": 495091,
+  "fixed_width_audit": {
+    "code_bits": 6144,
+    "mask_bits": 32,
+    "total_bits": 6176
+  },
+  "per_episode": "per_episode.jsonl",
+  "per_transition": "per_transition.npz",
+  "per_transition_sha256": "e925f3128c40c3dd3a899fc97fd179cbcf2e68bb96151fa9a74fe6131a79fbb5",
+  "protocol": "v8_task_conditioned_baselines_v1",
+  "side_information_audit": {
+    "action": {
+      "full_fixed_bits_per_transition": 40.1750305997552,
+      "note": "Action costs are audited but are not part of baseline conditioning.",
+      "structural_fixed_bits_per_transition": 21.964504283965727,
+      "used_by_baselines": false
+    },
+    "episodes": 70,
+    "task": {
+      "amortized_bits_per_transition": 0.0,
+      "fixed_bits_per_episode": 0.0,
+      "num_task_ids": 1
+    }
+  },
+  "smoothing": {
+    "jeffreys_alpha": 0.5
+  },
+  "source_backoff": {
+    "concentration": 32.0,
+    "prior": "copy"
+  }
+}

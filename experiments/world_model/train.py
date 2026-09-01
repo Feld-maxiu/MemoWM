@@ -1,4 +1,3 @@
-"""Train and evaluate one frozen-v8 discrete WM variant with pure JAX/Optax."""
 from __future__ import annotations
 
 import argparse
@@ -20,6 +19,7 @@ import yaml
 from experiments.state_tokenizer.common import sha256_file, write_json
 
 from .cache import CACHE_FILES, FrozenCache
+from .baselines import task_bill_bits
 from .config import ExperimentConfig, TrainingConfig, load_config, resolved_dict
 from .model import (
     ModelConfig,
@@ -36,10 +36,20 @@ MODEL_BATCH_KEYS = (
     "action_types", "action_tags", "action_refs", "action_payloads",
     "action_lengths", "task_ids", "target_codes", "target_valid",
 )
+COORDINATE_BATCH_KEYS = (
+    "action_x", "action_y", "action_dx", "action_dy",
+    "action_has_coord", "action_has_delta",
+)
+
+
+def model_batch_keys(config) -> tuple[str, ...]:
+    if not getattr(config, "use_coordinate_channel", False):
+        return MODEL_BATCH_KEYS
+    kept = tuple(k for k in MODEL_BATCH_KEYS if k not in ("action_tags", "action_refs"))
+    return kept + COORDINATE_BATCH_KEYS
 
 
 class DeterministicSampler:
-    """Permutation sampler whose complete state is checkpointed."""
 
     def __init__(self, rows: np.ndarray, batch_size: int, seed: int):
         self.rows = np.asarray(rows, np.int64)
@@ -138,7 +148,6 @@ def load_checkpoint(path: str | Path, expected_metadata: dict | None = None) -> 
 
 
 def _decay_mask(params):
-    # AdamW excludes every bias, normalization scalar and embedding/mask token.
     return {
         name: bool(name.endswith("_w") or name.endswith("/w"))
         for name in params
@@ -167,8 +176,8 @@ def build_optimizer(params, training: TrainingConfig, *, overfit: bool = False):
     return optimizer, schedule
 
 
-def _device_batch(batch: dict) -> dict:
-    return {name: jnp.asarray(batch[name]) for name in MODEL_BATCH_KEYS}
+def _device_batch(batch, keys=MODEL_BATCH_KEYS) -> dict:
+    return {name: jnp.asarray(batch[name]) for name in keys}
 
 
 def make_update(optimizer, variant: str, config: ModelConfig, *, overfit: bool):
@@ -227,10 +236,11 @@ def evaluate_model(
     task_totals: dict[int, defaultdict[str, float]] = defaultdict(lambda: defaultdict(float))
     policy_totals: dict[int, defaultdict[str, float]] = defaultdict(lambda: defaultdict(float))
     start_time = time.time()
+    keys = model_batch_keys(config.model)
     for start in range(0, len(rows), config.evaluation.batch_size):
         selected = rows[start:start + config.evaluation.batch_size]
         host_batch = cache.batch(selected)
-        result = jax.device_get(evaluator(params, _device_batch(host_batch)))
+        result = jax.device_get(evaluator(params, _device_batch(host_batch, keys)))
         mask_bits = np.asarray(result["mask_bits"], np.float64)
         code_bits = np.asarray(result["code_bits"], np.float64)
         total_bits = np.asarray(result["total_bits"], np.float64)
@@ -239,13 +249,14 @@ def evaluate_model(
         totals["mask_bits"] += mask_bits.sum(dtype=np.float64)
         totals["code_bits"] += code_bits.sum(dtype=np.float64)
         totals["total_bits"] += total_bits.sum(dtype=np.float64)
-        # Device accuracies are batch means; weight them by their exact element counts.
         totals["mask_correct"] += float(result["mask_accuracy"]) * count
         totals["code_correct"] += float(result["code_accuracy"]) * count
+        policies = host_batch.get("policies")
         for local in range(count):
-            task = int(host_batch["task_ids"][local])
-            policy = int(host_batch["policies"][local])
-            for bucket in (task_totals[task], policy_totals[policy]):
+            buckets = [task_totals[int(host_batch["task_ids"][local])]]
+            if policies is not None:
+                buckets.append(policy_totals[int(policies[local])])
+            for bucket in buckets:
                 bucket["count"] += 1
                 bucket["mask_bits"] += mask_bits[local]
                 bucket["code_bits"] += code_bits[local]
@@ -261,7 +272,8 @@ def evaluate_model(
                 "target_indices", "episode_ids", "task_ids", "policies",
                 "structural_action_bits", "full_action_bits", "steps",
             ):
-                transition_parts[name].append(np.asarray(host_batch[name]))
+                if host_batch.get(name) is not None:
+                    transition_parts[name].append(np.asarray(host_batch[name]))
 
     count = max(totals["count"], 1.0)
 
@@ -305,7 +317,7 @@ def evaluate_model(
         episode_ids = per_transition["episode_ids"]
         task_bill = np.zeros_like(per_transition["total_bits"], dtype=np.float64)
         _, first_indices = np.unique(episode_ids, return_index=True)
-        task_bill[first_indices] = 4.0
+        task_bill[first_indices] = task_bill_bits(len(cache.task_names))
         per_transition["action_bill_bits"] = bill
         per_transition["task_id_bill_bits"] = task_bill
         per_transition["action_billed_total_bits"] = (
@@ -348,6 +360,20 @@ def _task_balanced_overfit_rows(cache: FrozenCache, count: int, seed: int) -> np
     return np.asarray(selected, np.int64)
 
 
+def episode_split(cache: FrozenCache, rows: np.ndarray, fraction: float, seed: int):
+    rng = np.random.default_rng(seed)
+    episodes = cache.transitions["episode_ids"][rows]
+    tasks = cache.transitions["task_ids"][rows]
+    held: set[int] = set()
+    for task in np.unique(tasks):
+        unique = np.unique(episodes[tasks == task])
+        shuffled = rng.permutation(unique)
+        take = max(1, int(round(len(shuffled) * (1.0 - fraction))))
+        held.update(shuffled[:take].tolist())
+    mask = np.isin(episodes, np.fromiter(held, np.int64, len(held)))
+    return rows[~mask], rows[mask]
+
+
 def _training_rows(cache: FrozenCache, args) -> np.ndarray:
     if args.overfit_transitions:
         return _task_balanced_overfit_rows(cache, args.overfit_transitions, args.seed)
@@ -383,7 +409,6 @@ def _apply_training_overrides(training: TrainingConfig, args) -> TrainingConfig:
     if args.overfit_transitions:
         values.setdefault("min_steps", values.get("max_steps", training.max_steps))
         values.setdefault("patience_steps", values.get("max_steps", training.max_steps))
-        # Keep validation cadence legal for tiny sanity invocations.
         candidate_eval = values.get("eval_every", training.eval_every)
         candidate_patience = values["patience_steps"]
         if candidate_patience % candidate_eval:
@@ -414,7 +439,9 @@ def _write_per_episode(path: Path, cache: FrozenCache, values: dict[str, np.ndar
                 "action_billed_total_bits": float(
                     values["action_billed_total_bits"][local].sum(dtype=np.float64)
                 ),
-                "task_id_bill_bits": 4.0,
+                "task_id_bill_bits": float(
+                    values["task_id_bill_bits"][local].sum(dtype=np.float64)
+                ),
                 "total_episodic_bits": float(
                     values["total_episodic_bits"][local].sum(dtype=np.float64)
                 ),
@@ -431,6 +458,16 @@ def run(args: argparse.Namespace) -> dict:
         )
     cache = FrozenCache(args.cache, verify_hashes=args.verify_cache_hashes)
     config = load_config(args.config, num_tasks=len(cache.task_names))
+    cache.max_history = config.model.max_history
+    eval_cache = None
+    if args.eval_cache:
+        if args.dev_fraction:
+            raise ValueError("--eval-cache and --dev-fraction are exclusive")
+        eval_cache = FrozenCache(
+            args.eval_cache, verify_hashes=args.verify_cache_hashes
+        )
+        eval_cache.max_history = config.model.max_history
+    sel_cache = cache if eval_cache is None else eval_cache
     training = _apply_training_overrides(config.training, args)
     config = dataclasses.replace(config, training=training)
     jax.config.update("jax_default_matmul_precision", training.matmul_precision)
@@ -459,9 +496,24 @@ def run(args: argparse.Namespace) -> dict:
 
     train_rows = _training_rows(cache, args)
     overfit = bool(args.overfit_transitions)
-    selection_rows = train_rows if overfit else cache.indices_for_split(
-        "validation", test_freeze_manifest=None
-    )
+    if eval_cache is not None:
+        selection_rows = eval_cache.indices_for_split(
+            "validation", test_freeze_manifest=None
+        )
+    elif args.dev_fraction:
+        train_rows, selection_rows = episode_split(
+            cache, train_rows, 1.0 - args.dev_fraction, args.seed
+        )
+        if args.fit_subsample:
+            train_rows, _discarded = episode_split(
+                cache, train_rows, args.fit_subsample, args.seed
+            )
+    elif overfit:
+        selection_rows = train_rows
+    else:
+        selection_rows = cache.indices_for_split(
+            "validation", test_freeze_manifest=None
+        )
     params = jax.device_put(initialize_params(config.model, args.seed), device)
     optimizer, schedule = build_optimizer(params, training, overfit=overfit)
     opt_state = optimizer.init(params)
@@ -485,7 +537,7 @@ def run(args: argparse.Namespace) -> dict:
 
     update = make_update(optimizer, variant, config.model, overfit=overfit)
     initial, _ = evaluate_model(
-        cache, selection_rows, params, variant, config, keep_per_transition=False
+        sel_cache, selection_rows, params, variant, config, keep_per_transition=False
     )
     if not args.resume:
         best_metric = initial["total_bits_per_transition"]
@@ -502,7 +554,7 @@ def run(args: argparse.Namespace) -> dict:
     with history_path.open("a", encoding="utf-8") as history:
         while step < training.max_steps:
             selected = sampler.next()
-            batch = _device_batch(cache.batch(selected))
+            batch = _device_batch(cache.batch(selected), model_batch_keys(config.model))
             key, update_key = jax.random.split(key)
             params, opt_state, _loss, train_metrics = update(
                 params, opt_state, batch, update_key
@@ -511,7 +563,7 @@ def run(args: argparse.Namespace) -> dict:
             if step % training.eval_every and step != training.max_steps:
                 continue
             validation, _ = evaluate_model(
-                cache, selection_rows, params, variant, config,
+                sel_cache, selection_rows, params, variant, config,
                 keep_per_transition=False,
             )
             metric = validation["total_bits_per_transition"]
@@ -562,12 +614,23 @@ def run(args: argparse.Namespace) -> dict:
     best = load_checkpoint(best_path, metadata)
     best_params = jax.device_put(best["params"], device)
     final, per_transition = evaluate_model(
-        cache, selection_rows, best_params, variant, config,
+        sel_cache, selection_rows, best_params, variant, config,
         keep_per_transition=True,
     )
     transition_path = output / "per_transition.npz"
     np.savez_compressed(transition_path, **per_transition)
-    _write_per_episode(output / "per_episode.jsonl", cache, per_transition)
+    _write_per_episode(output / "per_episode.jsonl", sel_cache, per_transition)
+
+    last_final: dict | None = None
+    if last_path.exists():
+        last_params = jax.device_put(load_checkpoint(last_path, metadata)["params"], device)
+        last_final, last_per_transition = evaluate_model(
+            sel_cache, selection_rows, last_params, variant, config,
+            keep_per_transition=True,
+        )
+        last_transition_path = output / "per_transition_last.npz"
+        np.savez_compressed(last_transition_path, **last_per_transition)
+        _write_per_episode(output / "per_episode_last.jsonl", sel_cache, last_per_transition)
 
     relative_drop = 1.0 - final["total_bits_per_transition"] / max(
         initial["total_bits_per_transition"], 1e-30
@@ -586,6 +649,15 @@ def run(args: argparse.Namespace) -> dict:
             final["total_bits_per_transition"]
             < baseline_rates["source"]["total_bits_per_transition"]
         )
+        if last_final is not None:
+            gates["beats_copy_point_last"] = (
+                last_final["total_bits_per_transition"]
+                < baseline_rates["copy"]["total_bits_per_transition"]
+            )
+            gates["beats_source_point_last"] = (
+                last_final["total_bits_per_transition"]
+                < baseline_rates["source"]["total_bits_per_transition"]
+            )
     result = {
         "protocol": PROTOCOL,
         "variant": variant,
@@ -599,13 +671,17 @@ def run(args: argparse.Namespace) -> dict:
             "cache": str(Path(args.cache).resolve()),
             "cache_manifest_sha256": metadata["cache_manifest_sha256"],
             "train_transitions": len(train_rows),
-            "selection": "overfit_train" if overfit else "validation",
+            "selection": ("eval_cache_validation" if args.eval_cache else
+                          "train_dev_split" if args.dev_fraction else
+                          "overfit_train" if overfit else "validation"),
             "selection_transitions": len(selection_rows),
+            "eval_cache": (str(Path(args.eval_cache).resolve())
+                           if args.eval_cache else None),
             "subset": args.subset_name,
             "test_evaluated": False,
-            # Diagnostic runs are permanently disqualified from formal
-            # statistics; statistics._validate_run_artifact rejects this flag.
-            "dev_run": allow_dev,
+            "dev_run": allow_dev or bool(args.dev_fraction),
+            "dev_fraction": args.dev_fraction,
+            "fit_subsample": args.fit_subsample,
         },
         "training": {
             **dataclasses.asdict(training),
@@ -616,6 +692,7 @@ def run(args: argparse.Namespace) -> dict:
         },
         "initial": initial,
         "best_selection": final,
+        "last_selection": last_final,
         "relative_nll_drop": relative_drop,
         "gates": gates,
         "all_gates_passed": all(gates.values()) if gates else None,
@@ -628,6 +705,15 @@ def run(args: argparse.Namespace) -> dict:
             "per_transition": "per_transition.npz",
             "per_transition_sha256": sha256_file(transition_path),
             "per_episode": "per_episode.jsonl",
+            "per_transition_last": (
+                "per_transition_last.npz" if last_final is not None else None
+            ),
+            "per_transition_last_sha256": (
+                sha256_file(last_transition_path) if last_final is not None else None
+            ),
+            "per_episode_last": (
+                "per_episode_last.jsonl" if last_final is not None else None
+            ),
         },
         "numerics": {
             "activations": "float32",
@@ -670,14 +756,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subset-archive")
     parser.add_argument("--subset-name")
     parser.add_argument("--overfit-transitions", type=int)
+    parser.add_argument("--fit-subsample", type=float,
+                        help="keep this task-stratified fraction of the FIT "
+                             "episodes, dev untouched. Nested: the per-task "
+                             "permutation depends only on the seed, so the 0.25 "
+                             "set is a subset of the 0.5 set and a scaling curve "
+                             "built from these is not confounded by which "
+                             "episodes were drawn. Requires --dev-fraction.")
+    parser.add_argument("--dev-fraction", type=float,
+                        help="hold this fraction of TRAIN out by episode and select "
+                             "on it instead of validation. Used to derive a step "
+                             "budget without reading the validation curve -- the "
+                             "300,000 inherited from v8 overfits this corpus by "
+                             "step 22,500, and 22,500 was itself read off "
+                             "validation. Marks the run as a dev run.")
+    parser.add_argument("--eval-cache",
+                        help="evaluate the selection metric on this external "
+                             "cache's validation split at every eval point; "
+                             "exclusive with --dev-fraction")
     parser.add_argument("--baseline-json")
     parser.add_argument("--enforce-c1-point-gate", action="store_true")
     parser.add_argument("--verify-cache-hashes", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    # Diagnostic escape hatch. Unlocks DEV_VARIANTS and stamps the run as a dev
-    # run so statistics.py can never absorb it into a formal comparison.
     parser.add_argument("--allow-dev-variant", action="store_true")
-    # Explicit overrides are useful for M0/M1 smoke tests; formal runs leave them unset.
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--warmup-steps", type=int)

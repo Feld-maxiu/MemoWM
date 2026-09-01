@@ -42,7 +42,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from ..baselines import POSITIONS
+from ..baselines import cache_positions
 from ..cache import FrozenCache
 from ..schema import NUM_CATEGORIES
 from .artifacts import dev_path, write_dev_json
@@ -54,6 +54,7 @@ LN2 = float(np.log(2.0))
 
 def collect_targets(cache, fit_rows, positions_per_task, seed):
     """Dense source kernels + empirical row weights for sampled (task, position)."""
+    POSITIONS = cache_positions(cache)  # noqa: N806
     rng = np.random.default_rng(seed)
     tasks = np.unique(cache.transitions["task_ids"][fit_rows])
     kernels, weights, task_of, position_of, task_weight = [], [], [], [], []
@@ -126,6 +127,7 @@ def fit_rank(K, w, rank, *, use_copy, steps, learning_rate, seed, report=None):
 
 def run(args) -> dict:
     cache = FrozenCache(args.cache)
+    POSITIONS = cache_positions(cache)  # noqa: N806
     fit_rows, _dev_rows = episode_split(
         cache, cache.indices_for_split("train"), args.fit_fraction, args.seed
     )

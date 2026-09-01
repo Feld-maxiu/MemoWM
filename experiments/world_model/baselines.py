@@ -1,4 +1,3 @@
-"""Strict train-fit/held-out discrete transition baselines for frozen v8 codes."""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from experiments.state_tokenizer.common import sha256_file, write_json
-from experiments.state_tokenizer.slot_layout import GROUP_NAMES, KEY64_LAYOUT
+from experiments.state_tokenizer.slot_layout import GROUP_NAMES
 
 from .cache import CACHE_FILES, FrozenCache
 from .schema import NUM_CATEGORIES, NUM_LATENT_TOKENS, NUM_SUBSPACES, POLICY_NAMES
@@ -19,6 +18,32 @@ from .schema import NUM_CATEGORIES, NUM_LATENT_TOKENS, NUM_SUBSPACES, POLICY_NAM
 ALPHA = 0.5
 SOURCE_PRIOR_CONCENTRATION = NUM_CATEGORIES * ALPHA
 POSITIONS = NUM_LATENT_TOKENS * NUM_SUBSPACES
+
+
+def cache_categories(cache) -> int:
+    return int(cache.manifest.get("num_categories", NUM_CATEGORIES))
+
+
+def cache_positions(cache) -> int:
+    return int(cache.codes.shape[1]) * int(cache.codes.shape[2])
+
+
+def cache_groups(cache) -> tuple[tuple[str, int], ...]:
+    declared = tuple(int(v) for v in cache.manifest.get("layout", ()))
+    if (len(declared) == len(GROUP_NAMES)
+            and sum(declared) == int(cache.valid.shape[1])):
+        return tuple(zip(GROUP_NAMES, declared))
+    if declared and sum(declared) == int(cache.valid.shape[1]):
+        return tuple((f"band{i}", size) for i, size in enumerate(declared))
+    return (("slots", int(cache.valid.shape[1])),)
+
+
+def cache_layout(cache) -> tuple[int, ...]:
+    return tuple(size for _, size in cache_groups(cache))
+
+
+def task_bill_bits(num_tasks: int) -> float:
+    return float(max(0, int(np.ceil(np.log2(max(int(num_tasks), 1))))))
 
 
 def _lookup(sorted_keys: np.ndarray, counts: np.ndarray, wanted: np.ndarray) -> np.ndarray:
@@ -47,8 +72,12 @@ def _task_rates(
     eval_target: np.ndarray,
     eval_source_mask: np.ndarray,
     eval_target_mask: np.ndarray,
+    positions: int = POSITIONS,
+    categories: int = NUM_CATEGORIES,
 ) -> dict[str, np.ndarray]:
-    """Fit one task's tables and return per-evaluation-transition codelengths."""
+    POSITIONS = positions          # noqa: N806 -- shadows the v8 default on purpose
+    NUM_CATEGORIES = categories    # noqa: N806 -- ditto
+    SOURCE_PRIOR_CONCENTRATION = NUM_CATEGORIES * ALPHA   # noqa: N806
     fit_source = fit_source.reshape(len(fit_source), POSITIONS)
     fit_target = fit_target.reshape(len(fit_target), POSITIONS)
     eval_source = eval_source.reshape(len(eval_source), POSITIONS)
@@ -91,7 +120,6 @@ def _task_rates(
     )
     copy_code = -np.log2(copy_probability).sum(axis=1, dtype=np.float64)
 
-    # Sparse source-conditioned counts avoid a >6 GiB dense table.
     position_pair_offsets = np.arange(POSITIONS, dtype=np.int64) * (
         NUM_CATEGORIES * NUM_CATEGORIES
     )
@@ -175,7 +203,7 @@ def evaluate_baselines(
         )
     }
     output["marginal_mask_group_bits"] = np.zeros(
-        (len(eval_rows), len(KEY64_LAYOUT)), np.float64
+        (len(eval_rows), len(cache_layout(cache))), np.float64
     )
     output["copy_mask_group_bits"] = np.zeros_like(output["marginal_mask_group_bits"])
 
@@ -195,6 +223,8 @@ def evaluate_baselines(
             np.asarray(cache.codes[eval_target_indices[eval_local]], np.uint8),
             np.asarray(cache.valid[eval_source_indices[eval_local]], np.bool_),
             np.asarray(cache.valid[eval_target_indices[eval_local]], np.bool_),
+            categories=cache_categories(cache),
+            positions=cache_positions(cache),
         )
         for name in ("marginal_code_bits", "copy_code_bits", "source_code_bits"):
             output[name][eval_local] = rates[name]
@@ -204,7 +234,7 @@ def evaluate_baselines(
                 axis=1, dtype=np.float64
             )
             start = 0
-            for group, size in enumerate(KEY64_LAYOUT):
+            for group, size in enumerate(cache_layout(cache)):
                 stop = start + size
                 output[f"{prefix}_mask_group_bits"][eval_local, group] = matrix[
                     :, start:stop
@@ -226,7 +256,10 @@ def _mean(values: np.ndarray, selection: np.ndarray | None = None) -> float:
 
 
 def _summary(cache: FrozenCache, rows: np.ndarray, rates: dict[str, np.ndarray]) -> dict:
-    policies = cache.transitions["action_policies"][rows, -1]
+    policies = (
+        cache.transitions["action_policies"][rows, -1]
+        if "action_policies" in cache.transitions else None
+    )
     report = {}
     for name in ("marginal", "copy", "source"):
         entry = {
@@ -234,20 +267,21 @@ def _summary(cache: FrozenCache, rows: np.ndarray, rates: dict[str, np.ndarray])
             "code_bits_per_transition": _mean(rates[f"{name}_code_bits"]),
             "total_bits_per_transition": _mean(rates[f"{name}_total_bits"]),
         }
-        entry["by_policy"] = {
-            policy: {
-                "transitions": int(np.sum(policies == policy_id)),
-                "total_bits_per_transition": _mean(
-                    rates[f"{name}_total_bits"], policies == policy_id
-                ),
+        if policies is not None:
+            entry["by_policy"] = {
+                policy: {
+                    "transitions": int(np.sum(policies == policy_id)),
+                    "total_bits_per_transition": _mean(
+                        rates[f"{name}_total_bits"], policies == policy_id
+                    ),
+                }
+                for policy_id, policy in enumerate(POLICY_NAMES)
             }
-            for policy_id, policy in enumerate(POLICY_NAMES)
-        }
         report[name] = entry
     for name in ("marginal", "copy"):
         report[name]["mask_bits_by_observation_group"] = {
             group: _mean(rates[f"{name}_mask_group_bits"][:, index])
-            for index, group in enumerate(GROUP_NAMES)
+            for index, (group, _) in enumerate(cache_groups(cache))
         }
     return report
 
@@ -276,7 +310,7 @@ def _change_diagnostics(cache: FrozenCache, rows: np.ndarray, seed: int) -> dict
     consecutive = rates(target_codes, target_mask)
     start = 0
     consecutive["mask_by_observation_group"] = {}
-    for name, size in zip(GROUP_NAMES, KEY64_LAYOUT):
+    for name, size in cache_groups(cache):
         stop = start + size
         consecutive["mask_by_observation_group"][name] = (
             float(np.mean(source_mask[:, start:stop] != target_mask[:, start:stop]))
@@ -337,7 +371,7 @@ def run(args: argparse.Namespace) -> dict:
     episode_ids = cache.transitions["episode_ids"][eval_rows]
     task_bill = np.zeros((len(eval_rows),), np.float64)
     unique_episodes, first_indices = np.unique(episode_ids, return_index=True)
-    task_bill[first_indices] = 4.0
+    task_bill[first_indices] = task_bill_bits(len(cache.task_names))
     episodic_rates = {
         f"{name}_episodic_total_bits": rates[f"{name}_total_bits"] + task_bill
         for name in ("marginal", "copy", "source")
@@ -352,12 +386,15 @@ def run(args: argparse.Namespace) -> dict:
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     transition_path = output / "per_transition.npz"
+    per_transition = {}
+    if "action_policies" in cache.transitions:
+        per_transition["policies"] = cache.transitions["action_policies"][eval_rows, -1]
     np.savez_compressed(
         transition_path,
         transition_indices=eval_rows,
         task_ids=cache.transitions["task_ids"][eval_rows],
         episode_ids=cache.transitions["episode_ids"][eval_rows],
-        policies=cache.transitions["action_policies"][eval_rows, -1],
+        **per_transition,
         structural_action_bits=structural_action_bits,
         full_action_bits=full_action_bits,
         task_id_bill_bits=task_bill,
@@ -372,15 +409,21 @@ def run(args: argparse.Namespace) -> dict:
         "fit_transitions": len(fit_rows),
         "eval_transitions": len(eval_rows),
         "smoothing": {"jeffreys_alpha": ALPHA},
-        "source_backoff": {"prior": "copy", "concentration": SOURCE_PRIOR_CONCENTRATION},
+        "source_backoff": {"prior": "copy",
+                           "concentration": cache_categories(cache) * ALPHA},
         "bits_per_transition": rate_summary,
         "change_rate": _change_diagnostics(cache, eval_rows, args.seed),
-        "fixed_width_audit": {"code_bits": 16_384, "mask_bits": 64, "total_bits": 16_448},
+        "fixed_width_audit": {
+            "code_bits": int(cache_positions(cache) * np.log2(cache_categories(cache))),
+            "mask_bits": int(cache.valid.shape[1]),
+            "total_bits": int(cache_positions(cache) * np.log2(cache_categories(cache))
+                              + cache.valid.shape[1]),
+        },
         "side_information_audit": {
             "episodes": int(len(unique_episodes)),
             "task": {
                 "num_task_ids": len(cache.task_names),
-                "fixed_bits_per_episode": 4,
+                "fixed_bits_per_episode": task_bill_bits(len(cache.task_names)),
                 "amortized_bits_per_transition": _mean(task_bill),
             },
             "action": {

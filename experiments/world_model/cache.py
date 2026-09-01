@@ -1,10 +1,3 @@
-"""Build and read the immutable v8 code/transition cache.
-
-The cache is the only supported input to the neural WM and baselines. Once it is
-built, no training or evaluation path imports the tokenizer or re-encodes a
-state. This makes the evidence gate auditable and keeps test data mechanically
-closed until a freeze manifest is supplied.
-"""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +12,8 @@ import numpy as np
 
 from experiments.state_tokenizer.common import iter_jsonl, sha256_file, write_json
 from experiments.state_tokenizer.slot_layout import KEY64_LAYOUT
+
+from .schema_web import WEB_CACHE_PROTOCOL
 
 from .schema import (
     ACTION_TYPE_IDS,
@@ -50,6 +45,8 @@ CACHE_FILES = {
     "manifest": "manifest.json",
 }
 
+ACCEPTED_PROTOCOLS = frozenset({PROTOCOL, WEB_CACHE_PROTOCOL})
+
 V8_EXPECTED_STATES = {"train": 70_018, "validation": 20_011, "test": 9_979}
 V8_EXPECTED_TRANSITIONS = {"train": 39_365, "validation": 11_263, "test": 5_629}
 
@@ -62,8 +59,6 @@ class _Record:
     step: int
     split: str
     action: dict | None
-    # Needed only to correct SELECT_OPTION's logged option ref to the ref that
-    # BrowserGym actually acted on.
     compact_axtree: str
 
 
@@ -85,9 +80,6 @@ def _minimal_records(path: str | Path) -> tuple[list[_Record], dict[str, int]]:
             raise ValueError(f"row {row} has missing or duplicate state_id {state_id!r}")
         seen_states.add(state_id)
         action = raw.get("action")
-        # The dom is now read for every action, not just SELECT_OPTION: it is the
-        # only source of the target element's accessible name, which is absent
-        # from action.text for 100% of CLICKs (71.7% of all actions).
         needs_tree = isinstance(action, dict)
         records.append(_Record(
             global_index=index,
@@ -126,7 +118,6 @@ def build_transition_archive(
     *,
     expected_counts: dict[str, int] | None = None,
 ) -> dict:
-    """Join strict consecutive transitions and materialise seven-step contexts."""
     episodes: dict[str, list[_Record]] = defaultdict(list)
     for record in records:
         episodes[record.episode_id].append(record)
@@ -286,8 +277,6 @@ def _save_array_atomic(path: Path, values: np.ndarray) -> None:
 
 
 def build_cache(args: argparse.Namespace) -> dict:
-    """Encode all states once and freeze their transition metadata."""
-    # Heavy imports stay local: every downstream consumer remains tokenizer-free.
     import jax
     import jax.numpy as jnp
 
@@ -426,16 +415,22 @@ def build_cache(args: argparse.Namespace) -> dict:
 
 
 class FrozenCache:
-    """Validated, memory-mapped view of the immutable cache."""
 
-    def __init__(self, root: str | Path, *, verify_hashes: bool = False):
+    HISTORY_COLUMNS = (
+        "history_codes", "history_valid", "history_present", "action_types",
+        "action_payloads", "action_lengths", "action_tags", "action_refs",
+        "action_targets", "action_target_lengths", "action_x", "action_y",
+        "action_dx", "action_dy", "action_has_coord", "action_has_delta",
+    )
+
+    def __init__(self, root: str | Path, *, verify_hashes: bool = False,
+                 max_history: int | None = None):
+        self.max_history = max_history
         self.root = Path(root)
         manifest_path = self.root / CACHE_FILES["manifest"]
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if self.manifest.get("protocol") != PROTOCOL:
+        if self.manifest.get("protocol") not in ACCEPTED_PROTOCOLS:
             raise ValueError(f"unsupported cache protocol {self.manifest.get('protocol')!r}")
-        if tuple(self.manifest.get("layout", ())) != tuple(KEY64_LAYOUT):
-            raise ValueError(f"cache uses legacy/unknown layout {self.manifest.get('layout')}")
         self.codes = np.load(self.root / CACHE_FILES["codes"], mmap_mode="r")
         self.valid = np.load(self.root / CACHE_FILES["valid"], mmap_mode="r")
         self.global_indices = np.load(
@@ -452,23 +447,30 @@ class FrozenCache:
 
     def _validate_arrays(self):
         total = sum(int(v) for v in self.manifest["state_counts"].values())
-        if self.codes.dtype != np.uint8 or self.codes.shape != (
-            total, NUM_LATENT_TOKENS, NUM_SUBSPACES
-        ):
+        if self.codes.dtype != np.uint8 or self.codes.ndim != 3 or len(self.codes) != total:
             raise ValueError(f"invalid codes array {self.codes.dtype} {self.codes.shape}")
         if self.valid.dtype != np.bool_ or self.valid.shape != (
-            total, NUM_OBSERVATION_SLOTS
+            total, self.codes.shape[1]
         ):
             raise ValueError(f"invalid valid array {self.valid.dtype} {self.valid.shape}")
+        layout = tuple(int(v) for v in self.manifest.get("layout", ()))
+        if not layout or sum(layout) != self.valid.shape[1]:
+            raise ValueError(
+                f"layout {layout} does not describe {self.valid.shape[1]} mask slots"
+            )
         if self.global_indices.dtype != np.int64 or not np.array_equal(
             self.global_indices, np.arange(total, dtype=np.int64)
         ):
             raise ValueError("global_indices are not contiguous int64 0..N-1")
         n = int(self.manifest["transitions"])
-        if self.transitions["history_indices"].shape != (n, MAX_HISTORY):
-            raise ValueError("transition history shape mismatch")
+        window = int(self.manifest.get("max_history", MAX_HISTORY))
+        if self.transitions["history_indices"].shape != (n, window):
+            raise ValueError(
+                f"history_indices is {self.transitions['history_indices'].shape}, "
+                f"not {(n, window)} as the manifest declares"
+            )
         if self.transitions["action_payloads"].shape != (
-            n, MAX_HISTORY, MAX_PAYLOAD_BYTES
+            n, window, MAX_PAYLOAD_BYTES
         ):
             raise ValueError("transition payload shape mismatch")
         source = self.transitions["history_indices"]
@@ -515,22 +517,17 @@ class FrozenCache:
     def batch(self, transition_indices: np.ndarray) -> dict[str, np.ndarray]:
         rows = np.asarray(transition_indices, np.int64)
         history = self.transitions["history_indices"][rows]
+        keep = self.max_history
         present = history >= 0
         safe = np.maximum(history, 0)
         target = self.transitions["target_indices"][rows]
-        return {
+        batch = {
             "transition_indices": rows,
             "history_codes": np.asarray(self.codes[safe], np.uint8),
             "history_valid": np.asarray(self.valid[safe] & present[..., None], np.bool_),
             "history_present": present,
             "action_types": self.transitions["action_types"][rows],
-            "action_tags": self.transitions["action_tags"][rows],
-            "action_refs": self.transitions["action_refs"][rows],
             "action_payloads": self.transitions["action_payloads"][rows],
-            "action_targets": self.transitions["action_targets"][rows]
-            if "action_targets" in self.transitions else None,
-            "action_target_lengths": self.transitions["action_target_lengths"][rows]
-            if "action_target_lengths" in self.transitions else None,
             "action_lengths": self.transitions["action_lengths"][rows],
             "task_ids": self.transitions["task_ids"][rows],
             "target_codes": np.asarray(self.codes[target], np.uint8),
@@ -538,10 +535,32 @@ class FrozenCache:
             "target_indices": target,
             "episode_ids": self.transitions["episode_ids"][rows],
             "steps": self.transitions["steps"][rows],
-            "policies": self.transitions["action_policies"][rows, -1],
             "structural_action_bits": self.transitions["structural_action_bits"][rows],
             "full_action_bits": self.transitions["full_action_bits"][rows],
         }
+        for name in ("action_tags", "action_refs", "action_targets",
+                     "action_target_lengths", "action_x", "action_y",
+                     "action_dx", "action_dy", "action_has_coord",
+                     "action_has_delta"):
+            batch[name] = (
+                self.transitions[name][rows] if name in self.transitions else None
+            )
+        if keep is not None:
+            width = int(history.shape[1])
+            if keep > width:
+                raise ValueError(
+                    f"max_history {keep} exceeds the cache's window of {width}"
+                )
+            if keep < width:
+                for name in self.HISTORY_COLUMNS:
+                    value = batch.get(name)
+                    if value is not None:
+                        batch[name] = value[:, -keep:]
+        batch["policies"] = (
+            self.transitions["action_policies"][rows, -1]
+            if "action_policies" in self.transitions else None
+        )
+        return batch
 
 
 def parse_args() -> argparse.Namespace:

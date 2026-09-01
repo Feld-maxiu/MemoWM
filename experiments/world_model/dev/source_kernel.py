@@ -17,7 +17,7 @@ import dataclasses
 
 import numpy as np
 
-from ..baselines import ALPHA, POSITIONS, SOURCE_PRIOR_CONCENTRATION
+from ..baselines import ALPHA, SOURCE_PRIOR_CONCENTRATION, cache_positions
 from ..cache import FrozenCache
 from ..schema import NUM_CATEGORIES
 
@@ -37,6 +37,7 @@ class TaskTables:
 
 def fit_task(cache: FrozenCache, task_id: int, fit_rows: np.ndarray) -> TaskTables:
     """Refit one task's copy tables from the frozen cache (train rows only)."""
+    POSITIONS = cache_positions(cache)  # noqa: N806 -- geometry from the cache, not the v8 default
     fit_rows = np.asarray(fit_rows, np.int64)
     task_ids = cache.transitions["task_ids"][fit_rows]
     rows = fit_rows[task_ids == task_id]
@@ -122,6 +123,7 @@ def source_code_bits(
     This exists so the dense kernel used by the residual diagnostic can be
     checked against the frozen baseline artifact bit-for-bit.
     """
+    POSITIONS = cache_positions(cache)  # noqa: N806
     eval_rows = np.asarray(eval_rows, np.int64)
     fit_rows = np.asarray(fit_rows, np.int64)
     bits = np.zeros((len(eval_rows),), np.float64)

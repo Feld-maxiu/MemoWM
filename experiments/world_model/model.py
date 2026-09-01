@@ -1,4 +1,3 @@
-"""Pure-JAX block-causal Transformer for frozen distributed A2 codes."""
 from __future__ import annotations
 
 import dataclasses
@@ -44,17 +43,15 @@ class ModelConfig:
     action_embedding_dim: int = 32
     byte_embedding_dim: int = 16
     payload_hidden_dim: int = 64
-    # Adds the target-element byte channel. Lives in ModelConfig so it reaches
-    # resolved_dict and hence freeze.py's config hash.
     use_target_channel: bool = False
-    # Explicit persistence mixture p(c') = pi*1[c'=c] + (1-pi)*q(c'). A tied
-    # rank-8 head cannot express the identity kernel the copy baseline needs,
-    # so the term is supplied structurally rather than learned. Lives in
-    # ModelConfig for the same reason as use_target_channel: formal runs need
-    # it inside resolved_dict, and statistics.py compares parameter_shapes
-    # across runs, so it cannot be injected after initialisation.
     use_copy_gate: bool = False
     max_payload_bytes: int = MAX_PAYLOAD_BYTES
+    use_coordinate_channel: bool = False
+    num_action_types: int = len(ACTION_TYPE_IDS)
+    num_model_tags: int = NUM_MODEL_TAGS
+    num_model_refs: int = NUM_MODEL_REFS
+    coordinate_bins: int = 64
+    remat: bool = False
 
     def __post_init__(self):
         integers = (
@@ -75,6 +72,10 @@ class ModelConfig:
             raise ValueError("d_model must be divisible by num_heads")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie in [0,1)")
+        for name in ("num_action_types", "num_model_tags", "num_model_refs",
+                     "coordinate_bins"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be positive")
 
 
 def _normal(key, shape, std=0.02):
@@ -94,6 +95,8 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         return subkey
 
     action_width = config.action_embedding_dim * 3 + config.payload_hidden_dim
+    if config.use_coordinate_channel:
+        action_width += config.action_embedding_dim
     if config.use_target_channel:
         action_width += config.payload_hidden_dim
     params = {
@@ -111,14 +114,17 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         "valid/w": _weight(take(), (config.num_observation_slots, config.d_model)),
         "valid/b": jnp.zeros((config.d_model,), jnp.float32),
         "action/type_embedding": _normal(take(), (
-            len(ACTION_TYPE_IDS), config.action_embedding_dim
+            config.num_action_types, config.action_embedding_dim
         )),
-        "action/tag_embedding": _normal(take(), (
-            NUM_MODEL_TAGS, config.action_embedding_dim
-        )),
-        "action/ref_embedding": _normal(take(), (
-            NUM_MODEL_REFS, config.action_embedding_dim
-        )),
+    }
+    if not config.use_coordinate_channel:
+        params["action/tag_embedding"] = _normal(take(), (
+            config.num_model_tags, config.action_embedding_dim
+        ))
+        params["action/ref_embedding"] = _normal(take(), (
+            config.num_model_refs, config.action_embedding_dim
+        ))
+    params.update({
         "action/byte_embedding": _normal(take(), (256, config.byte_embedding_dim)),
         "action/gru_wx": _weight(take(), (
             config.byte_embedding_dim, 3 * config.payload_hidden_dim
@@ -128,7 +134,16 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         )),
         "action/gru_b": jnp.zeros((3 * config.payload_hidden_dim,), jnp.float32),
         "action/payload_mask": _normal(take(), (config.payload_hidden_dim,)),
-    }
+    })
+    if config.use_coordinate_channel:
+        params["action/x_embedding"] = _normal(take(), (
+            config.coordinate_bins + 1, config.action_embedding_dim
+        ))
+        params["action/y_embedding"] = _normal(take(), (
+            config.coordinate_bins + 1, config.action_embedding_dim
+        ))
+        params["action/delta_w"] = _weight(take(), (3, config.action_embedding_dim))
+        params["action/delta_b"] = jnp.zeros((config.action_embedding_dim,), jnp.float32)
     if config.use_target_channel:
         params["action/target_mask"] = _normal(take(), (config.payload_hidden_dim,))
     params.update({
@@ -138,8 +153,6 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         "action/pad": _normal(take(), (config.d_model,)),
         "mask_head/w": _weight(take(), (config.d_model, config.num_observation_slots)),
         "mask_head/b": jnp.zeros((config.num_observation_slots,), jnp.float32),
-        # The output classifier has no separate weight. Hidden is split into 32
-        # eight-dimensional pieces and dotted with code_embedding below.
         "code_head/b": jnp.zeros((
             config.num_latent_tokens, config.num_subspaces, config.num_categories
         ), jnp.float32),
@@ -162,11 +175,6 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         })
     params["final_norm_scale"] = jnp.ones((config.d_model,), jnp.float32)
     params["final_norm_bias"] = jnp.zeros((config.d_model,), jnp.float32)
-    # Deliberately last, and deliberately without a ``take()`` call: the copy
-    # gate must not perturb the PRNG stream, so that every other parameter is
-    # bit-identical to a run with the gate off at the same seed. Zeros give
-    # ``copy_logit = 0`` -> a 50/50 mixture at step 0, which is exactly the
-    # function dev/d_head_bakeoff.py trained from.
     if config.use_copy_gate:
         params["copy_head/w"] = jnp.zeros((
             config.num_latent_tokens, config.num_subspaces,
@@ -202,7 +210,6 @@ def _dropout(values, key, rate: float, train: bool):
 
 
 def block_causal_mask(max_history: int, tokens_per_time: int) -> jax.Array:
-    """Same-time tokens are bidirectional; future time blocks are invisible."""
     times = jnp.repeat(jnp.arange(max_history), tokens_per_time)
     return times[None, :] <= times[:, None]
 
@@ -253,7 +260,6 @@ def _byte_gru(params, payloads, lengths, config: ModelConfig):
 
 
 def _byte_channel(params, byte_ids, lengths, mask_param, mode, shape, config):
-    """Either encode the bytes or substitute the learned MASK for this channel."""
     if mode == "full":
         return _byte_gru(params, byte_ids, lengths, config)
     if mode == "mask":
@@ -261,25 +267,58 @@ def _byte_channel(params, byte_ids, lengths, mask_param, mode, shape, config):
     raise ValueError(mode)
 
 
+def actions_from_batch(batch, config: ModelConfig) -> dict:
+    actions = {
+        "types": batch["action_types"],
+        "payloads": batch["action_payloads"],
+        "lengths": batch["action_lengths"],
+    }
+    if config.use_coordinate_channel:
+        for name in ("x", "y", "dx", "dy", "has_coord", "has_delta"):
+            actions[name] = batch[f"action_{name}"]
+    else:
+        actions["tags"] = batch["action_tags"]
+        actions["refs"] = batch["action_refs"]
+    return actions
+
+
+def _coordinate_bin(values, present, bins: int):
+    index = jnp.clip((jnp.asarray(values, jnp.float32) * bins).astype(jnp.int32),
+                     0, bins - 1)
+    return jnp.where(jnp.asarray(present, jnp.bool_), index, bins)
+
+
+def _signed_log(values):
+    values = jnp.asarray(values, jnp.float32)
+    return jnp.sign(values) * jnp.log1p(jnp.abs(values))
+
+
 def _action_embedding(
     params, actions, config: ModelConfig, payload_mode: str,
     target_mode: str = "mask",
 ):
-    """Structural fields plus two byte channels sharing one GRU.
-
-    ``target`` says which element was acted on; ``payload`` says what was applied
-    to it. They are separate channels -- and separately maskable -- so that
-    G_semantic and G_payload can be attributed independently. The GRU weights
-    are shared and simply run twice, so the split costs no new parameters.
-    """
     type_ids = jnp.asarray(actions["types"], jnp.int32)
-    tag_ids = jnp.asarray(actions["tags"], jnp.int32)
-    refs = jnp.asarray(actions["refs"], jnp.int32)
-    structural = (
-        params["action/type_embedding"][type_ids],
-        params["action/tag_embedding"][tag_ids],
-        params["action/ref_embedding"][refs],
-    )
+    if config.use_coordinate_channel:
+        structural = (
+            params["action/type_embedding"][type_ids],
+            params["action/x_embedding"][
+                _coordinate_bin(actions["x"], actions["has_coord"], config.coordinate_bins)
+            ],
+            params["action/y_embedding"][
+                _coordinate_bin(actions["y"], actions["has_coord"], config.coordinate_bins)
+            ],
+            jnp.stack(
+                (_signed_log(actions["dx"]), _signed_log(actions["dy"]),
+                 jnp.asarray(actions["has_delta"], jnp.float32)),
+                axis=-1,
+            ) @ params["action/delta_w"] + params["action/delta_b"],
+        )
+    else:
+        structural = (
+            params["action/type_embedding"][type_ids],
+            params["action/tag_embedding"][jnp.asarray(actions["tags"], jnp.int32)],
+            params["action/ref_embedding"][jnp.asarray(actions["refs"], jnp.int32)],
+        )
     payload = _byte_channel(
         params, actions["payloads"], actions["lengths"],
         params["action/payload_mask"], payload_mode, type_ids.shape, config,
@@ -314,9 +353,6 @@ def _prepare_inputs(
     )):
         raise ValueError(f"history_valid has wrong shape {jnp.shape(history_valid)}")
 
-    # Ablations replace removed inputs by learned MASK tokens. For fixed-context
-    # variants all seven positions are active so the original padding pattern
-    # cannot leak episode age into T-only/no-history predictions.
     fixed_context = variant in (
         "no_history", "t_only", "state_only", "struct_no_history"
     )
@@ -352,7 +388,6 @@ def _prepare_inputs(
             payload_mode="mask" if (
                 structural_only or variant == "semantic_action"
             ) else "full",
-            # semantic_action = structural + target, payload withheld.
             target_mode="mask" if structural_only else "full",
         )
     if variant in ("no_history", "struct_no_history"):
@@ -429,21 +464,6 @@ def predict(
     train: bool = False,
     source_log_prior=None,
 ):
-    """Return ``mask_logits[B,64]`` and ``code_logits[B,64,32,256]``.
-
-    Three optional behaviours, all inert unless explicitly requested, so formal
-    runs are bit-identical to the original tied model:
-
-    * ``source_log_prior`` is added to the code logits, making the network
-      predict a residual over an external log-distribution instead of the
-      distribution itself.
-    * if ``params`` carries ``code_head/w`` the output classifier is untied
-      from the input code embedding.
-    * if ``params`` carries ``copy_head/w`` the code distribution becomes an
-      explicit persistence mixture ``p(c') = pi*1[c'=c] + (1-pi)*q(c')``. A
-      tied low-rank head cannot express the identity kernel the copy baseline
-      needs, so it is injected structurally rather than learned.
-    """
     history_codes = jnp.asarray(history_codes, jnp.int32)
     if history_present is None:
         history_present = jnp.any(jnp.asarray(history_valid, jnp.bool_), axis=-1)
@@ -454,8 +474,12 @@ def predict(
         actions, task_id, ablation_mask, config,
     )
     keys = jax.random.split(rng, config.num_layers)
+    layer_fn = (
+        jax.checkpoint(_transformer_layer, static_argnums=(3, 4, 6))
+        if config.remat else _transformer_layer
+    )
     for layer in range(config.num_layers):
-        hidden = _transformer_layer(
+        hidden = layer_fn(
             params, hidden, present, layer, config, keys[layer], train
         )
     hidden = _layer_norm(hidden, params["final_norm_scale"], params["final_norm_bias"])
@@ -483,15 +507,12 @@ def predict(
         on_source = jax.nn.one_hot(
             source_codes, config.num_categories, dtype=code_logits.dtype
         )
-        # -1e30 rather than -inf: logaddexp keeps a finite gradient path.
         keep_term = jnp.where(on_source > 0, log_keep, -1e30)
-        # Already normalised; codelength_bits' log_softmax is idempotent here.
         code_logits = jnp.logaddexp(keep_term, log_change + residual)
     return mask_logits, code_logits
 
 
 def codelength_bits(mask_logits, code_logits, target_valid, target_codes):
-    """Per-transition mask/code NLL; all 2,048 codes are always charged."""
     target_valid = jnp.asarray(target_valid, jnp.float32)
     target_codes = jnp.asarray(target_codes, jnp.int32)
     mask_matrix = (
@@ -516,13 +537,7 @@ def codelength_bits(mask_logits, code_logits, target_valid, target_codes):
 def loss_and_metrics(
     params, batch, variant: str, config: ModelConfig, *, rng=None, train=False
 ):
-    actions = {
-        "types": batch["action_types"],
-        "tags": batch["action_tags"],
-        "refs": batch["action_refs"],
-        "payloads": batch["action_payloads"],
-        "lengths": batch["action_lengths"],
-    }
+    actions = actions_from_batch(batch, config)
     mask_logits, code_logits = predict(
         params,
         batch["history_codes"], batch["history_valid"], actions,

@@ -58,6 +58,25 @@ STATE_LABELS: tuple[str, ...] = (
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
 
+def read_jsonl(path: str | Path) -> list[dict]:
+    """One JSON object per line, split on newlines only.
+
+    ``read_text().splitlines()`` is the obvious spelling and is wrong here.
+    ``splitlines`` also breaks on U+2028, U+2029, \x0b, \x0c and U+0085, and
+    ``json.dumps(..., ensure_ascii=False)`` -- which every writer in this repo
+    uses -- leaves those characters raw inside strings. MolmoWeb shard 15 has 11
+    page titles containing U+2028; each was cut in half and the whole caption
+    stage died on "Unterminated string". The pilot's two shards happened to
+    contain none, so nothing failed until the corpus grew.
+    """
+    rows: list[dict] = []
+    with Path(path).open(encoding="utf-8") as handle:
+        for line in handle:          # iteration splits on \n alone
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
 def adaptive_average_pool(values: np.ndarray, slots: int) -> tuple[np.ndarray, np.ndarray]:
     """Order-preserving adaptive mean pool with deterministic short-input handling.
 

@@ -1,0 +1,83 @@
+# World model for the MolmoWeb corpus, over Q-Former codes and pixel-coordinate
+# actions.
+#
+# Not a variant of v8_frozen.yaml and not comparable to it. Different slot count,
+# different quantiser, different action space, different fixed width. The one
+# number that carries over is the shape of the claim: how far below the
+# best statistical baseline the model gets, each measured on its own corpus.
+protocol: residualmem_web_discrete_wm_v1
+
+model:
+  # num_tasks is deliberately absent. config.load_config adopts the cache's value
+  # when the key is missing; MolmoWeb has one task where MiniWoB had twelve, and
+  # writing the number here would only be a second place for it to disagree.
+  max_history: 64
+  # 32 learned queries, not 64 pooled slots.
+  num_latent_tokens: 32
+  num_observation_slots: 32
+  num_subspaces: 32
+  num_categories: 256
+  code_embedding_dim: 8
+  # Unchanged: 32 x 8 = 256 still satisfies the weight-tying constraint.
+  d_model: 256
+  num_layers: 12
+  num_heads: 8
+  mlp_dim: 4096
+  dropout: 0.3
+  # 64 steps x 32 slots = 2048 tokens; the backward pass needs this.
+  remat: true
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  # Coordinates replace tag/ref. 17 action types against v8's 6 -- the table is
+  # sized here rather than from a module constant because an out-of-range gather
+  # in JAX clamps instead of raising.
+  use_coordinate_channel: true
+  num_action_types: 17
+  coordinate_bins: 64
+  # Carried over from v8: worth +434.76 bits there, and persistence is if
+  # anything more of the story here -- only 10.5% of codes survive a transition
+  # under this quantiser, against 29.2% under the contiguous split.
+  use_copy_gate: true
+  # No target channel: falsified on v8 (a deterministic +60.81-bit bill for no
+  # measurable gain), and there is no accessible name to put in it here anyway.
+  use_target_channel: false
+  max_payload_bytes: 40
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  # 38,840 train transitions at batch 32 is 1,214 steps per epoch. v8's 300,000
+  # was derived from its own 39,365, which happens to be within 2%, so the same
+  # budget lands at the same ~247 epochs.
+  max_steps: 300000
+  min_steps: 300000
+  eval_every: 2500
+  patience_steps: 300000
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  # rollout.py selects transitions by `steps == horizon - 1`, so these cover only
+  # the first seven steps of a trajectory. On MiniWoB that was most of an
+  # episode; here the median is 13 steps and the maximum 301, so a rollout number
+  # from this range describes the opening of a session, not the session.
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  payload_bytes: 40
+  # Per axis, matching schema_web.action_side_information_bits.
+  coordinate_bits: 10
+  # Recorded, not read -- no code consults these. They are here because v8_frozen
+  # carries the same three and its values (11 structural, 4 per episode) are
+  # wrong for this corpus: the coordinate channel bills more, and a single-task
+  # corpus bills nothing at all for naming the task. Measured over the 49,679
+  # transitions of the pilot cache.
+  structural_bill_bits: 20.45
+  full_bill_bits: 73.86
+  task_bill_bits_per_episode: 0
