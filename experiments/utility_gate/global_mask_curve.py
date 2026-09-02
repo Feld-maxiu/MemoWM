@@ -67,11 +67,24 @@ def main() -> None:
     parser.add_argument("--posteriors", required=True)
     parser.add_argument("--codebook", required=True)
     parser.add_argument("--pairs", required=True)
+    parser.add_argument("--fit-pairs", default=None,
+                        help="pairs file the labels index into, if not --pairs")
     parser.add_argument("--model", default="models/Qwen3.5-9B")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--keep", type=float, nargs="+",
-                        default=[0.3, 0.5, 0.7, 0.9])
+                        default=[0.70, 0.75, 0.80, 0.85, 0.90])
+    parser.add_argument("--pairs-split", default=None,
+                        help="evaluate only on this split of the pairs file")
+    parser.add_argument("--fit-pairs-split", default=None,
+                        help="fit the mask only from labels whose question is in "
+                             "this split. Separating the two by question is what "
+                             "keeps the Q-Former's own CE_gold targets out of the "
+                             "evaluation: on its training questions the latent "
+                             "carries 26 bits of state-specific signal, on held-out "
+                             "questions of the same corpus 11.4")
+    parser.add_argument("--lambdas", type=float, nargs="*", default=None,
+                        help="thresholds for |U| >= lambda * entropy")
     parser.add_argument("--max-rows", type=int, default=200)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
@@ -109,15 +122,36 @@ def main() -> None:
         with np.load(fit_gate / "codes.npz", allow_pickle=True) as data:
             fit_state_ids = [str(v) for v in np.asarray(data["state_ids/train"])]
         fit_sample_of = np.asarray([s.rsplit("-", 1)[0] for s in fit_state_ids])
+    elif args.pairs_split:
+        # The pairs file already splits by sample, and its split is the one that
+        # matters: those samples' questions were never CE_gold targets. Using it
+        # as the hold-out makes the evaluation disjoint from the mask fit in both
+        # question and sample, and keeps all of it rather than intersecting with
+        # a second random split.
+        eval_pairs = np.load(args.pairs, allow_pickle=True)
+        eval_split = np.asarray([str(v) for v in eval_pairs["split"]])
+        held = {f"{s}" for s, v in zip(eval_pairs["sample_id"], eval_split)
+                if v == args.pairs_split}
+        fit_sample_of = sample_of
     else:
         samples = np.unique(sample_of)
         held = set(rng.permutation(samples)[: max(1, len(samples) // 4)])
         fit_sample_of = sample_of
 
+    fit_pairs = np.load(args.fit_pairs or args.pairs, allow_pickle=True)
+    fit_split = ([str(v) for v in fit_pairs["split"]]
+                 if "split" in fit_pairs.files else None)
+
     table = load_labels(args.labels)
     label_sample = np.asarray([fit_sample_of[s] for s in table["state_row"]])
     fit = np.ones(len(label_sample), bool) if external else ~np.isin(
         label_sample, list(held))
+    if args.fit_pairs_split and fit_split is not None:
+        by_question = np.asarray(
+            [fit_split[int(r)] == args.fit_pairs_split for r in table["pair_row"]])
+        fit &= by_question
+    print(f"[curve] mask fitted from {int(fit.sum())} of {len(fit)} labels",
+          flush=True)
     position = table["position"][fit]
     utility = table["delta_nll_bits"][fit].astype(np.float64)
 
@@ -143,9 +177,14 @@ def main() -> None:
         axis=-1).mean(0).astype(np.float64)
     mean_rate = dumped["code_bits"][rows][:, slot, sub].mean(0).astype(np.float64)
 
+    magnitude = per_position(np.abs(utility), np.mean)
     scores = {
-        "magnitude": per_position(np.abs(utility), np.mean),
-        "signed": per_position(utility, np.mean),
+        "magnitude": magnitude,
+        # The criterion the objective actually names: utility per bit. Ranking by
+        # |U| alone ignores that positions differ in what they cost -- p1 to p99
+        # of the code length spans 1.3 to 8.8 bits -- so two positions of equal
+        # impact are not equally worth keeping.
+        "density": magnitude / np.maximum(mean_rate, 1e-6),
         "displacement": displacement,
         "rate": mean_rate,
         "random": rng.random(NUM_POSITIONS),
@@ -164,11 +203,26 @@ def main() -> None:
             mask[order[: int(round(keep * NUM_POSITIONS))]] = True
             masks[f"{arm}@{keep}"] = mask
 
+    # The Lagrangian form, kept per state rather than per corpus: drop j when
+    # |U_j| < lambda * H_j, with |U| a constant shipped with the model and H the
+    # posterior entropy at this state.
+    #
+    # The entropy is the part that has to be decoder-side. The obvious choice --
+    # the actual code length -log2 p(z+_j) -- is not available to the decoder,
+    # because it is a function of the very symbol being decided about. Entropy is
+    # what the decoder can compute from h and u alone, and it is the expected
+    # cost of the position, so the trade it expresses is the intended one and it
+    # costs no mask bits.
+    lambdas = args.lambdas or []
+
     pairs = np.load(args.pairs, allow_pickle=True)
     keys = [f"{s}-{int(r):04d}" for s, r in zip(pairs["sample_id"], pairs["record_index"])]
+    split = ([str(v) for v in pairs["split"]] if "split" in pairs.files
+             else [""] * len(keys))
     usable = [i for i, key in enumerate(keys)
               if key in by_id and sample_of[by_id[key]] in held
-              and posterior_row[by_id[key]] >= 0]
+              and posterior_row[by_id[key]] >= 0
+              and (args.pairs_split is None or split[i] == args.pairs_split)]
     chooser = np.random.default_rng(args.seed + 2)
     usable = list(chooser.permutation(usable))[args.shard_index::args.shard_count]
     usable = usable[: args.max_rows]
@@ -187,9 +241,14 @@ def main() -> None:
         fill = dumped["wm_argmax"][row].reshape(-1)
         base = codes[state].reshape(-1)
 
+        entropy = dumped["entropy_bits"][row].reshape(-1).astype(np.float64)
+        state_masks = dict(masks)
+        for lam in lambdas:
+            state_masks[f"threshold@{lam}"] = scores["magnitude"] >= lam * entropy
+
         variants = [rebuild(codes[state][None], book)]
         names = ["reference"]
-        for name, mask in masks.items():
+        for name, mask in state_masks.items():
             gated = base.copy()
             gated[~mask] = fill[~mask]
             variants.append(rebuild(gated.reshape(codes[state].shape)[None], book))
@@ -209,7 +268,7 @@ def main() -> None:
         for offset, name in enumerate(names[1:], start=1):
             if name == "raw_xbar":
                 continue
-            mask = masks[name]
+            mask = state_masks[name]
             records.append({
                 "pair_row": int(pair_row), "arm": name.split("@")[0],
                 "keep": float(name.split("@")[1]),
