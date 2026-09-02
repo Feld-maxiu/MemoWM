@@ -63,7 +63,6 @@ $JX -m residualmem.manifest        # 六项全 ok 才继续
 | Q-Former | `$D/qformer-K32e-obs0.5.gapbest.pt`（step 6000） |
 | 检索头 | `$D/head-K32e-obs0.5-gapbest.pt` |
 | 码本 C=64 | `$DATA/pq-full/opq-shared-mix10-M32-C64.npz` |
-| 码本 C=16 | `$DATA/pq/opq-shared-mix10-M32-C16.npz` |
 | 世界模型 | `run/best.pkl`（60k 步；`last.pkl` 是它的硬链接，两者字节相同） |
 | 效用掩码 | `gate/mask-lambda0.0010.npz` |
 
@@ -78,7 +77,10 @@ DATA=/mnt/data/users/luzheng/workspace/iclr/czs/data/molmoweb-pilot
 `opq-shared-mix10-M32-C64.npz`，是同一配置拟合的两次。只有 `pq-full/` 那本与世界模型
 训练数据内嵌的解码器逐位一致。用错另一本会产出合法的 `(32,32) uint8` 码、缓存能建、
 模型能打分——**只是所有数字差约 972 bit，且全程无任何报错**。
-删掉错的那本也不行（`pq/` 下还有要用的 C=16）。**只有 manifest 的哈希校验能拦住。**
+**只有 manifest 的哈希校验能拦住**——改名字或删文件都不行，因为出问题的正是「同名」这件事。
+
+（C=16 码本已于 2026-09-02 删除，全线只用 C=64。技术报告 §5.1 的 C=16 行与 `UTILITY_GATE.md` §4.4 的
+可证伪实验若要重做，需先用 `$DATA/encoded` 重新拟合。）
 
 被删掉的 30 个历史 checkpoint 的指纹与元信息留在 `CHECKPOINT_INVENTORY.json`。
 

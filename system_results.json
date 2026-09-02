@@ -4,7 +4,6 @@
     "qformer": "ok",
     "retrieval_head": "ok",
     "codebook": "ok",
-    "codebook_coarse": "ok",
     "world_model": "ok",
     "utility_mask": "ok"
   },

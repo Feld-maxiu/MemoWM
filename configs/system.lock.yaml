@@ -58,12 +58,17 @@ artifacts:
           0.000. The model will train and score without complaint and every
           number will be wrong by roughly 972 bits. See WM_MIXED_复现手册 §3.3.
 
-  # Kept, not deleted, and deliberately locked: UTILITY_GATE.md §4.4 rests a
-  # falsifiable prediction on it (a coarser codebook should leave the mask less
-  # to remove than C=64's 16.8%). Not run as of this minting.
-  codebook_coarse:
-    path: ${DATA}/pq/opq-shared-mix10-M32-C16.npz
-    sha256: 762ffac45e96d1401686e3d8a29c73b9a7449b701f003b090465e8e8f2fad12a
+  # REMOVED 2026-09-02, by request, so that only C=64 is on disk and no one can
+  # reach for the wrong granularity by accident.
+  #   $DATA/pq/opq-shared-mix10-M32-C16.npz
+  #     sha256 762ffac45e96d1401686e3d8a29c73b9a7449b701f003b090465e8e8f2fad12a
+  #   gate/codes-coarse.npz (its applied codes)
+  #     sha256 910220a085ec5f81e0fce4ff21a24e11ad57bc5c0933f3e2e90b7c119d1ae584
+  # Refittable from $DATA/encoded (4.0 GB, still present) with
+  # `qformer_pq --num-categories 16`; the falsifiability test in
+  # UTILITY_GATE.md 4.4 now needs that refit first rather than just a run.
+  # Consumers are guarded (`--codebook-coarse` defaults to None and both call
+  # sites check existence), so nothing breaks by its absence.
 
   # 60,000 steps, dropout 0.1. run/run.json best_selection.code_bits_per_transition
   # = 5182.83124384419 over 817 transitions; that number is the cross-check every
