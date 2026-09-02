@@ -1,0 +1,324 @@
+{
+  "protocol": "residualmem_system_run_v1",
+  "artifacts": {
+    "qformer": "ok",
+    "retrieval_head": "ok",
+    "codebook": "ok",
+    "codebook_coarse": "ok",
+    "world_model": "ok",
+    "utility_mask": "ok"
+  },
+  "mask": {
+    "protocol": "residualmem_utility_gate_mask_v1",
+    "groups_protocol": "residualmem_utility_gate_v1",
+    "rule": "drop j iff |U_j| < lambda * H_j, H from the WM posterior",
+    "lambda": 0.001,
+    "mask_bits": 0,
+    "why_zero_mask_bits": "utility and lambda ship with the model; H_j is recomputed decoder-side from h and u, so no per-state decision is transmitted",
+    "utility_is": "per-position mean |delta_nll_bits|, magnitude not signed",
+    "fitted_on_question_distribution": "wma-fitcorpus-questions",
+    "question_binding_warning": "the mask is bound to the question distribution above; fitting it on generated questions measurably worsened it on WMA questions (UTILITY_GATE.md 7.4)",
+    "labels": [
+      {
+        "path": "gate/labels-wmfill.npz",
+        "sha256": "40195020ea23f0cbaf75c632f3ff5640a35f0197f3bd7ba3ff6978a31ec185cc"
+      },
+      {
+        "path": "gate/labels-slot-s0.npz",
+        "sha256": "57b5a9c3ba3debd2c7dfdac4da6c70e4e6d275551faeb368285a3ed042ad1263"
+      },
+      {
+        "path": "gate/labels-slot-s1.npz",
+        "sha256": "30adb840d75b6ef84ea75ae15b165e7111be06560e22b1a2a9a161b150aa86d3"
+      }
+    ],
+    "num_labels": 86400,
+    "positions_covered": 1024,
+    "self_check": {
+      "states": 817,
+      "full_rate_bits": 5182.831233484654,
+      "gated_rate_bits": 4311.962860457973,
+      "keep_fraction": 0.835920765758874,
+      "saved_fraction": 0.16802946763928417,
+      "compression_vs_fixed_width": 1.4248731259590317
+    }
+  },
+  "null_control": {
+    "lambda": 0.0,
+    "arm": "gate",
+    "open_loop": {
+      "states": 817,
+      "full_rate_bits": 5182.831233666751,
+      "gated_rate_bits": 5182.831233666751,
+      "keep_fraction": 1.0,
+      "history_positions_spliced": 0
+    },
+    "closed_loop": {
+      "states": 817,
+      "full_rate_bits": 5182.831233666751,
+      "gated_rate_bits": 5182.831233666751,
+      "keep_fraction": 1.0,
+      "history_positions_spliced": 41472
+    },
+    "drift_bits": 0.0,
+    "drift_fraction_of_open_saving": 0.0,
+    "closed_loop_saved_fraction": 0.0,
+    "closed_loop_compression": 1.1854524531089623,
+    "history_corruption_cost_bits": 0.0,
+    "drift_by_episode_depth": [
+      {
+        "step_range": "0-0",
+        "states": 70,
+        "mean_drift_bits": 0.0,
+        "median_drift_bits": 0.0
+      },
+      {
+        "step_range": "1-1",
+        "states": 47,
+        "mean_drift_bits": 0.0,
+        "median_drift_bits": 0.0
+      },
+      {
+        "step_range": "2-3",
+        "states": 64,
+        "mean_drift_bits": 0.0,
+        "median_drift_bits": 0.0
+      },
+      {
+        "step_range": "4-7",
+        "states": 93,
+        "mean_drift_bits": 0.0,
+        "median_drift_bits": 0.0
+      },
+      {
+        "step_range": "8-15",
+        "states": 128,
+        "mean_drift_bits": 0.0,
+        "median_drift_bits": 0.0
+      },
+      {
+        "step_range": "16+",
+        "states": 415,
+        "mean_drift_bits": 0.0,
+        "median_drift_bits": 0.0
+      }
+    ]
+  },
+  "closed_loop": [
+    {
+      "lambda": 0.001,
+      "arm": "gate",
+      "open_loop": {
+        "states": 817,
+        "full_rate_bits": 5182.831233666751,
+        "gated_rate_bits": 4311.962860691869,
+        "keep_fraction": 0.835920765758874,
+        "history_positions_spliced": 0
+      },
+      "closed_loop": {
+        "states": 817,
+        "full_rate_bits": 5239.472749122298,
+        "gated_rate_bits": 4323.840133964778,
+        "keep_fraction": 0.8361383108935129,
+        "history_positions_spliced": 41472
+      },
+      "drift_bits": 11.877273272909406,
+      "drift_fraction_of_open_saving": 0.01363842532521498,
+      "closed_loop_saved_fraction": 0.16573781027676915,
+      "closed_loop_compression": 1.4209591033991844,
+      "history_corruption_cost_bits": 56.64151545554705,
+      "drift_by_episode_depth": [
+        {
+          "step_range": "0-0",
+          "states": 70,
+          "mean_drift_bits": 0.0,
+          "median_drift_bits": 0.0
+        },
+        {
+          "step_range": "1-1",
+          "states": 47,
+          "mean_drift_bits": 0.1839501699234577,
+          "median_drift_bits": 3.2928266525268555
+        },
+        {
+          "step_range": "2-3",
+          "states": 64,
+          "mean_drift_bits": 18.706888310611248,
+          "median_drift_bits": 9.313498109579086
+        },
+        {
+          "step_range": "4-7",
+          "states": 93,
+          "mean_drift_bits": 22.717966321975954,
+          "median_drift_bits": 10.434513926506042
+        },
+        {
+          "step_range": "8-15",
+          "states": 128,
+          "mean_drift_bits": 16.47650603041984,
+          "median_drift_bits": 10.921177089214325
+        },
+        {
+          "step_range": "16+",
+          "states": 415,
+          "mean_drift_bits": 10.3038123235286,
+          "median_drift_bits": 11.233940303325653
+        }
+      ]
+    },
+    {
+      "lambda": 0.001,
+      "arm": "random",
+      "open_loop": {
+        "states": 817,
+        "full_rate_bits": 5182.831233666751,
+        "gated_rate_bits": 4325.893987078088,
+        "keep_fraction": 0.835920765758874,
+        "history_positions_spliced": 0
+      },
+      "closed_loop": {
+        "states": 817,
+        "full_rate_bits": 5193.210058335502,
+        "gated_rate_bits": 4337.09197570938,
+        "keep_fraction": 0.8363809573898409,
+        "history_positions_spliced": 41472
+      },
+      "drift_bits": 11.197988631291992,
+      "drift_fraction_of_open_saving": 0.013067454677538497,
+      "closed_loop_saved_fraction": 0.16318093718035798,
+      "closed_loop_compression": 1.4166174096400344,
+      "history_corruption_cost_bits": 10.378824668750894,
+      "drift_by_episode_depth": [
+        {
+          "step_range": "0-0",
+          "states": 70,
+          "mean_drift_bits": 0.0,
+          "median_drift_bits": 0.0
+        },
+        {
+          "step_range": "1-1",
+          "states": 47,
+          "mean_drift_bits": 20.73823370515032,
+          "median_drift_bits": 14.344877362251282
+        },
+        {
+          "step_range": "2-3",
+          "states": 64,
+          "mean_drift_bits": 32.025767997372895,
+          "median_drift_bits": 28.950277358293533
+        },
+        {
+          "step_range": "4-7",
+          "states": 93,
+          "mean_drift_bits": 28.465092014561417,
+          "median_drift_bits": 15.65944504737854
+        },
+        {
+          "step_range": "8-15",
+          "states": 128,
+          "mean_drift_bits": 8.879069703863934,
+          "median_drift_bits": 9.503359168767929
+        },
+        {
+          "step_range": "16+",
+          "states": 415,
+          "mean_drift_bits": 5.640086979140718,
+          "median_drift_bits": 8.663704872131348
+        }
+      ]
+    },
+    {
+      "lambda": 0.001,
+      "arm": "anti",
+      "open_loop": {
+        "states": 817,
+        "full_rate_bits": 5182.831233666751,
+        "gated_rate_bits": 4347.617991871794,
+        "keep_fraction": 0.835920765758874,
+        "history_positions_spliced": 0
+      },
+      "closed_loop": {
+        "states": 817,
+        "full_rate_bits": 5259.3356312167,
+        "gated_rate_bits": 4381.698394545599,
+        "keep_fraction": 0.8364980970777234,
+        "history_positions_spliced": 41472
+      },
+      "drift_bits": 34.0804026738042,
+      "drift_fraction_of_open_saving": 0.04080443289017066,
+      "closed_loop_saved_fraction": 0.15457436350949194,
+      "closed_loop_compression": 1.4021960086637044,
+      "history_corruption_cost_bits": 76.50439754994841,
+      "drift_by_episode_depth": [
+        {
+          "step_range": "0-0",
+          "states": 70,
+          "mean_drift_bits": 0.0,
+          "median_drift_bits": 0.0
+        },
+        {
+          "step_range": "1-1",
+          "states": 47,
+          "mean_drift_bits": 15.836370178993713,
+          "median_drift_bits": 10.11200499534607
+        },
+        {
+          "step_range": "2-3",
+          "states": 64,
+          "mean_drift_bits": 43.46878893254325,
+          "median_drift_bits": 20.993120044469833
+        },
+        {
+          "step_range": "4-7",
+          "states": 93,
+          "mean_drift_bits": 56.90613975992767,
+          "median_drift_bits": 31.064443111419678
+        },
+        {
+          "step_range": "8-15",
+          "states": 128,
+          "mean_drift_bits": 37.95244824059773,
+          "median_drift_bits": 38.70317527651787
+        },
+        {
+          "step_range": "16+",
+          "states": 415,
+          "mean_drift_bits": 34.13781378779067,
+          "median_drift_bits": 34.28472065925598
+        }
+      ]
+    }
+  ],
+  "main_table": [
+    {
+      "arm": "fixed width",
+      "rate_bits": 6144.0,
+      "compression": 1.0,
+      "answer_cost_bits": null
+    },
+    {
+      "arm": "+ WM conditional coding",
+      "rate_bits": 5182.831233484654,
+      "compression": 1.1854524531506128,
+      "answer_cost_bits": 0.148,
+      "note": "answer cost is the quantizer's own, measured separately"
+    },
+    {
+      "arm": "+ utility gate lambda=0.001 (open loop)",
+      "rate_bits": 4311.962860457973,
+      "compression": 1.4248731259590317,
+      "answer_cost_bits": 0.103
+    },
+    {
+      "arm": "+ utility gate lambda=0.001 (closed loop)",
+      "rate_bits": 4323.840133964778,
+      "compression": 1.4209591033991844,
+      "answer_cost_bits": null,
+      "note": "drift 11.88 bits; NOT earned by the gate -- a budget-matched random mask drifts the same amount"
+    }
+  ],
+  "quoted_not_recomputed": {
+    "qa_c": 0.5953360768175583,
+    "why": "report §5.6: 90.3% of questions retrieve zero latent rows, so QA-C cannot observe a change to the latent. Recomputing it here would imply it was responsive to this pipeline."
+  }
+}
