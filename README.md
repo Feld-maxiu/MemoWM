@@ -4,9 +4,14 @@ ResidualMem 是一个面向 GUI/Web 与交互轨迹的外部记忆方法原型�
 
 完整实验结论见：
 
-- `QFORMER_实验手册.md`（当前 Q-Former 线：怎么跑、坑在哪、数字能说什么）
-- `WORLD_MODEL_WORKLOG.md`
-- `技术报告_ResidualMem.md`
+- `WMA_RESIDUAL_复现手册.md`（**从这里开始**：整条链路怎么跑、产物在哪）
+- `技术报告_ResidualMem.md`（方法、全部实测、必须声明的事项）
+- `UTILITY_GATE.md`（效用门控与闭环）
+- `QFORMER_实验手册.md` / `WM_MIXED_复现手册.md`（分段细节与坑）
+
+`WORLD_MODEL_WORKLOG.md`（v8/MiniWoB 线，语料已废弃）与 `WMA_RAG_WORKLOG.md`
+（检索线，2026-08-22 冻结）已于 2026-09-02 移除，内容见
+`git show d91aaa3:WORLD_MODEL_WORKLOG.md`。
 
 v8 离散 WM 已实现为独立的 `experiments/world_model/` 实验线；正式入口、
 计费不变量与 M0--M4 命令见 `experiments/world_model/README.md`。M0 已完成；
