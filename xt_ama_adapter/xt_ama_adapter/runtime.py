@@ -6,12 +6,15 @@ requires the residual-mem checkout and its ``qwen-vl`` Python environment.
 
 The selected artifact pair is explicit rather than interchangeable:
 
-* ``qformer-K16-nosa.pt`` produces 16 x 512 x_t states;
-* ``retrieval-head-qformer-wma.pt`` was fitted on that Q-Former cache and maps
-  those states to normalized 4096-D ``qwen3_vl_fused_observation_v1`` vectors.
+* the frozen K32 (32 x 512) Q-Former checkpoint (``qk_norm=True``, no
+  self-attention) produces 32 x 512 x_t states;
+* the matched retrieval head was fitted on that Q-Former cache and maps those
+  states to normalized 4096-D ``qwen3_vl_fused_observation_v1`` vectors.
 
-Using a PCA head or a 64-slot Q-Former with this head would be a coordinate
-mismatch, so the loader checks both protocols and state-dict shapes.
+Using a PCA head, a 16-slot Q-Former, or a Q-Former trained with a different
+``qk_norm`` setting would be a coordinate mismatch, so the loader checks
+protocols, ``qk_norm``, the head-to-Q-Former artifact hash binding and
+state-dict shapes.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+import hashlib
 import sys
 
 import numpy as np
@@ -45,13 +49,17 @@ class QFormerRuntimeConfig:
     # can be touched.  This matters on the shared server, where existing jobs
     # may already own the cards.
     device: str = "cpu"
-    queries: int = 16
+    queries: int = 32
     qformer_hidden: int = 1024
     qformer_heads: int = 8
     qformer_layers: int = 4
     self_attention: bool = False
+    qk_norm: bool = True
     layer: int = 16
     max_length: int = 8192
+    # When False (default), an observation that does not fit ``max_length``
+    # raises instead of silently shortening the DOM fed to the frozen trunk.
+    allow_truncate: bool = False
 
     def required_paths(self) -> tuple[Path, ...]:
         return tuple(
@@ -91,11 +99,20 @@ def _l2_normalize(values: np.ndarray) -> np.ndarray:
     return values / norms
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def validate_artifact_pair(config: QFormerRuntimeConfig) -> dict[str, Any]:
     """Validate the selected Q-Former and retrieval head without a GPU forward.
 
-    This reads the two checkpoints on CPU. It proves protocol, slot count and
-    4096-D head compatibility before a 9B model is loaded on GPU.
+    This reads the two checkpoints on CPU. It proves protocol, slot count,
+    ``qk_norm``, the head-to-Q-Former artifact hash binding and 4096-D head
+    compatibility before a 9B model is loaded on GPU.
     """
     config.check_paths()
     _enable_residualmem(config.residualmem_root)
@@ -117,6 +134,12 @@ def validate_artifact_pair(config: QFormerRuntimeConfig) -> dict[str, Any]:
         raise ValueError(
             f"Q-Former checkpoint has queries={artifact_queries!r}; config requests {config.queries}"
         )
+    artifact_qk_norm = metadata.get("qk_norm")
+    if artifact_qk_norm is None or bool(artifact_qk_norm) != bool(config.qk_norm):
+        raise ValueError(
+            f"Q-Former checkpoint has qk_norm={artifact_qk_norm!r}; "
+            f"config requests {config.qk_norm}"
+        )
     if head_payload.get("protocol") != RETRIEVAL_HEAD_PROTOCOL:
         raise ValueError(
             f"retrieval-head protocol {head_payload.get('protocol')!r}; "
@@ -127,10 +150,28 @@ def validate_artifact_pair(config: QFormerRuntimeConfig) -> dict[str, Any]:
         raise ValueError(
             "retrieval head is not aligned to qwen3_vl_fused_observation_v1"
         )
+    recorded_hash = str(head_metadata.get("qformer_artifact_sha256") or "")
+    actual_hash = _sha256_file(Path(config.qformer_checkpoint))
+    if recorded_hash != actual_hash:
+        raise ValueError(
+            "artifact hash mismatch: retrieval head was not fitted on this Q-Former "
+            f"checkpoint (recorded {recorded_hash or 'missing'} != actual {actual_hash})"
+        )
     cache_name = str(head_metadata.get("cache", "")).lower()
-    if "qformer" not in cache_name:
+    if head_metadata.get("cache") and "qformer" not in cache_name:
         raise ValueError(
             "retrieval head was not trained on a Q-Former cache; refusing coordinate mismatch"
+        )
+    head_queries = head_metadata.get("queries")
+    if head_queries is not None and int(head_queries) != int(config.queries):
+        raise ValueError(
+            f"retrieval head was fitted for queries={head_queries!r}; "
+            f"config requests {config.queries}"
+        )
+    head_qk_norm = head_metadata.get("qk_norm")
+    if head_qk_norm is not None and bool(head_qk_norm) != bool(config.qk_norm):
+        raise ValueError(
+            f"retrieval head has qk_norm={head_qk_norm!r}; config requests {config.qk_norm}"
         )
     state = head_payload.get("state_dict") or {}
     projection = state.get("projection.2.weight")
@@ -140,6 +181,8 @@ def validate_artifact_pair(config: QFormerRuntimeConfig) -> dict[str, Any]:
     return {
         "qformer_protocol": qformer_payload["protocol"],
         "qformer_queries": artifact_queries,
+        "qformer_qk_norm": bool(artifact_qk_norm),
+        "qformer_artifact_sha256": recorded_hash,
         "qformer_checkpoint": str(Path(config.qformer_checkpoint).resolve()),
         "retrieval_head_protocol": head_payload["protocol"],
         "retrieval_head_checkpoint": str(Path(config.retrieval_head_checkpoint).resolve()),
@@ -176,9 +219,11 @@ class QFormerXTDocumentEncoder:
         self.processor, self.model = _load_model(
             self.config.qwen35_model_path, self._device, False
         )
-        # The Q-Former checkpoint contains its reader connector too.  It is
-        # loaded strictly even though retrieval only needs qformer.encode(), so
-        # all coordinates remain tied to the saved artifact.
+        # The Q-Former checkpoint is a joint artifact: it carries the reader
+        # connector AND the L_sem retrieval head it was trained against.  It is
+        # loaded strictly -- including that embedded head -- so every coordinate
+        # stays tied to the saved artifact; the runtime never calls
+        # reader.project(), the separately fitted head.pt drives ranking.
         reader = QFormerStateReader(
             StateQFormer(
                 num_queries=self.config.queries,
@@ -187,9 +232,10 @@ class QFormerXTDocumentEncoder:
                 layers=self.config.qformer_layers,
                 modalities=NUM_MODALITIES,
                 self_attention=self.config.self_attention,
+                qk_norm=self.config.qk_norm,
             ),
             InputSoftTokenConnector(slots=self.config.queries),
-            retrieval_head=None,
+            retrieval_head=MaskedAttentionRetrievalHead(),
         )
         qformer_payload = torch.load(
             self.config.qformer_checkpoint, map_location="cpu", weights_only=True
@@ -207,15 +253,19 @@ class QFormerXTDocumentEncoder:
 
     def encode_with_latents(
         self, records: Sequence[AMAXTObservation]
-    ) -> tuple[np.ndarray, tuple[tuple[np.ndarray, np.ndarray], ...]]:
+    ) -> tuple[np.ndarray, tuple[tuple[np.ndarray, np.ndarray], ...], tuple[bool, ...]]:
         """Encode AMA steps once for both retrieval and the latent Reader.
 
         The vectors are used only to rank steps.  The matching ``(xbar, valid)``
         state is retained for each selected rank and passed directly to the
         connector-backed Qwen reader at answer time.
+
+        The third return value is a per-record truncation audit (aligned with
+        ``records``); entries are True when the observation exceeded
+        ``max_length`` and was shortened under ``allow_truncate``.
         """
         if not records:
-            return np.empty((0, EMBEDDING_DIMENSION), dtype=np.float32), ()
+            return np.empty((0, EMBEDDING_DIMENSION), dtype=np.float32), (), ()
         self._load()
         _enable_residualmem(self.config.residualmem_root)
         from residualmem.benchmarks.worldmemarena_tokenizer import (
@@ -226,6 +276,7 @@ class QFormerXTDocumentEncoder:
 
         vectors = []
         latents = []
+        truncated_flags: list[bool] = []
         for record in records:
             web_observation = WebObservation(**record.worldmem_payload())
             if not web_observation.has_observation:
@@ -240,7 +291,9 @@ class QFormerXTDocumentEncoder:
                 layer=self.config.layer,
                 max_length=self.config.max_length,
                 device=self._device,
+                allow_truncate=self.config.allow_truncate,
             )
+            truncated_flags.append(bool(states.truncated))
             with self._torch.no_grad():
                 xbar, valid = self.reader.encode(*collate([states]))
                 vector = self.retrieval_head(xbar, valid)[0]
@@ -249,7 +302,11 @@ class QFormerXTDocumentEncoder:
                 xbar[0].float().cpu().numpy(),
                 valid[0].cpu().numpy(),
             ))
-        return _l2_normalize(np.stack(vectors, axis=0)), tuple(latents)
+        return (
+            _l2_normalize(np.stack(vectors, axis=0)),
+            tuple(latents),
+            tuple(truncated_flags),
+        )
 
     def encode(self, records: Sequence[AMAXTObservation]) -> np.ndarray:
         """Compatibility helper for retrieval-only callers."""

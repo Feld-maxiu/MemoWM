@@ -268,6 +268,16 @@ def _load_model(model_path: str, device: torch.device, use_kernels: bool,
     skips vanish it is numerical, if they persist the hypothesis is dead.
     """
     processor = AutoProcessor.from_pretrained(model_path, local_files_only=True)
+    # Newer transformers (>= 5.x) no longer copies the tokenizer's chat
+    # template onto multimodal processors, so processor.apply_chat_template()
+    # raises even though tokenizer.apply_chat_template() works.  The frozen
+    # trunk was trained through processor.apply_chat_template() under an older
+    # release, and the rendered text is identical either way (same
+    # chat_template.jinja), so bridge the template to keep the prompt bytes --
+    # and therefore the layer-16 hidden coordinates -- unchanged.
+    tokenizer_template = getattr(getattr(processor, "tokenizer", None), "chat_template", None)
+    if tokenizer_template and not getattr(processor, "chat_template", None):
+        processor.chat_template = tokenizer_template
     kwargs = {
         "dtype": dtype,
         "low_cpu_mem_usage": True,

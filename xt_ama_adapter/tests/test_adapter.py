@@ -53,7 +53,8 @@ class TestAMAXTAdapter(unittest.TestCase):
 
     def test_real_ama_episode_has_a_stable_record_per_step(self):
         root = Path(__file__).resolve().parents[2]
-        dataset = root / "AMA-Bench" / "dataset" / "test" / "open_end_qa_set.jsonl"
+        dataset = (root / "third_party" / "AMA-Bench" / "dataset" / "test"
+                   / "open_end_qa_set.jsonl")
         with dataset.open(encoding="utf-8") as handle:
             episode = json.loads(next(handle))
 

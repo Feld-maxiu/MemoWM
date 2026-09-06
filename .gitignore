@@ -8,6 +8,10 @@ MUJOCO_LOG.TXT
 ;
 .venv/
 .venv-jax/
+.venv-*/
+.hf-cache/
+logs/
+datasets/
 models/
 browsergym-venv/
 third_party/
@@ -17,3 +21,7 @@ gate/
 cache/
 run/
 testset/
+miniconda*
+qwen3-32b*.log
+switch_qwen32b_to_xet.sh
+.trae/

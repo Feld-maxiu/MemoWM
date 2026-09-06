@@ -48,6 +48,10 @@ class TrunkStates:
     hidden: torch.Tensor        # (tokens, 4096) bfloat16
     modality_ids: torch.Tensor  # (tokens,) int64
     positions: torch.Tensor     # (tokens,) float32 in [0, 1]
+    # Truncation audit, populated when the caller opted into ``allow_truncate``.
+    truncated: bool = False
+    kept_dom_chars: int | None = None
+    full_dom_chars: int | None = None
 
     def __len__(self) -> int:
         return int(self.hidden.shape[0])
@@ -71,21 +75,25 @@ def trunk_states(
     max_length: int = 8192,
     instruction: str = OBSERVATION_PROMPT,
     device: torch.device | None = None,
+    allow_truncate: bool = False,
 ) -> TrunkStates:
     """``(image, dom)`` -> the layer-16 sequence, unpooled.
 
     Mirrors ``frozen_v8_runtime.encode`` up to the pooling call, including the
     ``"instruct"`` prompt mode and the refusal to proceed on truncation -- a
     silently shortened DOM would change ``H_t`` without changing anything the
-    caller can see.
+    caller can see.  Callers that would rather keep going on over-long DOMs
+    (AMA episodes reach 43k characters) pass ``allow_truncate=True`` and get
+    the truncation facts back on the returned ``TrunkStates`` for audit.
     """
     inputs, truncated, kept_dom_chars, _original = prepare_inputs(
         processor, image, dom, instruction, max_length, "instruct"
     )
-    if truncated:
+    if truncated and not allow_truncate:
         raise ValueError(
             f"observation exceeded max length: kept {kept_dom_chars}/{len(dom)} DOM chars"
         )
+    kept = int(kept_dom_chars) if truncated else len(dom)
     indices = modality_indices(processor, model, inputs["input_ids"])
     target = device if device is not None else model.device
     device_inputs = inputs.to(target)
@@ -121,6 +129,9 @@ def trunk_states(
         hidden=hidden,
         modality_ids=modality_labels(length, indices, target),
         positions=positions / max(length - 1, 1),
+        truncated=bool(truncated),
+        kept_dom_chars=kept,
+        full_dom_chars=len(dom),
     )
 
 

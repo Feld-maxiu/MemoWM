@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 from pathlib import Path
 
@@ -53,7 +54,15 @@ def main() -> None:
                              "loads cleanly and encodes with the wrong forward")
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=35)
+    parser.add_argument("--rank", type=int, default=0)
+    parser.add_argument("--world-size", type=int, default=1,
+                        help="shard the store across N workers by sample stem")
+    parser.add_argument("--text-only", action="store_true",
+                        help="encode with a blank white image instead of reading "
+                             "record screenshots, matching the AMA runtime path")
     args = parser.parse_args()
+    if not 0 <= args.rank < args.world_size:
+        raise ValueError("rank must satisfy 0 <= rank < world-size")
 
     tokenizer = QFormerInstructTokenizer(
         model_path=args.model, checkpoint=args.checkpoint, queries=args.queries,
@@ -63,12 +72,22 @@ def main() -> None:
     processor, model, reader = tokenizer.processor, tokenizer.model, tokenizer.reader
 
     samples = sorted(Path(args.xbar_dir).glob("*.npz"))
+    if args.world_size > 1:
+        samples = [
+            path for position, path in enumerate(samples)
+            if position % args.world_size == args.rank
+        ]
     stems = [p.stem for p in samples]
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(len(stems))
     held = {stems[i] for i in order[: max(1, int(round(len(stems) * args.validation_fraction)))]}
 
-    xbars, valids, teachers, splits, sample_ids, texts = [], [], [], [], [], []
+    if args.rank == 0:
+        print(f"[cache] {len(stems)} samples on rank {args.rank}/{args.world_size}", flush=True)
+
+    xbars, valids, teachers, splits, sample_ids, step_indices, texts = (
+        [], [], [], [], [], [], []
+    )
     for path in samples:
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(np.asarray(data["metadata"])))
@@ -85,8 +104,11 @@ def main() -> None:
         for index, record in enumerate(records):
             if not record.get("synthetic_axtree"):
                 raise ValueError(f"{path.stem}[{index}] has no synthetic_axtree")
-            with Image.open(record["screenshot"]) as handle:
-                image = handle.convert("RGB")
+            if args.text_only:
+                image = Image.new("RGB", (1280, 720), "white")
+            else:
+                with Image.open(record["screenshot"]) as handle:
+                    image = handle.convert("RGB")
             states = trunk_states(processor, model, image, record["synthetic_axtree"],
                                   layer=tokenizer.layer, device=tokenizer.device)
             with torch.no_grad():
@@ -94,14 +116,36 @@ def main() -> None:
             xbars.append(xbar[0].float().cpu().numpy())
             valids.append(valid[0].cpu().numpy())
             teachers.append(teacher[index])
-            splits.append("validation" if path.stem in held else "train")
+            # Prefer the record's own split when the extraction carried one (the
+            # HumanTrajs manifest marks train/validation/test per trajectory);
+            # fall back to the held-out-sample discipline otherwise.
+            record_split = str(record.get("split", ""))
+            if record_split in {"train", "validation", "test"}:
+                splits.append(record_split)
+            else:
+                splits.append("validation" if path.stem in held else "train")
             sample_ids.append(path.stem)
+            # step_index: the record's position inside its trajectory, which is
+            # how downstream (_unique_states / merge) orders and deduplicates.
+            step = record.get("step_idx", record.get("step_index", index))
+            step_indices.append(int(step))
             texts.append(str(record.get("fused_text", "")))
         print(f"[cache] {path.stem}: {len(records)} states", flush=True)
 
     embeddings = np.stack(teachers).astype(np.float32)
     norms = np.linalg.norm(embeddings, axis=1)
     embeddings = embeddings / np.maximum(norms, 1e-12)[:, None]
+
+    # Bind the cache to the exact Q-Former that produced it.  frozen.pt's own
+    # file hash is the artifact hash the retrieval head stores, and the
+    # checkpoint metadata carries the model-state hash.
+    checkpoint_path = str(Path(args.checkpoint).resolve())
+    artifact_sha256 = hashlib.sha256(Path(checkpoint_path).read_bytes()).hexdigest()
+    qformer_state_sha256 = str(tokenizer.metadata.get("qformer_sha256", ""))
+    resolved_qk_norm = bool(
+        args.qk_norm if args.qk_norm is not None
+        else tokenizer.metadata.get("qk_norm", False)
+    )
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -111,14 +155,19 @@ def main() -> None:
         teacher_fused_embedding=embeddings,
         split=np.asarray(splits),
         sample_id=np.asarray(sample_ids),
+        step_index=np.asarray(step_indices, dtype=np.int64),
         target_text=np.asarray(texts),
         metadata=np.asarray(json.dumps({
             "protocol": BRIDGE_CACHE_PROTOCOL,
             "teacher_protocol": FUSED_OBSERVATION_TEACHER_PROTOCOL,
             "representation": "xbar",
             "source": "qformer",
-            "checkpoint": str(Path(args.checkpoint).resolve()),
+            "checkpoint": checkpoint_path,
             "queries": int(np.stack(xbars).shape[1]),
+            "qformer_artifact_sha256": artifact_sha256,
+            "qformer_state_sha256": qformer_state_sha256,
+            "qk_norm": resolved_qk_norm,
+            "self_attention": bool(args.self_attention),
             "split_unit": "sample",
             "validation_fraction": args.validation_fraction,
             "seed": args.seed,
