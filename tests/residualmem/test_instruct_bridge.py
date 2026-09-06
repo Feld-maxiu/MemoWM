@@ -8,6 +8,7 @@ from residualmem.latent.instruct_bridge import (
     MaskedAttentionRetrievalHead,
     cache_metadata_json,
 )
+from experiments.state_tokenizer.build_utility_retrieval_cache import build_views
 from experiments.state_tokenizer.extract_qwen import _input_text
 from experiments.state_tokenizer.train_retrieval_bridge import batch_loss, load_cache
 
@@ -61,6 +62,79 @@ def test_xbar_only_bridge_cache_and_loss_need_no_a2(tmp_path):
     )
     assert torch.isfinite(loss)
     assert set(metrics) == {"contrastive", "cosine", "xbar_cosine"}
+
+
+def test_utility_gated_bridge_cache_and_loss_use_both_reconstructions(tmp_path):
+    rng = np.random.default_rng(13)
+    xbar = rng.normal(size=(3, 32, 512)).astype(np.float32)
+    full = xbar + rng.normal(scale=0.01, size=xbar.shape).astype(np.float32)
+    gated = full + rng.normal(scale=0.02, size=xbar.shape).astype(np.float32)
+    valid = np.ones((3, 32), dtype=np.bool_)
+    teacher = rng.normal(size=(3, 4096)).astype(np.float32)
+    teacher /= np.linalg.norm(teacher, axis=-1, keepdims=True)
+    path = tmp_path / "utility-gated.npz"
+    np.savez_compressed(
+        path,
+        xbar=xbar,
+        full_recon_xbar=full,
+        gated_recon_xbar=gated,
+        valid=valid,
+        teacher_fused_embedding=teacher,
+        split=np.asarray(["train", "train", "validation"]),
+        metadata=np.asarray(cache_metadata_json(representation="utility_gated")),
+    )
+
+    cache = load_cache(path)
+    assert cache["metadata"]["representation"] == "utility_gated"
+    assert cache["full_recon_xbar"].shape == xbar.shape
+    head = MaskedAttentionRetrievalHead()
+    loss, metrics = batch_loss(
+        head,
+        torch.from_numpy(xbar),
+        torch.from_numpy(valid),
+        torch.from_numpy(teacher),
+        0.05,
+        full_recon=torch.from_numpy(full),
+        gated_recon=torch.from_numpy(gated),
+        consistency_weight=0.1,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert all(parameter.grad is not None for parameter in head.parameters())
+    assert set(metrics) == {
+        "contrastive", "cosine", "consistency",
+        "full_recon_cosine", "gated_recon_cosine",
+    }
+
+
+def test_build_utility_views_uses_all_send_without_a_posterior():
+    codes = np.ones((2, 2, 2), np.uint8)
+    centroids = np.zeros((2, 2, 2, 2), np.float32)
+    centroids[:, :, 1] = 1.0
+    book = {
+        "mean": np.zeros((2, 4), np.float32),
+        "scale": np.ones((2, 4), np.float32),
+        "centroids": centroids,
+        "bases": None,
+        "order": None,
+    }
+    posterior = {
+        "target_indices": np.asarray([1]),
+        "target_codes": codes[1:2],
+        "entropy_bits": np.ones((1, 2, 2), np.float32),
+        "wm_argmax": np.zeros((1, 2, 2), np.uint8),
+    }
+    full, gated, diagnostics = build_views(
+        ["initial", "transition"], codes, ["initial", "transition"],
+        {"initial": 0, "transition": 1}, posterior,
+        utility=np.zeros(4), lam=0.001, book=book,
+    )
+
+    assert np.array_equal(full[0], gated[0])
+    assert np.count_nonzero(full[1]) == full[1].size
+    assert np.count_nonzero(gated[1]) == 0
+    assert diagnostics["posterior_states"] == 1
+    assert diagnostics["all_send_states"] == 1
 
 
 def test_input_connector_has_exact_zero_padding():

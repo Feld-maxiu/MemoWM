@@ -85,8 +85,8 @@ def main() -> None:
     if args.rank == 0:
         print(f"[cache] {len(stems)} samples on rank {args.rank}/{args.world_size}", flush=True)
 
-    xbars, valids, teachers, splits, sample_ids, step_indices, texts = (
-        [], [], [], [], [], [], []
+    xbars, valids, teachers, splits, sample_ids, step_indices, state_ids, texts = (
+        [], [], [], [], [], [], [], []
     )
     for path in samples:
         with np.load(path, allow_pickle=False) as data:
@@ -129,6 +129,9 @@ def main() -> None:
             # how downstream (_unique_states / merge) orders and deduplicates.
             step = record.get("step_idx", record.get("step_index", index))
             step_indices.append(int(step))
+            # state_id mirrors the utility-gate joining convention
+            # ({sample}-{record:04d}); kept alongside sample_id/step_index.
+            state_ids.append(f"{path.stem}-{index:04d}")
             texts.append(str(record.get("fused_text", "")))
         print(f"[cache] {path.stem}: {len(records)} states", flush=True)
 
@@ -156,6 +159,7 @@ def main() -> None:
         split=np.asarray(splits),
         sample_id=np.asarray(sample_ids),
         step_index=np.asarray(step_indices, dtype=np.int64),
+        state_id=np.asarray(state_ids),
         target_text=np.asarray(texts),
         metadata=np.asarray(json.dumps({
             "protocol": BRIDGE_CACHE_PROTOCOL,

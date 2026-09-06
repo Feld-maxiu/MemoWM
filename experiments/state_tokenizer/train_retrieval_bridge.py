@@ -1,4 +1,10 @@
-"""Train the shared Xbar/A2 retrieval head against fused Qwen3-VL teachers."""
+"""Train the retrieval head against fused Qwen3-VL teachers.
+
+Besides the legacy raw-Xbar and Xbar/A2 modes, ``utility_gated`` treats the
+full OPQ reconstruction as a training-time teacher view and the utility-gated
+reconstruction as the deployment view.  Both views retain the retrieval loss;
+the extra consistency term only asks compression not to move the memory's key.
+"""
 from __future__ import annotations
 
 import argparse
@@ -23,8 +29,9 @@ def load_cache(path: str | Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as data:
         if "teacher_embedding" in data.files:
             raise ValueError("stale screenshot-only teacher cache is forbidden")
+        available = set(data.files)
         required = {"xbar", "valid", "teacher_fused_embedding", "split", "metadata"}
-        missing = required - set(data.files)
+        missing = required - available
         if missing:
             raise ValueError(f"bridge cache missing {sorted(missing)}")
         metadata = json.loads(str(np.asarray(data["metadata"]).item()))
@@ -35,12 +42,17 @@ def load_cache(path: str | Path) -> dict[str, np.ndarray]:
         representation = metadata.get(
             "representation", "both" if "a2_xbar" in data.files else "xbar"
         )
-        if representation not in {"xbar", "both"}:
+        if representation not in {"xbar", "both", "utility_gated"}:
             raise ValueError(f"unsupported cache representation {representation!r}")
-        if representation == "both" and "a2_xbar" not in data.files:
-            raise ValueError("representation=both cache has no a2_xbar")
-        if "a2_xbar" in data.files:
-            required.add("a2_xbar")
+        view_fields = {
+            "both": {"a2_xbar"},
+            "utility_gated": {"full_recon_xbar", "gated_recon_xbar"},
+        }.get(representation, set())
+        missing = view_fields - available
+        if missing:
+            raise ValueError(
+                f"representation={representation} cache missing {sorted(missing)}")
+        required.update(view_fields)
         output = {name: np.asarray(data[name]) for name in required if name != "metadata"}
         metadata["representation"] = representation
         output["metadata"] = metadata
@@ -51,6 +63,11 @@ def load_cache(path: str | Path) -> dict[str, np.ndarray]:
     # right budget. The width is still fixed -- that one is real.
     if output["teacher_fused_embedding"].shape[1:] != (4096,):
         raise ValueError("teacher embedding must be 4096-D")
+    for name in ("a2_xbar", "full_recon_xbar", "gated_recon_xbar"):
+        if name in output and output[name].shape != output["xbar"].shape:
+            raise ValueError(
+                f"{name} shape {output[name].shape} does not match "
+                f"xbar {output['xbar'].shape}")
     return output
 
 
@@ -60,7 +77,39 @@ def symmetric_infonce(student: torch.Tensor, teacher: torch.Tensor, temperature:
     return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
 
 
-def batch_loss(head, xbar, valid, teacher, temperature, a2=None):
+def batch_loss(
+    head, xbar, valid, teacher, temperature, a2=None, *,
+    full_recon=None, gated_recon=None, consistency_weight=0.1,
+):
+    if (full_recon is None) != (gated_recon is None):
+        raise ValueError("full_recon and gated_recon must be provided together")
+    if full_recon is not None:
+        if a2 is not None:
+            raise ValueError("A2 and utility-gated views are mutually exclusive")
+        full_vector = head(full_recon, valid)
+        gated_vector = head(gated_recon, valid)
+        contrastive = 0.5 * (
+            symmetric_infonce(full_vector, teacher, temperature)
+            + symmetric_infonce(gated_vector, teacher, temperature)
+        )
+        cosine = 0.5 * (
+            (1.0 - (full_vector * teacher).sum(-1)).mean()
+            + (1.0 - (gated_vector * teacher).sum(-1)).mean()
+        )
+        # Full reconstruction is the stable target view.  Stop-gradient makes
+        # this a one-way distillation term; the ordinary retrieval objectives
+        # above continue to train both views and rule out a collapsed solution.
+        consistency = (
+            1.0 - (gated_vector * full_vector.detach()).sum(-1)
+        ).mean()
+        return contrastive + cosine + consistency_weight * consistency, {
+            "contrastive": contrastive,
+            "cosine": cosine,
+            "consistency": consistency,
+            "full_recon_cosine": (full_vector * teacher).sum(-1).mean(),
+            "gated_recon_cosine": (gated_vector * teacher).sum(-1).mean(),
+        }
+
     x_vector = head(xbar, valid)
     if a2 is None:
         contrastive = symmetric_infonce(x_vector, teacher, temperature)
@@ -89,7 +138,7 @@ def batch_loss(head, xbar, valid, teacher, temperature, a2=None):
     }
 
 
-def evaluate(head, tensors, indices, batch_size, temperature):
+def evaluate(head, tensors, indices, batch_size, temperature, consistency_weight):
     totals: dict[str, float] = {}
     count = 0
     head.eval()
@@ -100,6 +149,11 @@ def evaluate(head, tensors, indices, batch_size, temperature):
                 head, tensors["xbar"][index], tensors["valid"][index],
                 tensors["teacher"][index], temperature,
                 tensors.get("a2_xbar", None)[index] if "a2_xbar" in tensors else None,
+                full_recon=(tensors["full_recon_xbar"][index]
+                            if "full_recon_xbar" in tensors else None),
+                gated_recon=(tensors["gated_recon_xbar"][index]
+                             if "gated_recon_xbar" in tensors else None),
+                consistency_weight=consistency_weight,
             )
             values = {"loss": loss, **metrics}
             for name, value in values.items():
@@ -114,6 +168,10 @@ def train(args: argparse.Namespace) -> dict:
     representation = cache_representation if args.representation == "auto" else args.representation
     if representation == "both" and "a2_xbar" not in cache:
         raise ValueError("representation=both requested but cache has no a2_xbar")
+    if representation == "utility_gated" and not {
+            "full_recon_xbar", "gated_recon_xbar"}.issubset(cache):
+        raise ValueError(
+            "representation=utility_gated requested but cache has no utility views")
     device = torch.device(args.device)
     tensors = {
         "xbar": torch.as_tensor(cache["xbar"], dtype=torch.float32, device=device),
@@ -126,6 +184,10 @@ def train(args: argparse.Namespace) -> dict:
         tensors["a2_xbar"] = torch.as_tensor(
             cache["a2_xbar"], dtype=torch.float32, device=device
         )
+    if representation == "utility_gated":
+        for name in ("full_recon_xbar", "gated_recon_xbar"):
+            tensors[name] = torch.as_tensor(
+                cache[name], dtype=torch.float32, device=device)
     split = cache["split"].astype(str)
     train_idx = np.flatnonzero(split == "train")
     val_idx = np.flatnonzero(split == "validation")
@@ -148,12 +210,19 @@ def train(args: argparse.Namespace) -> dict:
             head, tensors["xbar"][index_t], tensors["valid"][index_t],
             tensors["teacher"][index_t], args.temperature,
             tensors.get("a2_xbar", None)[index_t] if "a2_xbar" in tensors else None,
+            full_recon=(tensors["full_recon_xbar"][index_t]
+                        if "full_recon_xbar" in tensors else None),
+            gated_recon=(tensors["gated_recon_xbar"][index_t]
+                         if "gated_recon_xbar" in tensors else None),
+            consistency_weight=args.consistency_weight,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(head.parameters(), args.clip_norm)
         optimizer.step()
         if step % args.eval_every == 0 or step == args.max_steps:
-            metrics = evaluate(head, tensors, torch.as_tensor(val_idx, device=device), args.eval_batch_size, args.temperature)
+            metrics = evaluate(
+                head, tensors, torch.as_tensor(val_idx, device=device),
+                args.eval_batch_size, args.temperature, args.consistency_weight)
             history.append({"step": step, **metrics})
             print(json.dumps(history[-1], sort_keys=True), flush=True)
             if metrics["loss"] < best:
@@ -167,6 +236,10 @@ def train(args: argparse.Namespace) -> dict:
                     representation=representation,
                     cache=str(Path(args.cache).resolve()),
                     temperature=args.temperature,
+                    consistency_weight=args.consistency_weight,
+                    consistency_teacher=(
+                        "full_reconstruction_stop_gradient"
+                        if representation == "utility_gated" else None),
                     best_step=step, validation=metrics,
                 )
             else:
@@ -180,6 +253,7 @@ def train(args: argparse.Namespace) -> dict:
         "output": str(Path(args.output).resolve()),
         "best_step": best_step,
         "best_validation_loss": best,
+        "consistency_weight": args.consistency_weight,
         "history": history,
     }
     Path(args.output).with_suffix(".json").write_text(json.dumps(report, indent=2, sort_keys=True))
@@ -191,7 +265,9 @@ def main() -> None:
     parser.add_argument("--cache", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--representation", choices=("auto", "xbar", "both"), default="auto")
+    parser.add_argument(
+        "--representation", choices=("auto", "xbar", "both", "utility_gated"),
+        default="auto")
     parser.add_argument("--max-steps", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=128)
@@ -200,6 +276,10 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.05)
+    parser.add_argument(
+        "--consistency-weight", type=float, default=0.1,
+        help="weight of 1-cos(gated key, stopgrad(full key)); used only by "
+             "representation=utility_gated")
     parser.add_argument("--clip-norm", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=35)
     args = parser.parse_args()
