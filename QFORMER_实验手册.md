@@ -3,7 +3,7 @@
 > 最终版的设计、结果、跑法。历史排查过程已压缩成 §5 的一张表，细节在 git：
 > `git show c7b9687:QFORMER_WORKLOG.md`（456 行编年体）。
 >
-> 最后更新 2026-08-28。
+> 最后更新 2026-09-06。
 
 ---
 
@@ -11,13 +11,12 @@
 
 把一个冻结 9B 读到的一屏观察（截图 + AXTree，约 1100–2800 token）压成 **K=32 个软 token**，喂给同一个冻结 9B 去答题。
 
-**选定产物**：`$D/qformer-K32e-obs0.5.gapbest.pt`（step 6000）+ `$D/head-K32e-obs0.5-gapbest.pt`
+**选定产物**：`$D/qformer-K32e-obs0.5.gapbest.pt`（step 6000）+
+`$D/head-K32e-obs0.5-gapbest-utility-gated.pt`（检索头 step 1750，$\alpha=0.1$）。
 
 能站住的主张只有一条：
 
 > **K=32 的学习式 resampler，用固定池化 1/2 的存储，在屏幕保真（gap +0.1744 vs +0.1610）上超过 64 槽固定池化；QA-C 不劣化。**
-
-⚠️ **不能写「答题质量持平」。** 本 benchmark 的 QA-C 对 latent 表示**没有判别力**（§2.2）——16 槽也打平 64 槽，所以「一半存储打平」不是 Q-Former 的功劳。
 
 ---
 
@@ -63,6 +62,27 @@ $$\mathcal L = \text{CE}_{\text{gold}} + 0.3\cdot\text{KL}_q + 0.5\cdot\text{KL}
 
 teacher 输出**预计算成 top-128**（`build_observation_teacher.py`）。截断在这个 KL 方向上有原则：每项由教师概率加权，丢掉的是权重最小的部分，残余质量即误差上界。**实测 70 万个位置：中位保留 0.999987，最小 0.73。** 全量存储要 0.2 TB，top-128 只要 1.6 GB。
 
+**utility gate 接入后只重训独立检索头，不重训 Q-Former。** 令
+$x_f=D(z^+)$ 为全码 OPQ 重建，
+$x_m=D(m\odot z^+ +(1-m)\odot\hat z_{\rm WM})$ 为门控重建，检索头 $h$
+使用：
+
+$$
+\mathcal L_{\rm head}=
+\tfrac12\mathcal L_{\rm ret}(h(x_f),t)+
+\tfrac12\mathcal L_{\rm ret}(h(x_m),t)+
+\alpha\left[1-\cos\left(h(x_m),\operatorname{sg}(h(x_f))\right)\right].
+$$
+
+默认 $\alpha=0.1$。两路都保留原有 symmetric InfoNCE + teacher cosine，
+因此一致性项不是单独优化，不存在“所有 key 一起塌缩”这个自由解。full 分支只在一致性项中
+stop-gradient；它自己的检索损失仍正常回传。Q-Former、OPQ、WM 和 utility artifact 全部冻结，
+否则会破坏已有码本、posterior 与 utility 位置坐标。
+
+**冻结决定（2026-09-06）**：固定 $\alpha=0.1$，不再扫权重；固定 best step 1750。
+相同 full/gated cache 上，新 head 的检索目标 3.30336（旧 head 3.31884），gated
+validation R@1/R@10 为 0.2274/0.6560。该项定位为压缩感知的接口正则，不单独作效果贡献。
+
 ### 1.3 探针 P1–P4
 
 定义在 `observation_kl_precheck.py:46-52`（**唯一副本**，trainer 直接 import）：
@@ -99,17 +119,17 @@ teacher 输出**预计算成 top-128**（`build_observation_teacher.py`）。截
 
 ### 2.1 主表（27/27 样本，1459 条 QA）
 
-| | 槽数 | QA-C | QA-H | QA-O | 保真 gap | 检索 R@1 |
-|---|---|---|---|---|---|---|
-| v6 官方 Raw-Fused | — | 0.5415 | 0.2132 | 0.2454 | — | — |
-| v9 Q-Former | 16 | 0.5949 | 0.1857 | 0.2193 | +0.0976 | 0.1464 |
-| v10 固定池化 | **64** | **0.5984** | 0.1864 | **0.2152** | +0.1610 | **0.3429** |
-| v12 K32b obs1.0 CE-best | 32 | 0.5936 | 0.1885 | 0.2180 | +0.0487 | — |
-| v12 K32b obs1.0 gap-best | 32 | 0.5936 | 0.1851 | 0.2214 | +0.0655 | — |
-| **★ K32e obs0.5 gapbest** | **32** | 0.5953 | 0.1886 | 0.2160 | **+0.1744** | 0.2310 |
-| K32e obs1.0 gapbest | 32 | 0.5977 | 0.1844 | 0.2180 | +0.1408 | 0.2095 |
+| | 槽数 | QA-C | QA-H | QA-O | 保真 gap |
+|---|---|---|---|---|---|
+| v6 官方 Raw-Fused | — | 0.5415 | 0.2132 | 0.2454 | — |
+| v9 Q-Former | 16 | 0.5949 | 0.1857 | 0.2193 | +0.0976 |
+| v10 固定池化 | **64** | **0.5984** | 0.1864 | **0.2152** | +0.1610 |
+| v12 K32b obs1.0 CE-best | 32 | 0.5936 | 0.1885 | 0.2180 | +0.0487 |
+| v12 K32b obs1.0 gap-best | 32 | 0.5936 | 0.1851 | 0.2214 | +0.0655 |
+| **★ K32e obs0.5 gapbest** | **32** | 0.5953 | 0.1886 | 0.2160 | **+0.1744** |
+| K32e obs1.0 gapbest | 32 | 0.5977 | 0.1844 | 0.2180 | +0.1408 |
 
-★ = 选定臂。QA-C 取顶层 `aggregate_metrics.json` 的 micro 值；gap 是 48 条 / P4 口径；R@1 是 `head_recall` 的 within-sample。
+★ = 选定臂。QA-C 取顶层 `aggregate_metrics.json` 的 micro 值；gap 是 48 条 / P4 口径。
 
 **K32e 两条臂是严格单变量对照**：只有 `--obs-weight` 不同，其余逐字相同、同数据同 seed。各 7250 步 / 12h42m / **跳步 0 次 / 学习率全程 1e-4 未动**。
 
@@ -125,95 +145,20 @@ teacher 输出**预计算成 top-128**（`build_observation_teacher.py`）。截
 所有 latent 臂 vs v6 官方         不一致 222–230  p≈1e-7~1e-8   全部 ***  （胜负约 152:74）
 ```
 
-**这个结构本身就是 §2.2 的证据。**
+### 2.2 一道没过的闸
 
-### 2.2 ☠️ QA-C 对 latent 表示没有判别力
+**24 条 vs 48 条 gap 的排序会反**。内联 24 条说 obs1.0(+0.3691) ≫ obs0.5(+0.2381)，独立 48 条说 obs0.5(+0.1744) > obs1.0(+0.1408)。**两次测量两次反转，至今没解释掉。** 48 条是权威口径，24 条只能看同一条臂的趋势。
 
-**本项目最重要的负面结论，做任何新实验前先读。**
-
-五个架构差异很大的臂，QA-C 全部落在 **0.5936–0.5985**，跨度 0.005 = 1459 题里差 7 题。
-
-**不是代码坏了**，三条证据：
-
-1. 五条 latent 臂彼此**答案字符串逐字相同率 90–94%，不是 100%**——latent 确实进了生成。而它们对 v6 只有 47%。
-2. 对 v6 全部 p≈1e-8 显著胜出，胜负比约 152:74。
-3. 检索全命中的题 QA-C 0.6917，完全没命中的 0.5505——记忆确实在起作用。
-
-**根因**：☠️ **原写作「检索几乎饱和」，2026-08-30 实测推翻，见下。**
-
-~~每个样本的记忆池 25–28 条；每题 top_k = 10 ← 池子的约 38% 直接交给 reader~~
-
-**真实根因：latent 行几乎进不了 reader。** 在选定臂 ★ K32e-obs0.5-gapbest 的 1,457 题上实测（`exp_results/K32e-obs0.5-gapbest/**/qa_records.jsonl`）：
-
-| | 原记载 | 实测 |
-|---|---|---|
-| 会话末池大小（28 样本） | 25–28 条 | min 54 / **p50 100** / mean 86.4 / max 110 |
-| top-10 占池比例 | 约 38% | **约 10%** |
-| 池内组成 | — | `full_round_text` 1,410 / `residualmem_xbar` 1,010 → latent 行占 41.7% |
-| 检索出的 14,570 个位置中的 latent 行 | — | **244 个 = 1.67%** |
-| **完全没检到 latent 行的题** | — | **1,315 / 1,457 = 90.3%** |
-
-**决定性证据（自然实验）**：obs0.5 与 obs1.0 是严格单变量对照。按"该题是否检到 latent 行"分层比较两臂的生成答案：
-
-| | 答案相同 | 答案不同 | 相同率 |
-|---|---:|---:|---:|
-| **零 latent 行**（1,282 题） | 1,282 | 0 | **100.0%** |
-| 有 latent 行（175 题） | 66 | 109 | 37.7% |
-
-**零例外。** 贪心解码下 latent 没进 prompt，两臂 prompt 逐字相同，答案必然相同。上面证据 1 的"逐字相同率 90–94%"因此**完全由「latent 没进 prompt」解释**，不是饱和——判别力只可能来自那 12% 的题，QA-C 跨度 0.005 是结构性必然。
-
-机制是 **latent 行的 key 在余弦竞争中打不过文本行**（查询是问题文本，经 Qwen3-VL 编码；latent 的 key 由 `MaskedAttentionRetrievalHead` 投影去迁就它）。`instruct_bridge.py:200-205` 的 docstring 早已记下同类观察（0.30 行 / 84% 无命中），本次在选定臂上测得更严重。
-
-离线 `head_recall` 上各臂 R@1 差得很远（0.21 vs 0.34），但端到端 `retrieval_hit_rate` 有 **97.7–98.6% 的题完全相同**。
-
-按命中率分层（K32e-obs1.0）：全命中 798 题 0.6917、部分命中 352 题 0.4290、**完全没命中 307 题仍有 0.5505**。**21% 的题在零证据下还能答对一半以上**，动态范围被进一步压缩。
-
-**后果**：
-
-- **「K=32 用一半存储打平 64 槽池化」站不住**——**16 槽也打平**（v9 vs v10 p=0.636）。1/4 存储也打平，说明 QA-C 压根没在量存储敏感度。
-- QA-C 列只能写**「不劣化」**。
-- **QA-C 不能当 latent 表示的保真闸**（含残差编码那条线原计划的"QA-C 下限 0.5936–0.5985"）——90.3% 的题它测不到 latent。要用，必须先在有 latent 行的题上分层。
-- ☠️ **原写的补救方向是反的。** 原文说"唯一办法是把 `top_k` 从 10 降到 2–3"。但 latent 行压在排序末尾——244 次出现中 rank 9 独占 68 次，rank 0 只有 5 次：
-
-  ```
-  截到 top-1  仅剩   5/244 =  2.0%
-  截到 top-2  仅剩  17/244 =  7.0%
-  截到 top-3  仅剩  38/244 = 15.6%   ← 原建议的 2–3
-  top-10          244/244 = 100%
-  ```
-
-  **降 `top_k` 会砍掉 84–93% 的 latent 行，QA-C 只会更死。** 真正要修的是检索排序（让 latent key 与文本 key 可比），不是 $k$。
-
-### 2.3 「内部指标涨、QA-C 不动」已经出现四次
-
-| | 内部指标 | QA-C |
-|---|---|---|
-| ℒ_sem InfoNCE | session 内 R@1 +50% | p=0.237 ns |
-| v12 CE-best vs gap-best | gap +35% | p=1.000，micro 值逐位相同 |
-| K32e obs0.5 vs obs1.0 | gap +24% | p=0.618 ns |
-| K32e vs v10 池化 | gap +8% | p=0.652 ns |
-
-**做新实验前先想清楚你要证的到底是哪一个指标。**
-
-### 2.4 两道没过的闸
-
-**① 检索**。`head_recall` within-sample R@1：固定池化 0.3429，K32e 最好的 0.2310（更早的 K32 臂 0.1655，随机 0.0369）。**Q-Former 在 session 内检索上稳定输给固定池化。**
-
-机制（仍然成立）：PCA 的目标函数就是可区分性，Q-Former 的目标是任务充分性，**两者部分对立**。分开同 session 第 3 轮和第 7 轮的是滚动位置、光标、哪一行高亮——**恰恰是一个好答题者应当归一化掉的偶然状态**。池化的 32 个图像槽固定在 4×8 网格上，「同站点不同状态」直接表现为「第 17 槽变了」，**差异有固定地址**；Q-Former 的查询是内容寻址的，同站点两轮取到相似内容、输出就相似。**让 resampler 稳健的置换不变性，正是抹掉 session 内差异的那个性质。**
-
-**② 24 条 vs 48 条 gap 的排序会反**。内联 24 条说 obs1.0(+0.3691) ≫ obs0.5(+0.2381)，独立 48 条说 obs0.5(+0.1744) > obs1.0(+0.1408)。**两次测量两次反转，至今没解释掉。** 48 条是权威口径，24 条只能看同一条臂的趋势。
-
-### 2.5 出表时必须写明
+### 2.3 出表时必须写明
 
 1. **只跑 `agent/gui/web` 27 样本**（论文 461），**同一个本地模型既答题又判题**，最终换 GPT-5.4 重判。
 2. **gap 列来自按 gap 选出的 checkpoint**，且 48 条抽样的**前 24 条就是选择集**（同 seed 35）。这是在被选择的指标上报告。
-3. **QA-C 打平 ≠ 同质量**，见 §2.2。**更强的表述**：90.3% 的题根本没检到 latent 行，两条单变量对照臂在这些题上答案相同率 100.0%（零例外）。**QA-C 在这批题上没有测量 latent 的能力**，不是"测了但没差别"。任何 QA-C 结论都必须注明有效样本是 175 题而非 1,459 题。
-4. **$w_o$ 两条臂都要报**。两点扫描全报是正常做法，只报赢的那条是第二层的指标选择。
-5. **本轮动了三处**（`KL_obs` 新增 + `KL_q` 换 teacher + 槽数 16→32），**非单变量**，表注逐项列。
-6. **top-128 是截断近似**，覆盖质量（中位 0.999987 / 最小 0.73）随结果一起报。
-7. **每条臂都是「训过的」对「零样本的官方基线」**，改损失消除不掉。
-8. **记忆侧 6 列各臂差 <0.01**——它们测的是 session 阶段的记忆抽取，不经过被改动的组件，**报成 12 列是充数**。
-9. **Q-Former 只在 WMA 非 web 的 QA 上训过**，在 BrowserGym 上是分布外的。
+3. **$w_o$ 两条臂都要报**。两点扫描全报是正常做法，只报赢的那条是第二层的指标选择。
+4. **本轮动了三处**（`KL_obs` 新增 + `KL_q` 换 teacher + 槽数 16→32），**非单变量**，表注逐项列。
+5. **top-128 是截断近似**，覆盖质量（中位 0.999987 / 最小 0.73）随结果一起报。
+6. **每条臂都是「训过的」对「零样本的官方基线」**，改损失消除不掉。
+7. **记忆侧 6 列各臂差 <0.01**——它们测的是 session 阶段的记忆抽取，不经过被改动的组件，**报成 12 列是充数**。
+8. **Q-Former 只在 WMA 非 web 的 QA 上训过**，在 BrowserGym 上是分布外的。
 
 ---
 
@@ -244,6 +189,7 @@ D=outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar
 | `$D/wma-observation-teacher/` | 1.6 GB | `build_observation_teacher.py` |
 | `$D/qformer-*.pt` | 315 MB | `train_qformer_joint.py` |
 | `$D/cache-*.npz` / `head-*.pt` | 373 / 19 MB | `build_qformer_bridge_cache.py` / `train_retrieval_bridge.py` |
+| `$D/cache-*-utility-gated.npz` | 835 MB | `build_utility_retrieval_cache.py`（full/gated 双视图，不重跑 Q-Former） |
 
 **预计算已全部做完**，只有换数据集或换 AXTree 风格时才重跑。依赖顺序是硬的：`wma_extract_xbar` → {`wma_encode_teacher`, `build_qformer_qa_pairs` → `build_observation_teacher`} → `train_qformer_joint`。只有 `build_observation_teacher` 支持分片（`--rank i --world-size n`，一进程一卡，**本仓库没有 torchrun**）。
 
@@ -294,7 +240,7 @@ bash scripts_qformer_downstream.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbe
 依次是：① `build_qformer_bridge_cache` 抽状态缓存 → ② `train_retrieval_bridge` 训检索头 → ③ `head_recall` 检索闸 → ④ `observation_kl_precheck` 算 48 条 gap。两条臂并行约 26 分钟。
 
 - **①④ 的 `--queries` 默认 16，必须传 32**，没有任何代码校验它与 checkpoint 是否匹配。
-- **③ 代码里没有通过标准**（无 VERDICT、无退出码），判据是人工比 within-sample R@1（§2.4）。**别看 global R@1**，干扰项更多只是更难。
+- **③ 输出 `head_recall` 诊断，不作为方法结论。**
 - **④ 有判据**（`:323-328`）：`gap <= 0` → 不要训；`matched_beats_mismatched < 0.9` → 先查。**报告数字必须用 `--observations 48`。**
 
 第五步官方 QA：
@@ -302,6 +248,17 @@ bash scripts_qformer_downstream.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbe
 ```bash
 bash scripts_qformer_official_eval.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
 ```
+
+utility-gated 检索头复现入口：
+
+```bash
+bash scripts_utility_retrieval_head.sh 0
+```
+
+当前选定 head 已锁定；脚本检测到它存在时会拒绝覆盖。从头复现时，脚本从现有
+`cache-K32e-obs0.5-gapbest.npz` 离线构造 full/gated 重建，只训练
+`MaskedAttentionRetrievalHead`。无 causal WM posterior 的 episode 初态按 codec 规则
+all-send，因此两路重建完全相同。
 
 **Q-Former 通过环境变量插入，不是 CLI 参数**（`residualmem_instruct_adapter.py:113-120`）。脚本已固化四个坑：
 
@@ -383,16 +340,14 @@ bash scripts_qformer_official_eval.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.ga
 
 | | 事情 | 为什么 |
 |---|---|---|
-| **1** | **修检索排序：让 latent 行的 key 与文本行的 key 可比** | §2.2。当前 **90.3% 的题一条 latent 行都没检到**，latent 行只占检索位置的 1.67% 且压在 rank 7–9。这是 QA-C 无判别力的真正根因，也是任何后续 QA 实验的前置条件 |
-| ~~1~~ | ~~`top_k` 10 → 2~3 重跑 QA-C~~ | ☠️ **撤销（2026-08-30）。方向是反的**——latent 行集中在排序末尾，截到 top-3 会砍掉 84.4%，QA-C 只会更死。见 §2.2 |
-| **2** | **换 seed 跑 96 条重测两臂 gap** | §2.5 第 2 条。「obs0.5 保真更好」目前只有一次独立测量，且测在选择集上 |
-| 3 | 重训固定池化 connector | 让主表两列的数据处理口径一致 |
-| 4 | 跑一条干净的 `w_o=0` 对照到收敛 | 现有对照只到 step 1250 |
-| 5 | 最终数字换 GPT-5.4 重判 | 现在答题与判题同模型 |
-| 6 | `observation_kl_precheck` 补 `--qformer-layers` | §4.1 的同类隐患 |
-| 7 | 2026-08-27 前的 `.gapbest.pt` 重算 gap | §4.2 |
+| **1** | **换 seed 跑 96 条重测两臂 gap** | §2.3 第 2 条。「obs0.5 保真更好」目前只有一次独立测量，且测在选择集上 |
+| 2 | 重训固定池化 connector | 让主表两列的数据处理口径一致 |
+| 3 | 跑一条干净的 `w_o=0` 对照到收敛 | 现有对照只到 step 1250 |
+| 4 | 最终数字换 GPT-5.4 重判 | 现在答题与判题同模型 |
+| 5 | `observation_kl_precheck` 补 `--qformer-layers` | §4.1 的同类隐患 |
+| 6 | 2026-08-27 前的 `.gapbest.pt` 重算 gap | §4.2 |
 
-**明确不做**：λ_sem 扫描（§2.3 表明内部指标涨传导不到 QA-C）；MolmoWeb 接入（唯一对症的同 session 负样本源，但无 AXTree、无 QA、183 GB，教师向量分布问题未解）；装 `flash-linear-attention`（更快但**换核就换数值**，毁掉与历史 run 的逐位对照）。
+**明确不做**：MolmoWeb 接入（无 AXTree、无 QA、183 GB，教师向量分布问题未解）；装 `flash-linear-attention`（更快但**换核就换数值**，毁掉与历史 run 的逐位对照）。
 
 **可选提速（未做）**：`latents_for` 每微批都重跑 trunk 前向，而 trunk 是冻结模型对固定输入的确定性函数，**每条观察被重复编码约 13 次**。缓存下来数值完全等价，约 31 GB，估计快 1.5–2 倍。不要在信任度要紧的 run 跑着时做。
 

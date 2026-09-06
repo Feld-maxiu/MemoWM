@@ -190,7 +190,7 @@ WMA 的问题有 **39.2% 是跨帧的**（引用 ≥2 张图），而 `build_qfo
 四条机制，标注证据强度：
 
 1. **【有数】量化器与任务目标不对齐** —— §4.1 三条。
-2. **【有数】`CE_gold` 只是四项损失之一。** 总损失是 `CE + 0.3·KL_q + 0.5·KL_obs + 1.0·InfoNCE`，**四项里三项不是 QA**：`KL_obs` 优化泛泛的屏幕描述，`InfoNCE` 优化检索可区分性。手册 §2.4 指出后两者与任务充分性**部分对立**（「PCA 的目标是可区分性，Q-Former 的目标是任务充分性」）。所以 xbar 必然携带 QA 不问的内容。
+2. **【有数】`CE_gold` 只是四项损失之一。** 总损失是 `CE + 0.3·KL_q + 0.5·KL_obs + 1.0·InfoNCE`，**四项里三项不是 QA**：`KL_obs` 优化泛泛的屏幕描述，`InfoNCE` 优化检索可区分性。因此 xbar 会携带 QA 没有直接监督到的内容。
 3. **【有数】42% 的位置带符号 $U<0$** —— 量化后的码有一部分是**误导性**的。训练从未优化过量化后的版本，没有机制阻止这件事。
 4. **【推测】冗余** —— 32 个软 token 替代约 1100 个真 token，而问题本身也提供信息，部分内容对特定问题冗余。
 
@@ -331,8 +331,7 @@ OPQ 的误差**已经**主要落在不要紧的位置上（2.2:1），虽然它�
 1. **闭环已测（§7）**，§6 的开环数是上界、真值高 11.88 bit（4311.96 → 4323.84，省 16.80% → 16.57%）。
    ☠️ 但**门控在闭环下的安全不是它的功劳**：等预算随机掩码漂移 11.0–12.5 bit，门控的 11.88 落在其中。
    真正的机制是漂移对污染比例强烈次线性（丢 16.4% 只花丢 100% 的 0.9%），随机掩码同享。
-2. **oracle 读取**：prompt 里只有这一条 latent，不经过检索。报告 §5.6 实测 **90.3% 的题一条 latent 行都检不到**——本工作与「修检索排序」正交，不替代它。
-3. ☠️ **裁判标签测不到本工作的效应，这是算过的，不是回避。**
+2. ☠️ **裁判标签测不到本工作的效应，这是算过的，不是回避。**
    `connector_fidelity` 是现成的、绕开检索的端到端 QA 口径（1,184 题 / 2,248 配对、同一个官方裁判），
    但它只输出 Correct/Hallucination/Omission 计数。McNemar 在 2,248 配对、80% 功效下的
    **最小可检准确率差是 1.32 pp**（最有利的 π_d=0.05；π_d=0.4 时是 3.74 pp）。
@@ -404,6 +403,9 @@ $JX -m experiments.utility_gate.closed_loop_rate \
   --all-send --split validation --output gate/closedloop-null.json
 $JX -m experiments.utility_gate.closed_loop_rate ... \
   --lambdas 0.0010 --arms gate random anti --output gate/closedloop-arms.json
+
+# 7. 压缩感知检索头（只训练 retrieval head；Q-Former / OPQ / WM / gate 全冻结）
+bash scripts_utility_retrieval_head.sh 0
 ```
 
 产物受 `configs/system.lock.yaml` 管辖，`residualmem/manifest.py` 在返回路径前校验 sha256。

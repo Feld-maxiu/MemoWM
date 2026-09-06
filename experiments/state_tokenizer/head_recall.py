@@ -1,27 +1,8 @@
-"""Does a retrieval head actually retrieve? Measured the way the benchmark asks.
+"""Report retrieval-head ranking diagnostics on a bridge-cache view.
 
-``train_retrieval_bridge`` reports loss, contrastive and cosine, and none of
-those says whether the right row comes back. Its own objective is also easier
-than the task: a batch of 64 drawn from 4,379 rows over 156 samples almost never
-contains two observations from the same session, so the in-batch negatives ask
-"which website is this" -- while WorldMemArena retrieval has to pick round 3
-from round 7 of one session.
-
-That distinction is not hypothetical here. Measured per session and normalized
-by the n-1 ceiling that centring imposes, the Q-Former retains 59.9% of the
-available within-session directions against the fixed pooling's 75.6%, while
-its *global* effective rank is 138.6 against 450.1 -- it discards cross-session
-variety far more aggressively than within-session detail. A global recall
-number would therefore misreport it in both directions.
-
-(An earlier draft of this file claimed the opposite -- "variance dominated by a
-few website-identity directions, effective rank 7.2 over 23 samples". That came
-from an ad-hoc measurement with no ceiling normalization and is retracted;
-``within_sample_spread`` below is the measurement that replaced it.)
-
-So the headline is ``same_sample_rank_metrics`` from ``wma_shift_attribution``,
-which ranks each state's own teacher against the *other rows of its own sample*.
-Global recall is reported next to it as a reference, not as the verdict.
+For a ``utility_gated`` cache, ``--view auto`` evaluates the gated
+reconstruction used at deployment.  ``--view full`` is the training-time
+reference view and ``--view raw`` is the pre-quantization Q-Former state.
 """
 from __future__ import annotations
 
@@ -132,6 +113,10 @@ def main() -> None:
     parser.add_argument("--cache", required=True,
                         help="must carry sample_id, or same-sample ranking is impossible")
     parser.add_argument("--split", default="validation")
+    parser.add_argument(
+        "--view", choices=("auto", "raw", "full", "gated"), default="auto",
+        help="latent view passed to the head; auto selects gated for a "
+             "utility_gated cache and raw otherwise")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output")
     args = parser.parse_args()
@@ -143,7 +128,19 @@ def main() -> None:
                 "by session and only the easy global ranking is available"
             )
         keep = data["split"].astype(str) == args.split
-        xbar = np.asarray(data["xbar"], np.float32)[keep]
+        metadata = json.loads(str(np.asarray(data["metadata"]).item()))
+        view = args.view
+        if view == "auto":
+            view = ("gated" if metadata.get("representation") == "utility_gated"
+                    else "raw")
+        field = {
+            "raw": "xbar",
+            "full": "full_recon_xbar",
+            "gated": "gated_recon_xbar",
+        }[view]
+        if field not in data.files:
+            raise ValueError(f"cache has no {field} for --view {view}")
+        xbar = np.asarray(data[field], np.float32)[keep]
         valid = np.asarray(data["valid"], bool)[keep]
         teacher = np.asarray(data["teacher_fused_embedding"], np.float32)[keep]
         samples = data["sample_id"].astype(str)[keep]
@@ -178,6 +175,7 @@ def main() -> None:
     }
 
     report = {
+        "view": view,
         "head": str(Path(args.head).resolve()),
         "head_source": "joint" if args.joint_head else "standalone",
         "cache": str(Path(args.cache).resolve()),

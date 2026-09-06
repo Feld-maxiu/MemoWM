@@ -68,7 +68,7 @@ def main() -> None:
     order = rng.permutation(len(stems))
     held = {stems[i] for i in order[: max(1, int(round(len(stems) * args.validation_fraction)))]}
 
-    xbars, valids, teachers, splits, sample_ids, texts = [], [], [], [], [], []
+    xbars, valids, teachers, splits, sample_ids, state_ids, texts = [], [], [], [], [], [], []
     for path in samples:
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(np.asarray(data["metadata"])))
@@ -96,6 +96,7 @@ def main() -> None:
             teachers.append(teacher[index])
             splits.append("validation" if path.stem in held else "train")
             sample_ids.append(path.stem)
+            state_ids.append(f"{path.stem}-{index:04d}")
             texts.append(str(record.get("fused_text", "")))
         print(f"[cache] {path.stem}: {len(records)} states", flush=True)
 
@@ -111,6 +112,7 @@ def main() -> None:
         teacher_fused_embedding=embeddings,
         split=np.asarray(splits),
         sample_id=np.asarray(sample_ids),
+        state_id=np.asarray(state_ids),
         target_text=np.asarray(texts),
         metadata=np.asarray(json.dumps({
             "protocol": BRIDGE_CACHE_PROTOCOL,

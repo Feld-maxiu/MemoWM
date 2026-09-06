@@ -51,10 +51,8 @@ echo "--- 2/4 retrieval head ---"
 python -u -m experiments.state_tokenizer.train_retrieval_bridge \
   --cache "$D/cache-$ARM.npz" --output "$D/head-$ARM.pt" --device "$DEV"
 
-# No pass/fail criterion in the code (no VERDICT, no exit code). Judge by hand:
-# within-sample R@1 against fixed pooling's 0.3429. Ignore global R@1 -- more
-# distractors is only harder, within-sample is the task itself.
-echo "--- 3/4 head_recall (gate: within-sample R@1 vs pooling 0.3429) ---"
+# Diagnostic only; benchmark-specific ranking behavior is not a method gate.
+echo "--- 3/4 head_recall diagnostic ---"
 python -u -m experiments.state_tokenizer.head_recall \
   --head "$D/head-$ARM.pt" --cache "$D/cache-$ARM.npz" \
   --split validation --device cpu \

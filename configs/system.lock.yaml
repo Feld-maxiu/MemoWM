@@ -5,14 +5,14 @@
 # refuses to hand back a path whose sha256 disagrees, so choosing wrong becomes
 # an exception instead of a slightly different number.
 #
-# Every hash below was recomputed from the bytes on disk on 2026-09-02. Do not
+# Every hash below was recomputed from the bytes on disk on 2026-09-06. Do not
 # copy hashes out of documentation into this file -- a transcription error makes
 # the manifest reject the *correct* artifact, and the symptom is indistinguishable
 # from a real mismatch. Regenerate with:
 #     python -m residualmem.manifest --rehash
 
 protocol: residualmem_system_lock_v1
-minted: "2026-09-02"
+minted: "2026-09-06"
 
 # $DATA is outside the repo. On this machine /home/luzheng/workspace/...,
 # /mnt/data/users/luzheng/workspace/... and /mnt/workspace/users/luzheng/...
@@ -35,12 +35,21 @@ artifacts:
       loading one alongside this checkpoint is a hard raise
       (residualmem_instruct_adapter.py:199-204).
 
-  # Standalone head. QFORMER_实验手册 §3.4: RESIDUALMEM_RETRIEVAL_HEAD must be set
-  # explicitly, or the adapter silently falls back to the joint head baked into
-  # the Q-Former checkpoint, which measures within-session R@1 0.1988 vs 0.2131.
+  # Selected standalone retrieval head, frozen 2026-09-06. Trained only on the
+  # full/gated OPQ reconstructions below; Q-Former, OPQ, WM and utility mask were
+  # frozen. alpha=0.1, best step 1750. Both views retain symmetric InfoNCE and
+  # teacher cosine; the gated key additionally follows stopgrad(full key).
   retrieval_head:
-    path: ${REPO}/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/head-K32e-obs0.5-gapbest.pt
-    sha256: a961e9fdf69c7325290ba69d0f8cad75e0ec3df83c31cd52062af14413f9cf74
+    path: ${REPO}/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/head-K32e-obs0.5-gapbest-utility-gated.pt
+    sha256: 81ac262e85722e539f89734dc630ba755744cf9cb265b142fcb94dd5b216f424
+    produced_by: scripts_utility_retrieval_head.sh
+
+  # Exact cache that selected the head above. Locking it prevents a later WM
+  # posterior/mask/codebook refresh from silently reusing the same head name.
+  retrieval_cache:
+    path: ${REPO}/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/cache-K32e-obs0.5-gapbest-utility-gated.npz
+    sha256: a6af36c55c9e0d01a6482e66bc82e943cc3b9160f82af18024a6729587ea7650
+    produced_by: experiments/state_tokenizer/build_utility_retrieval_cache.py
 
   # The single most dangerous handoff in the system. Two fits share this
   # filename; only the pq-full/ one is bit-identical to the decoder embedded in
