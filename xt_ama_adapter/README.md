@@ -32,12 +32,16 @@ episode，但不会调用模型或 GPU。
 首次运行前可调用 `validate_artifact_pair(config)`；它只读 checkpoint、不会
 加载 9B 模型到 GPU，并会拒绝 PCA/QFormer 或不同 slot 数的坐标混用。
 
-## 当前边界：Qwen3-32B latent Reader 尚未实现
+## Qwen3-32B latent Reader（已实现）
 
-本包当前只实现 AMA→x_t 的数据/检索层，不提供 AMA-Bench 的运行时注册，也不将
-检索结果回映为文本给 Reader。目标实验要求把 top-k 的 `(xbar, valid)` 经一个
-**尚待训练**的 `512 → 5120` bridge 直接注入本地 Qwen3-32B 的
-`inputs_embeds`。现有 Qwen3.5 connector 的输出维度是 4096，不能复用。
+Qwen3-32B latent Reader 已实现：`qwen32_bridge.Qwen32LatentReader` 将检索命中的
+top-k `(xbar, valid)` 经训练好的 bridge（512→5120，
+`syqa/post-qformer/bridge/qwen32-input-k32-rms-top10.pt`）注入本地 Qwen3-32B 的
+`inputs_embeds`。评测入口为 `experiments/state_tokenizer/run_ama_web_latent.py`，
+支持 `latent-only` / `latent+anchor`（verbatim 元素锚，保精确 ID/文本）/
+`text-only` / `matched` 等 memory mode，以及 `semantic` / `lexical` / `hybrid` /
+`augment` 检索通道。AMA-Bench 数据位于 `third_party/AMA-Bench`（不入库，需自行放置）。
 
-后续应在本包中单独加入 bridge 训练、checkpoint 验证和 Qwen3-32B direct-input
-推理入口；AMA-Bench 保持从官方仓库直接获取且不作源代码修改。
+bridge 训练/选型代码在 `experiments/state_tokenizer/`（`train_qwen32_bridge.py`、
+`freeze_qformer_candidate.py`、`select_syqa_bridge_candidate.py` 等），与
+AMA-Bench 官方代码保持分离；AMA-Bench 从官方仓库直接获取且不作源代码修改。
