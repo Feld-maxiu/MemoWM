@@ -452,11 +452,6 @@ def answer(args: argparse.Namespace) -> None:
                           "requested": args.top_k_latent, "clamped": max_ranks}),
               flush=True)
         args.top_k_latent = max_ranks
-    if args.retrieval == "augment" and args.top_k_semantic > args.top_k_latent:
-        print(json.dumps({"event": "clamp_top_k_semantic",
-                          "requested": args.top_k_semantic,
-                          "clamped": args.top_k_latent}), flush=True)
-        args.top_k_semantic = args.top_k_latent
     tokenizer = AutoTokenizer.from_pretrained(args.reader_model, trust_remote_code=True)
     _, _, prompt_hash = render_ama_openend_parts(
         tokenizer, "{QUESTION}", enable_thinking=bool(bridge_metadata["enable_thinking"])
@@ -542,28 +537,11 @@ def answer(args: argparse.Namespace) -> None:
             needed = max(needed_latent, needed_text)
             if args.retrieval == "semantic":
                 order = np.argsort(-scores)
-            elif args.retrieval == "augment":
-                # No-drop keyword augmentation (option B): keep the top
-                # ``top_k_semantic`` semantic rows untouched, then fill the
-                # remaining rank budget (up to ``top_k_latent``) with the best
-                # BM25 rows that are not already selected.  Semantic rows are
-                # never evicted, so retrieval cannot regress the previous arm.
-                sem_order = np.argsort(-scores)
-                lexical = lexical_indexes[source_episode_id]
-                lex_scores = lexical.score(question)
-                lex_order = np.argsort(-lex_scores)
-                chosen = sem_order[:args.top_k_semantic]
-                keep = set(chosen.tolist())
-                budget = max(0, args.top_k_latent - int(chosen.shape[0]))
-                fill = [int(index) for index in lex_order
-                        if int(index) not in keep][:budget]
-                order = np.concatenate(
-                    (chosen, np.asarray(fill, dtype=np.int64))) \
-                    if fill else chosen
             else:
-                # Keyword (BM25) and optional RRF fusion.  ``ranked`` always
-                # carries the *semantic* score per row for audits; only the row
-                # ordering is changed by the lexical channel.
+                # Keyword (BM25) channel over the step texts, and optional RRF
+                # fusion.  ``ranked`` always carries the *semantic* score per
+                # row for audits; only the row ordering is changed by the
+                # lexical channel.
                 lexical = lexical_indexes[source_episode_id]
                 lex_scores = lexical.score(question)
                 if args.retrieval == "hybrid":
@@ -772,20 +750,14 @@ def main() -> None:
              "[id] role 'name' rows of the injected screens (P1); 'ids' emits "
              "only the [id] tokens (P2)")
     generate.add_argument(
-        "--retrieval", choices=("semantic", "hybrid", "lexical", "augment"),
+        "--retrieval", choices=("semantic", "hybrid", "lexical"),
         default="semantic",
         help="retrieval channel(s) selecting which memory rows are injected: "
              "'semantic' is the document@query head score (previous behavior); "
              "'lexical' re-ranks rows by BM25 over the step texts vs the "
              "question; 'hybrid' fuses the two orderings with reciprocal-rank "
              "fusion so keyword hits (element names, actions, quoted strings, "
-             "step numbers) can surface rows semantic search misses; 'augment' "
-             "keeps the top ``top_k_semantic`` semantic rows and only fills the "
-             "remaining rank budget with BM25 rows (no-drop, option B)")
-    generate.add_argument(
-        "--top-k-semantic", type=int, default=8,
-        help="number of leading semantic rows kept untouched when --retrieval "
-             "is 'augment'; must be <= --top-k-latent")
+             "step numbers) can surface rows semantic search misses")
     generate.add_argument("--shuffle-seed", type=int, default=35)
     generate.add_argument("--limit", type=int, default=0)
     generate.add_argument("--allow-partial-cache", action="store_true")
