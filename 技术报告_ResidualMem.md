@@ -1,29 +1,33 @@
 # ResidualMem 技术报告
 
 > 基于世界模型条件编码与任务效用门控的长期智能体记忆
-> 文档版本：1.0
-> 实现快照：2026-09-06
+> 文档版本：1.2
+> 实现快照：2026-09-07
 
 ## 摘要
 
 ResidualMem 将长期记忆表示为相对于世界模型预测的任务相关修正，而不是逐时刻保存完整观察。当前系统实现了以下链路：
 
 ```text
-截图 + AXTree
+观察前端（WMA：截图 + 文本；AMA-WEB：AXTree）
   → 冻结 Qwen3.5-9B 中间层状态
   → 32 槽 Q-Former 状态 tokenizer
-  → OPQ 离散码（32 × 32，C=64）
-  → 块因果 Transformer 世界模型
-  → 任务效用门控
-  → 闭环先验填补与连续状态重建
-  → 压缩感知检索头 / soft-token reader
+  → semantic latent
+      ├→ OPQ 离散码（32 × 32，C=64）
+      │   → 块因果 Transformer 世界模型
+      │   → 任务效用门控与连续状态重建
+      ├→ 压缩感知检索头 → memory key
+      └→ Reader Bridge → soft tokens → frozen Reader
+  → [可选] 精确符号 anchor → Reader token embeddings
 ```
 
 在 WorldMemArena Web 外部评测集的 817 条转移上，每状态定宽表示为 6,144 bit。世界模型条件编码将其降到 5,182.83 bit；效用门控在闭环条件下降到 4,323.84 bit，即相对定宽减少 29.63%，相对世界模型全发码率减少 16.57%，压缩比为 1.421×。门控造成的答案绝对 NLL 变化为 0.103 bit；作为参照，OPQ 量化自身造成 0.148 bit 的答案绝对 NLL 变化。
 
+从官方 WMA Web JSON 重新构建 Q-Former 状态、OPQ 码、闭环 WM+utility 重建并执行检索、soft-token Reader 和 Judge 后，完整端到端链路在 1,459 道题上得到 QA-C 0.5984（873/1459）。full-xbar Reader 参照为 0.6004（876/1459）。
+
 检索侧使用 full/gated 双视图训练独立检索头。在完全冻结 Q-Former、OPQ、世界模型和 utility artifact 的条件下，选定模型在 gated validation 上达到 R@1 0.2274、R@10 0.6560、MRR 0.3697；相同数据上的旧检索头分别为 0.2226、0.6488、0.3622。该损失用于约束压缩前后的检索接口一致性。
 
-本文只描述当前方法、实际实现、实验协议、结果与产物接口。运行命令和环境配置分别维护在 `WMA_RESIDUAL_复现手册.md`、`QFORMER_实验手册.md`、`WM_MIXED_复现手册.md` 和 `UTILITY_GATE.md`。
+本文只描述方法、实际实现、实验协议、结果与产物接口。WMA 全链路的运行命令和环境配置统一维护在 `WMA_RESIDUAL_复现手册.md`；效用门控和 AMA-WEB 的补充资源分别见 `UTILITY_GATE.md` 和 `AMA测评实验资源与环境说明.md`。
 
 ---
 
@@ -37,7 +41,7 @@ $$
 \tau=(o_0,u_0,o_1,u_1,\ldots,o_T),
 $$
 
-其中 $o_t$ 是截图、AXTree 和文本组成的多模态观察，$u_t$ 是在下一观察到达前已知的动作及其参数。后续查询记为 $q$，答案记为 $y$。
+其中 $o_t$ 是由评测前端提供的观察：WMA 前端以截图及配套文本为主，AMA-WEB 前端以序列化 AXTree 为主；$u_t$ 是在下一观察到达前已知的动作及其参数。后续查询记为 $q$，答案记为 $y$。
 
 ResidualMem 的写入端必须与查询无关：
 
@@ -75,7 +79,7 @@ $$
 
 ### 1.3 设计约束
 
-当前实现遵循三个约束。
+系统遵循三个约束。
 
 1. **因果性**：世界模型只能条件于已到达的观察码、已知动作和任务标识。
 2. **编码/解码对称性**：门控判据只能依赖双方都可得到的量；否则需要额外发送逐状态 mask。
@@ -109,7 +113,8 @@ $$
    $$
 
 5. utility gate 计算每个位置的发送决定 $m_{t,j}\in\{0,1\}$。保留位置发送真实码；丢弃位置由解码端填入世界模型众数。
-6. 重建状态 $\tilde x_t$ 进入检索头并形成记忆 key；被发送的离散码构成状态内容。
+6. 重建状态 $\tilde x_t$ 进入检索头并形成记忆 key；被发送的离散码构成语义状态内容。
+7. 可选精确符号旁路在同一次写入中生成 $a_t=A_\eta(o_t)$，并按 observation identity 与语义状态绑定。AXTree 前端抽取元素字段，截图前端使用轻量 OCR 抽取少量精确值；$a_t$ 不进入 OPQ、世界模型或检索头。
 
 首状态不存在因果先验，当前协议对该状态执行全发。
 
@@ -140,10 +145,9 @@ $\tilde z_t$ 随后进入解码端历史。后续世界模型分布始终条件�
 1. `MaskedAttentionRetrievalHead` 将 $\tilde x_t$ 投影到 4,096 维归一化 key；
 2. 查询由 Qwen3-VL-Embedding-8B 编码为归一化向量；
 3. 在 session 内对全部记忆行计算余弦相似度并取 top-10；
-4. latent 行经 `InputSoftTokenConnector` 转成 32 个 4,096 维 soft token；文本行使用普通 token embedding；
-5. 本地 Qwen3.5-9B 通过 `inputs_embeds` 读取混合上下文并生成答案。
+4. 被命中的 latent 行经 Reader Bridge 转成 soft token；启用精确符号旁路时，相同行的 $a_t$ 经冻结 Reader 的 tokenizer 和 input embedding 转成普通 token embedding，并与 soft token、问题模板沿序列维拼接后通过 `inputs_embeds` 输入 Reader。
 
-现有 WorldMemArena adapter 的在线池仍保存 float32 `xbar`。本文的码率主结果来自完整 codec、utility gate 和闭环评测；压缩感知检索头结果来自离线 full/gated 重建接口。两组结果的接口已经对齐，但现有 adapter 的官方 QA 运行不计为 codec 的端到端存储结果。
+WMA Reader 参考实验使用 float32 `xbar` 作为在线池内容；码率主结果由完整 codec、utility gate 和闭环协议计算，压缩感知检索结果由 full/gated 重建 cache 计算。三类数值分别描述 Reader、codec 和检索接口，不跨协议相乘。
 
 ---
 
@@ -263,6 +267,26 @@ $$
 观察 teacher 的分布离线存成 top-128。70 万个被缓存位置的教师概率质量中位数为 0.999987。训练使用 P1–P3 三种整体观察探针；P4 不进入梯度训练，只用于 checkpoint 选择和保真评测。
 
 选定 checkpoint 为 `qformer-K32e-obs0.5.gapbest.pt`，对应 step 6000、validation answer CE 1.7572，并按观察保真 gap 选择。
+
+#### 可选精确符号旁路
+
+Q-Former latent 是默认状态表示。对于要求逐字符保真的输入，写入端可并行生成与查询无关的稀疏符号序列
+
+$$
+a_t=A_\eta(o_t).
+$$
+
+$A_\eta$ 随输入模态适配：AMA-WEB 从 AXTree 保留元素 ID、role 和可见名称；截图输入使用轻量 OCR，仅过滤并保存页面索引、日期时间、URL、带标签计数和带类型数值等精确值。该序列按 observation identity 与 $x_t$ 绑定，不进入 OPQ、世界模型或检索 key。
+
+检索仍完全由重建语义状态 $\tilde x_t$ 完成。仅当第 $t$ 条 latent 被命中时，Reader 才将其 soft token 与该条记忆的原生 token embedding 拼接：
+
+$$
+H_t^{\rm mem}
+=
+\left[C_\phi(\tilde x_t);E_R(a_t)\right].
+$$
+
+anchor 是可选的离散 memory payload；启用时按实际符号码长独立计费，不作为共享模型参数或检索索引计费。
 
 ### 3.2 OPQ 离散状态
 
@@ -488,11 +512,11 @@ $$
 
 ### 3.4 任务效用门控
 
-门控的目标不是寻找最难预测的位置，而是在每个离散位置上比较“省略该码造成的任务影响”与“发送该码的预期成本”。任务影响由 reader 上的单位置反事实实验估计，发送成本由世界模型后验估计。
+任务效用门控在离散状态的每个码位置决定是否发送真实 OPQ 码。它不把“难预测”本身当作重要性，而是显式比较省略该码对任务读出的影响与发送该码的预期成本。该设计把 task-dependent 的 reader 测量放在离线阶段，把在线决策限制为编码端和解码端都可复现的查表与后验计算。
 
-#### 单位置反事实标签
+#### 离线单位置反事实标注
 
-令样本 $i$ 的完整 OPQ 码为 $z_i^+$，其对应问题和金标答案为 $(q_i,a_i)$。世界模型先根据该样本之前的因果历史产生后验
+令样本 $i$ 的完整 OPQ 码为 $z_i^+$，对应的离线观察读出问题和金标答案为 $(q_i,a_i)$。世界模型只根据在该状态之前双方共享的重建历史和动作产生后验：
 
 $$
 p_{i,j}(c)=p_\theta(z_{i,j}=c\mid \tilde z_{i,<t},u_{i,<t}),
@@ -504,7 +528,7 @@ $$
 \hat z_{i,j}=\arg\max_c p_{i,j}(c).
 $$
 
-对每个被打标的位置，只替换这一个码，其余 1,023 个码保持真值：
+第一阶段对选中的位置 $j$ 构造单位置反事实：只把该位置替换为世界模型众数，其余位置均保持真实码，
 
 $$
 z_i^{(-j)}
@@ -520,7 +544,7 @@ $$
 \hat x_i^{(-j)}=D_{\rm OPQ}(z_i^{(-j)}).
 $$
 
-两者经过同一个冻结 reader connector 和 reader。答案损失是金标答案全部 token 的 teacher-forced NLL 之和：
+两个重建均经过冻结的 Reader Bridge 和 Reader。以金标答案全部 token 的 teacher-forced NLL 作为任务损失：
 
 $$
 \mathcal L_{\rm ans}(q_i,a_i\mid x)
@@ -540,13 +564,13 @@ U_{i,j}
 }{\ln2}.
 $$
 
-除以 $\ln2$ 将自然对数 NLL 转换为 bit。基准必须是 $D_{\rm OPQ}(z_i^+)$，而不是量化前的连续 Q-Former 状态；这样两条分支具有完全相同的量化误差，差值只归因于位置 $j$ 从真实码变为世界模型填充值。
+除以 $\ln2$ 将 NLL 统一为 bit。反事实的参考必须是 $D_{\rm OPQ}(z_i^+)$，而不是量化前连续 Q-Former 状态：这样两条分支共享相同的 OPQ 误差，损失差只归因于位置 $j$ 由真实码替换为可由解码端生成的填充值。
 
-标签在 float32 下计算，单个问题的 reference 与所有反事实 variant 使用相同的 reader 前向协议，答案上限为 104 token。当前标签由三个互补分片组成：`labels-wmfill.npz` 在 900 个状态—问题行上各采样 32 个位置；`labels-slot-s0.npz` 和 `labels-slot-s1.npz` 各在 450 行上选择两个完整槽，即每行 64 个位置。每个分片含 28,800 个位置标签，合计 86,400 个，并在汇总后覆盖全部 1,024 个 OPQ 坐标。
+标注在 float32 下完成。同一状态—问题行的完整参考和所有反事实变体使用同一冻结 reader、相同问题模板、相同答案 token 上限和相同 batch 几何；每个前向还包含与参考相同的 null control，用来拒绝数值漂移。位置采样按状态—问题行分片，并优先补齐 1,024 个坐标的覆盖；这使反事实代价可控，同时避免只把标签集中在少量 OPQ 槽上。
 
-#### 从反事实标签得到全局 utility
+#### 聚合为可部署的固定效用向量
 
-令 $\mathcal A_j$ 表示所有对位置 $j$ 做过反事实替换的状态—问题样本。发布到系统中的 utility 是绝对变化的样本均值：
+令 $\mathcal A_j$ 是所有对位置 $j$ 完成第一阶段反事实的状态—问题样本。部署 utility 取绝对损失变化的样本均值：
 
 $$
 |U_j|
@@ -555,13 +579,11 @@ $$
 \sum_{i\in\mathcal A_j}|U_{i,j}|.
 $$
 
-因此最终 artifact 是长度为 1,024 的固定向量。在线编码时不运行 reader，也不需要当前问题；编码端只查表使用 $|U_j|$。这一设计将昂贵的 reader 反事实测量留在离线阶段，同时让同一个 query-independent memory state 能服务后续不同问题。
+该聚合产物是长度为 1,024 的固定向量。在线编码不运行 reader，也不把当前查询作为输入；编码端与解码端只加载同一个向量。这样单条 query-independent memory state 可以被未来的不同查询复用，代价是 utility 与离线标注问题分布绑定。迁移到新任务域时，保持算法、码本和世界模型接口不变，只需在该域的读出问题上重新估计此向量。
 
-该向量仍然与离线测量所用的问题分布绑定。当前锁定 artifact 在 WMA fit-corpus 的观察读出问题分布上估计，并在独立 WMA Web 问题上评测；更换任务域时可以保持门控算法不变，仅重新估计 1,024 维 utility。
+#### 为什么聚合绝对值
 
-#### 为什么使用绝对值
-
-$U_{i,j}$ 的符号只表示这一次替换使金标答案 NLL 上升还是下降，而门控所需的是位置 $j$ 对 reader 输出的影响强度。若直接计算带符号均值
+$U_{i,j}$ 的符号只表示这一次替换使该金标答案的 NLL 上升还是下降；门控需要的是位置 $j$ 对 reader 条件分布的影响强度。若使用带符号均值
 
 $$
 \bar U_j
@@ -570,11 +592,43 @@ $$
 \sum_{i\in\mathcal A_j}U_{i,j},
 $$
 
-同一位置在不同状态或问题上的正负效应会相互抵消。一个经常显著改变答案分布的位置，可能因此得到接近零的 $\bar U_j$，并被错误判定为可安全省略。
+不同状态或问题中的正负效应会相互抵消，使一个频繁改变答案分布的位置被错误地视为可省略。负值本身是合理的：完整分支已包含 OPQ 量化误差，某个真实码可能对特定问题冗余或偶然误导，替为众数后 NLL 反而下降。门控并不利用这类偶然改善奖励丢码，而是把任意方向的任务条件分布变化都视为失真，因此使用 $|U_{i,j}|$。
 
-当前 86,400 个标签中约 42% 的 $U_{i,j}$ 为负。负值是允许出现的：完整分支本身已经经过 OPQ 量化，某个真实量化码对特定金标答案可能带来冗余、校准偏差或误导信息，换成世界模型众数后 NLL 反而降低。系统的目标是保存观察的任务相关信息，而不是利用金标答案奖励这种偶然的单向改善，因此正向和负向变化都应被视为失真。
+#### 交互感知的第二阶段校准
 
-统计结果也支持这一选择。用编码端特征预测带符号效用时，留出 $R^2=-0.08$；预测 $|U|$ 时，留出 $R^2=0.46$、Spearman 相关为 0.86。逐位置码率与带符号效用的相关约为 $-0.002$，但与绝对效用的 Spearman 相关为 0.46–0.51。这说明可稳定估计的信号主要是影响幅度，而不是影响方向。
+单位置反事实在其余位置均为真实码的背景下度量边缘影响，但部署时会同时省略多个位置。为显式检验这种交互，系统先以第一阶段 utility 得到初始 mask $m_{i,j}^{(0)}$，构造完整 mask 后的基准码：
+
+$$
+z_i^{(0)}=m_i^{(0)}\odot z_i^+ + (1-m_i^{(0)})\odot\hat z_i.
+$$
+
+对于初始 mask 丢弃的每个位置 $j$，只把它恢复成真实码，其余丢弃位置继续使用世界模型填充：
+
+$$
+z_i^{(j\uparrow)}=z_i^{(0)},\qquad z_{i,j}^{(j\uparrow)}=z_{i,j}^+.
+$$
+
+第二阶段条件效用为
+
+$$
+U^{\rm cond}_{i,j}
+=
+\left|
+\mathcal L_{\rm ans}(q_i,a_i\mid D_{\rm OPQ}(z_i^{(0)}))
+-
+\mathcal L_{\rm ans}(q_i,a_i\mid D_{\rm OPQ}(z_i^{(j\uparrow)}))
+\right|/\ln2.
+$$
+
+它直接回答“在其它初始丢码已同时发生时，恢复位置 $j$ 是否仍会改变任务读出”。只对初始被丢弃的位置做该标注；若真实码恰好等于世界模型填充值，恢复不会改变状态，保留第一阶段值。与第一阶段相同，条件效用按位置对状态—问题样本取均值。
+
+为避免有限样本的二次估计使原本重要的位置被降级，部署采用只增不减的包络：
+
+$$
+U_j^{\rm eff}=\max\left(|U_j|,\;U_j^{\rm cond}\right).
+$$
+
+未达到最低标注覆盖的位置回退到 $|U_j|$。此规则只会恢复初始被丢弃的位置，不会新增丢弃位置；同时仍输出一个固定 1,024 维向量，因而不增加逐观察 mask、在线 reader 前向或解码端状态。
 
 #### 率失真门控的推导
 
@@ -586,14 +640,14 @@ H_{t,j}
 -\sum_{c=0}^{63}p_{t,j}(c)\log_2p_{t,j}(c).
 $$
 
-令 $m_{t,j}=1$ 表示发送真实码，$m_{t,j}=0$ 表示由解码端使用世界模型众数填补。使用绝对 utility 近似省略失真，并使用后验熵近似发送该位置的预期码长，则逐状态的拉格朗日目标为
+令 $m_{t,j}=1$ 表示发送真实码，$m_{t,j}=0$ 表示由解码端使用世界模型众数填补。以 $U_j^{\rm eff}$ 近似省略失真，以世界模型后验熵近似发送该位置的预期码长：
 
 $$
 \mathcal J_t(m_t)
 =
 \sum_{j=1}^{1024}
 \left(
-(1-m_{t,j})|U_j|
+(1-m_{t,j})U_j^{\rm eff}
 +\lambda m_{t,j}H_{t,j}
 \right).
 $$
@@ -604,11 +658,11 @@ $$
 \boxed{
 m_{t,j}=1
 \iff
-|U_j|\ge\lambda H_{t,j}
+U_j^{\rm eff}\ge\lambda H_{t,j}
 }.
 $$
 
-当前选定操作点为 $\lambda=0.0010$。$\lambda$ 越大，码率惩罚越强、发送位置越少；$\lambda$ 越小，系统越偏向保存任务相关变化。
+超参数 $\lambda$ 是锁定 artifact 的一部分：增大它会提高码率惩罚并减少发送位置，减小它会偏向保存任务相关变化。第一阶段与第二阶段使用相同的 $\lambda$，使第二阶段只校准效用而不混入预算变化。
 
 门控使用熵而不是已经观察到的真实码长
 
@@ -616,7 +670,7 @@ $$
 r_{t,j}=-\log_2p_{t,j}(z_{t,j}^+),
 $$
 
-是为了维持编码端与解码端的判定对称性。编码端知道 $z_{t,j}^+$，但解码端在收到该码之前并不知道它，因此无法独立复现一个依赖 $r_{t,j}$ 的 mask；若采用该规则，就必须额外传输 mask。相反，$H_{t,j}$ 只依赖双方共享的世界模型后验，双方可由相同的已重建历史、动作和模型参数独立计算。当前协议只发布 $|U|$、$\lambda$ 及锁定模型，不传逐状态 mask，因此 mask 开销为 0 bit。实际码率统计仍使用被发送真码的 $r_{t,j}$，而不是用熵替代计费。
+是为了维持编码端与解码端的判定对称性。编码端知道 $z_{t,j}^+$，但解码端在收到该码之前并不知道它，故不能独立复现依赖 $r_{t,j}$ 的 mask；采用该规则必须额外发送 mask。相反，$H_{t,j}$ 只依赖双方共享的世界模型后验，双方可由相同的已重建历史、动作和锁定模型独立计算。协议只发布 $U^{\rm eff}$、$\lambda$ 和锁定模型，不传逐状态 mask；实际计费仍使用被发送真码的 $r_{t,j}$，而不是用熵替代码长。
 
 轨迹初态没有可用的因果世界模型后验，按协议全部发送。从第二个可预测状态开始，编码端和解码端都以此前已经重建的历史计算后验和 mask；这也是闭环评测能够逐步复现门控决策的条件。
 
@@ -773,7 +827,9 @@ $$
 
 ### 4.4 计费范围
 
-主码率表统计观察离散码，不包含检索 key、索引结构和共享模型参数。当前外部评测集上，动作通道的独立计费为 40.175 bit/转移；该值在需要完整 episodic rate 时与观察码率相加。共享 Q-Former、OPQ、世界模型、utility vector 和检索头属于系统级 artifact，其具体版本由 manifest 管理。
+第 6.1 节主码率表使用 semantic-only 配置，统计观察离散码，不包含检索 key、索引结构和共享模型参数。WMA 外部评测集上的动作通道独立计费为 40.175 bit/转移；该值在计算完整 episodic rate 时与观察码率相加。共享 Q-Former、OPQ、世界模型、utility vector、Reader Bridge 和检索头属于系统级 artifact，其具体版本由 manifest 管理。
+
+若启用精确符号旁路，anchor 作为与 observation 绑定的状态 payload 按实际符号码长加入 episodic rate；Reader 运行时通过共享嵌入表产生的 token embedding 不重复计费。
 
 ---
 
@@ -788,16 +844,20 @@ $$
 | 世界模型 | 520,220 states / 495,527 transitions | 离散下一状态建模 |
 | utility labels | 86,400 位置级反事实标签 | 估计全局 $|U_j|$ |
 | retrieval-head cache | 4,379 states | full/gated 双视图检索训练 |
+| AMA Q-Former | 6,645 observations / 11,944 SyQA pairs | 视觉与精确文本状态读出 |
+| AMA Qwen3-32B Bridge | 冻结 AMA Q-Former cache | $512\rightarrow5120$ soft-token 接口训练 |
 
 世界模型训练文件是 train-only；训练时从 episode 维度留出 5% 用于过程选点。当前选定模型在 60,000 步达到 best=last。
 
 ### 5.2 外部评测
 
-主码率评测来自 WorldMemArena `agent/gui/web` 的 27 个样本，经轨迹转换后包含 956 个状态；最终 evaluation split 含 817 条转移、70 个评测 episode。该集合不进入世界模型的梯度训练，也不参与 utility vector 拟合；世界模型训练期间每 2,500 步在该 evaluation cache 上测量码率并选择 checkpoint，当前锁定运行的 best 与 60,000 步 last 为同一组权重。
+主码率评测来自 WorldMemArena `agent/gui/web` 的 27 个样本，经轨迹转换后包含 956 个状态；最终 evaluation split 含 817 条转移、70 个评测 episode。该集合不进入世界模型的梯度训练，也不参与 utility vector 拟合；世界模型训练期间每 2,500 步在该 evaluation cache 上测量码率并选择 checkpoint，当前锁定运行的 best 与 60,000 步 last 为同一组权重。WMA 默认配置不启用精确值 anchor 分路。
 
 Q-Former 下游表使用 27/27 个样本、1,459 道 QA。观察保真 gap 使用 48 个观察和不参与梯度训练的 P4 问法，其中前 24 个观察同时用于 gap-best checkpoint 选择。utility 质量评测在 Web 中有 QA 的 527 个状态、1,140 道问题上进行；码率仍对全部 817 条状态转移取平均。
 
 检索头验证集包含 840 行、31 个 session。R@K 先在每个 session 内计算，再按行数加权汇总。
+
+AMA-WEB 外部读取评测来自 `AMA-Bench/dataset/test/open_end_qa_set.jsonl` 的 WEB 开放式 QA 子集。评测排除 episode 184 后包含 30 条 trajectory、360 道 QA，每条 trajectory 含 12 道题。AMA-Bench test 不进入 Q-Former、检索头或 Bridge 的训练和 checkpoint 选择；生成阶段冻结 Qwen3.5-9B trunk、SyQA Q-Former、检索头、Qwen3-32B Bridge 与 Qwen3-32B Reader，答案由同一 Qwen3-32B Judge 按二值正确性评分。
 
 ### 5.3 对照方法
 
@@ -821,17 +881,19 @@ Q-Former 下游表使用 27/27 个样本、1,459 道 QA。观察保真 gap 使�
 |---|---:|---:|---:|---:|
 | 定宽全发 | 6,144.00 | 1.000× | 0.00% | — |
 | 世界模型条件编码，全发 | 5,182.83 | 1.185× | 15.64% | 0.00% |
-| + utility gate，开环 | 4,311.96 | 1.425× | 29.82% | 16.80% |
-| **+ utility gate，闭环** | **4,323.84** | **1.421×** | **29.63%** | **16.57%** |
+| + 第一阶段 utility gate，开环 | 4,311.96 | 1.425× | 29.82% | 16.80% |
+| + 第一阶段 utility gate，闭环 | 4,323.84 | 1.421× | 29.63% | 16.57% |
+| + 两阶段 utility gate，开环 | 4,497.87 | 1.366× | 26.79% | 13.22% |
+| **+ 两阶段 utility gate，闭环** | **4,509.77** | **1.362×** | **26.60%** | **12.99%** |
 
-闭环结果相对定宽减少 1,820.16 bit/转移，即 29.63%。开环与闭环相差 11.88 bit；该差值占开环节省量的 1.36%。
+当前结果采用两阶段门控。其闭环表示相对定宽减少 1,634.23 bit/转移，即 26.60%；开环与闭环相差 11.90 bit。第二阶段只会恢复初始被丢弃、且在联合丢码背景下仍有任务影响的位置，因此以一部分码率换取对多位置交互的显式校准。
 
 对应的任务质量测量为：
 
 | 变换 | 答案 $|\Delta\mathrm{NLL}|$ |
 |---|---:|
 | 原始 Q-Former 状态 → full OPQ 重建 | 0.148 bit |
-| full OPQ 重建 → utility-gated 重建 | 0.103 bit |
+| full OPQ 重建 → 第一阶段 utility-gated 重建 | 0.103 bit |
 
 两项分别测量量化和门控的增量影响，不将其直接相加作为端到端答案损失。
 
@@ -848,7 +910,7 @@ Q-Former 下游表使用 27/27 个样本、1,459 道 QA。观察保真 gap 使�
 
 世界模型比最强统计基线减少 238.01 bit/转移，说明 16 步状态历史与动作条件提供了超过一阶码转移表的信息。
 
-### 6.3 Utility gate 的率—质量曲线
+### 6.3 第一阶段 Utility gate 的率—质量曲线
 
 WMA Web 外部评测集：
 
@@ -875,11 +937,12 @@ WMA Web 外部评测集：
 
 | 评测臂 | 开环码率 | 闭环码率 | 漂移 |
 |---|---:|---:|---:|
-| utility gate | 4,311.96 | 4,323.84 | +11.88 |
+| 第一阶段 utility gate | 4,311.96 | 4,323.84 | +11.88 |
+| 两阶段 utility gate | 4,497.87 | 4,509.77 | +11.90 |
 | random，seed 35 | 4,325.89 | 4,337.09 | +11.20 |
 | anti-utility | 4,347.62 | 4,381.70 | +34.08 |
 
-四个等预算随机种子的漂移范围为 11.04–12.48 bit，utility gate 位于该范围内；anti-utility 的漂移为 34.08 bit。全发空对照的开环与闭环差为 0.00 bit，并实际回写了 41,472 个历史位置。
+四个等预算随机种子的漂移范围为 11.04–12.48 bit，第一阶段 utility gate 位于该范围内；anti-utility 的漂移为 34.08 bit。两阶段校准后的开环—闭环差为 11.90 bit。全发空对照的开环与闭环差为 0.00 bit，并实际回写了 41,472 个历史位置。
 
 将全部历史替换为世界模型众数时，全发码率从 5,182.83 增至 6,509.29 bit；只污染门控丢弃的 16.4% 位置时，同口径全发码率增量为 56.64 bit，低于线性外推的 217.5 bit。当前系统在稀疏历史替换下呈次线性漂移。
 
@@ -892,10 +955,11 @@ WMA Web 外部评测集：
 | Raw-Fused | — | 0.5415 | 0.2132 | 0.2454 | — |
 | Q-Former K=16 | 16 | 0.5949 | 0.1857 | 0.2193 | +0.0976 |
 | 固定池化 | 64 | **0.5984** | 0.1864 | **0.2152** | +0.1610 |
-| **Q-Former K=32，$w_{obs}=0.5$** | **32** | 0.5953 | 0.1886 | 0.2160 | **+0.1744** |
+| Q-Former K=32，$w_{obs}=0.5$，原检索头 | 32 | 0.5953 | 0.1886 | 0.2160 | **+0.1744** |
 | Q-Former K=32，$w_{obs}=1.0$ | 32 | 0.5977 | **0.1844** | 0.2180 | +0.1408 |
+| **full-xbar Reader 参照：K=32，$w_{obs}=0.5$，双视图检索头，无 anchor** | **32** | **0.6004** | 0.1851 | **0.2145** | **+0.1744** |
 
-选定的 K=32 表示使用固定池化一半的槽数，QA-C 与 64 槽固定池化接近，同时获得更高的观察保真 gap。这表明同一份 query-independent latent 能够同时支持整体状态读出和重点细节读出。
+选定的 K=32 表示使用固定池化一半的槽数，QA-C 与 64 槽固定池化接近，同时获得更高的观察保真 gap。这表明同一份 query-independent latent 能够同时支持整体状态读出和重点细节读出。该参照保持 Q-Former 不变，只将检索头替换为第 6.8 节的 full/gated 双视图训练版本；在 27/27 个样本的 1,459 道题上答对 876 题，QA-C 为 0.6004。它读取全精度 `xbar`；完整 codec 结果见第 6.9 节。
 
 ### 6.6 OPQ 率—失真结果
 
@@ -946,20 +1010,43 @@ $C$ 增大时重建质量提高，但定宽成本增长，且码持久率降低�
 
 按新目标在同一 validation cache 上重算，总损失从 3.31884 降到 3.30336。选定 checkpoint 为 step 1750，$\alpha=0.1$。full 与 gated 两个视图的 R@K 接近，且 gated 视图相对原检索头有小幅提升，因此该 head 被固定为当前检索接口。
 
-### 6.9 现有 WMA adapter 的端到端参考结果
+### 6.9 WMA 两阶段闭环 codec 端到端 Reader 结果
 
-以下结果评测现有 session memory pool、top-10 检索和 soft-token reader。该 adapter 保存全精度 `xbar`，因此本表用于描述读取子系统，不与第 6.1 节的 codec 码率相乘或合并。
+最终系统从官方 WMA Web JSON 重新生成 Q-Former 状态和 OPQ 码，使用已经重建的历史递归计算 WM posterior，经 utility gate 填补后再进入双视图检索头与 soft-token Reader。WMA 默认不启用 anchor 分路。
 
-| 指标 | Raw-Fused | ResMem | ResMem-union |
-|---|---:|---:|---:|
-| QA-C | 0.5408 | **0.5778** | 0.5668 |
-| QA-H | 0.2132 | **0.1720** | 0.1727 |
-| RC hit rate | 0.6536 | **0.6914** | 0.6867 |
-| Recall@1 | **0.2414** | 0.2221 | 0.2242 |
-| Recall@10 | 0.6960 | 0.7002 | **0.7012** |
-| answer token/题 | 3,228 | 2,252 | **2,205** |
+| 指标 | 闭环 WM + utility |
+|---|---:|
+| 样本 / 有效 QA | 27 / 1,459 |
+| QA-C | **0.6004（876/1459）** |
+| QA-H | 0.1864（272/1459） |
+| QA-O | 0.2132（311/1459） |
+| retrieval coverage | 0.6881（3556/4914） |
+| Recall@1 / @5 / @10 | 0.2242 / 0.5328 / 0.6988 |
+| 闭环码率 / keep fraction | 4,509.77 bit / 0.8719 |
 
-该表来自现有 adapter 配置；Raw-Fused 最多输入 5 张检索截图，ResMem 使用文本与 soft token，因此它们是完整系统配置比较，不是只替换单一表示的组件消融。第 6.8 节的新 utility-gated 检索头尚未用于这组官方 QA 数字。
+完整 codec 与第 6.5 节 full-xbar Reader 参照均答对 876 题，QA-C 同为 0.6004。最终结果位于 `gate/two-stage-v1/wma-qa/final/aggregate_metrics.json`。
+
+### 6.10 AMA-WEB AXTree Reader 结果
+
+AMA-WEB 评测使用 query-independent AXTree observation memory、冻结检索头和 Qwen3-32B Reader。该 Reader 协议直接读取连续 $x_t$，用于评估检索和生成接口，不与第 6.1 节的 semantic codec 码率合并。下表保持 30 条 trajectory、360 道 QA、matched memory、`top_k=1`、生成参数和 Judge 不变，只替换 $512\rightarrow5120$ Reader Bridge：
+
+| Bridge | 训练目标 | 正确数 | 准确率 |
+|---|---|---:|---:|
+| RMS Bridge | $\mathcal L_{\rm CE}+0.30\mathcal L_{\rm KL}$ | 87/360 | 24.17% |
+| **Delta-margin Bridge** | 基础目标 + hidden distillation + matched/shuffled CE margin | **99/360** | **27.50%** |
+
+Delta-margin Bridge 的新增目标为
+
+$$
+\mathcal L_{\rm bridge}
+=
+\mathcal L_{\rm CE}
++0.30\mathcal L_{\rm KL}
++0.10\mathcal L_{\rm hidden}
++0.20\max\left(0,0.10+\mathcal L_{\rm CE}^{\rm matched}-\mathcal L_{\rm CE}^{\rm shuffled}\right).
+$$
+
+$\mathcal L_{\rm hidden}$ 在 Qwen3-32B 第 16、32、48 层对齐完整观察 teacher 和 latent student 的 question-boundary hidden state；margin 项要求 matched memory 的答案 CE 至少比 shuffled memory 低 0.10。两版 Bridge 的逐题配对变化为 31 题由错变对、19 题由对变错、68 题均正确、242 题均错误，净增 12 题，即绝对提升 3.33 个百分点。
 
 ---
 
@@ -967,7 +1054,7 @@ $C$ 增大时重建质量提高，但定宽成本增长，且码持久率降低�
 
 ### 7.1 冻结产物
 
-`configs/system.lock.yaml` 是当前系统产物的唯一机器可读清单。它锁定以下六个角色并在加载时校验 SHA-256：
+WMA codec 使用 `configs/system.lock.yaml` 作为机器可读产物清单。它锁定以下六个角色并在加载时校验 SHA-256：
 
 | 角色 | 选定产物 |
 |---|---|
@@ -978,14 +1065,27 @@ $C$ 增大时重建质量提高，但定宽成本增长，且码持久率降低�
 | world model | `run/best.pkl` |
 | utility artifact | `gate/mask-lambda0.0010.npz` |
 
-验证命令：
+默认部署只校验五个运行时角色；`retrieval cache` 是训练追溯产物，不参与推理：
 
 ```bash
 cd /mnt/data/users/luzheng/workspace/iclr/czs/residual-mem
 ./.venv-jax/bin/python -m residualmem.manifest
+./.venv-jax/bin/python -m residualmem.manifest --include-training
 ```
 
-六个角色均返回 `ok` 后，组件坐标系才构成同一个系统。
+第一条命令用于发布产物部署，五个运行时角色均须返回 `ok`；第二条用于从头训练后的
+完整审计，并额外要求 retrieval cache 返回 `ok`。
+
+AMA-WEB Reader 链使用独立、相互绑定的冻结产物：
+
+| 角色 | 选定产物 |
+|---|---|
+| Q-Former | `outputs/ama_latent_memory/syqa/post-qformer/candidates/obs1.0-ce/frozen.pt` |
+| retrieval head | `outputs/ama_latent_memory/syqa/post-qformer/candidates/obs1.0-ce/head.pt` |
+| Reader Bridge | `outputs/ama_latent_memory/syqa/post-qformer/bridge/qwen32-input-k32-rms-delta-margin-total1000.pt` |
+| Reader / Judge | `Qwen3-32B` |
+
+AMA cache metadata 记录 Q-Former 和 retrieval-head SHA-256；Bridge metadata 继续绑定这两个 hash、Reader 模型 hash、prompt hash、槽数和最大 memory rank。加载阶段逐项检查，从而防止不同 latent 坐标系、检索头或 Reader prompt 被组合到同一次评测。
 
 ### 7.2 关键源码
 
@@ -1000,6 +1100,11 @@ cd /mnt/data/users/luzheng/workspace/iclr/czs/residual-mem
 | 闭环评测 | `experiments/utility_gate/closed_loop_rate.py` |
 | full/gated retrieval cache | `experiments/state_tokenizer/build_utility_retrieval_cache.py` |
 | 双视图检索训练 | `experiments/state_tokenizer/train_retrieval_bridge.py` |
+| WMA 可选 OCR anchor | `residualmem/benchmarks/wma_exact_value_anchor.py`、`residualmem/benchmarks/rapidocr_backend.py` |
+| AMA trajectory / AXTree 适配 | `xt_ama_adapter/xt_ama_adapter/adapter.py` |
+| AXTree 清洗与精确 anchor | `xt_ama_adapter/xt_ama_adapter/axtree_clean.py` |
+| Qwen3-32B Bridge / 混合 Reader | `xt_ama_adapter/xt_ama_adapter/qwen32_bridge.py` |
+| AMA cache、检索与生成 | `experiments/state_tokenizer/run_ama_web_latent.py` |
 | 系统结果汇总 | `scripts_run_system.py` |
 
 ### 7.3 组件依赖
@@ -1015,6 +1120,8 @@ $$
 $$
 
 更换 Q-Former 会改变连续状态坐标；更换 OPQ 会改变全部离散码坐标；这两类变化都要求重新生成其后的世界模型 posterior、utility 和检索双视图。当前 utility-gated 检索训练只修改最后的 retrieval head，不修改任何上游组件。
+
+可选 anchor 与语义链仅通过 observation identity 和 retrieval rank 对齐，不改变 OPQ、世界模型及其下游 artifact。
 
 ### 7.4 结果复现入口
 
@@ -1041,17 +1148,24 @@ bash scripts_utility_retrieval_head.sh 0
 
 该入口从现有 Q-Former cache 离线构造 full/gated OPQ 重建，并只训练 `MaskedAttentionRetrievalHead`。
 
+AMA-WEB 的冻结 Q-Former/Bridge 评测入口为：
+
+```bash
+bash xt_ama_adapter/scripts/run_ama_web_delta_margin_total1000.sh
+```
+
 ---
 
-## 8. 实现范围
+## 8. 实验口径
 
-当前技术结论适用于以下范围：
+技术结论使用以下实验口径：
 
 - 状态表示是 Qwen3.5-9B 第 16 层经 K=32 Q-Former 得到的 $32\times512$ latent；
 - 离散表示固定为 32 槽、每槽 32 个子空间、$C=64$；
 - 世界模型使用 16 步 Web 轨迹上下文和当前动作协议；
 - utility vector 针对当前问题分布估计，迁移到新的任务问题分布时需要重新估计；
 - 码率是 latent 的理想条件码长，不代表原始截图的可逆像素压缩率；
-- 现有 WMA adapter 的在线存储仍是全精度 `xbar`，而 codec、闭环与新检索头的结果分别通过冻结接口评测。
+- WMA Reader 表、semantic codec 表和 full/gated 检索表分别使用各自冻结协议，不跨表组合数值；
+- AMA-WEB 使用 AXTree observation、Qwen3-32B Reader 和二值 LLM-as-Judge；
 
-在上述范围内，实验支持三个技术结论：世界模型条件概率能够压缩完整离散状态；任务效用门控能够在较小答案扰动下进一步减少发送码；full/gated 双视图训练能够保持并小幅改善门控重建后的检索指标。
+在上述口径内，实验结果表明：世界模型条件概率能够压缩完整离散状态；任务效用门控能够在较小答案扰动下进一步减少发送码；full/gated 双视图训练能够保持并小幅改善门控重建后的检索指标；delta-margin Bridge 能够改善 Qwen3-32B 对 latent memory 的读取。
