@@ -107,7 +107,8 @@ def _pad(block: np.ndarray, size: int) -> tuple[np.ndarray, int]:
 
 def run_pass(cache, params, variant, config, rows, *, utility, lam, closed: bool,
              batch_size: int, arm: str = "gate", seed: int = 35,
-             log_every: int = 10) -> dict:
+             log_every: int = 10,
+             collect_reconstructions: bool = False) -> dict:
     """One sweep in ascending step order. ``closed`` decides whether to feed back."""
     rng = np.random.default_rng(seed)
 
@@ -159,7 +160,7 @@ def run_pass(cache, params, variant, config, rows, *, utility, lam, closed: bool
 
     code_bits = np.concatenate(collected["code_bits"])
     keep = np.concatenate(collected["keep"])
-    return {
+    result = {
         "states": int(len(code_bits)),
         "full_rate_bits": per_state_rate(code_bits),
         "gated_rate_bits": per_state_rate(code_bits, keep),
@@ -174,6 +175,14 @@ def run_pass(cache, params, variant, config, rows, *, utility, lam, closed: bool
             "target_indices": np.concatenate(collected["target_indices"]),
         },
     }
+    if collect_reconstructions:
+        if not closed:
+            raise ValueError("reconstructions are only defined for a closed pass")
+        # Kept private so callers that serialize the ordinary rate report do not
+        # accidentally place arrays in JSON.  The materializer consumes this
+        # exact decoder-side state rather than reimplementing the closed loop.
+        result["_reconstructed_codes"] = reconstructed
+    return result
 
 
 def build_keep(arm: str, utility: np.ndarray, entropy: np.ndarray, lam: float,
@@ -303,7 +312,7 @@ def main() -> None:
                           batch_size=args.batch_size, seed=args.seed)
         drift = closed["gated_rate_bits"] - openloop["gated_rate_bits"]
         depth = drift_by_depth(openloop, closed)
-        summary = {name: {k: v for k, v in block.items() if k != "_per_state"}
+        summary = {name: {k: v for k, v in block.items() if not k.startswith("_")}
                    for name, block in (("open_loop", openloop), ("closed_loop", closed))}
         row = {
             "lambda": lam,
