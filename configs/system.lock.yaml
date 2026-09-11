@@ -88,14 +88,13 @@ artifacts:
     path: ${REPO}/run/best.pkl
     sha256: e8ab2922fa642cd01cf40f80f30a46fdde0f69127dc6a6ca66713f9f0466bd6b
 
-  # Produced by experiments/utility_gate/export_mask.py from 86,400 labels across
-  # three files; all 1024 positions covered. Self-checked at export: full-send
-  # over all 817 states reproduces the world model's 5182.83124384419 to 1.0e-05
-  # (float32 storage, not a disagreement), and the gate reads 4311.96 -- 16.80%
-  # saved, keep 0.8359, 1.425x against fixed width.
+  # Two-stage utility vector. The first stage estimates absolute single-position
+  # effects; the second measures a restoration under the complete first-pass
+  # mask. Deployment uses the conservative envelope max(U_first, U_conditional),
+  # so the second stage can restore positions but never newly drop one.
   #
   # Ships the utility vector and lambda, NOT a boolean mask: the decision is per
-  # state (drop j iff |U_j| < lambda * H_j) and H_j is recomputed decoder-side,
+  # state (drop j iff U_eff,j < lambda * H_j) and H_j is recomputed decoder-side,
   # so the gate costs zero mask bits.
   #
   # The mask is bound to the WMA fit-corpus question distribution. Fitting it on
@@ -103,5 +102,5 @@ artifacts:
   # (UTILITY_GATE.md §7.4). That warning is also inside the npz metadata.
   utility_mask:
     path: ${REPO}/gate/mask-lambda0.0010.npz
-    sha256: 4edd12a24d2072e43d2f01a3d0297b18fbed37fb6d9fe58be3999b07ef68f511
-    produced_by: experiments/utility_gate/export_mask.py
+    sha256: 1568e82941b9f62fbfdc7550d806a6b065b8cbb93d0e766711f836062fa644d4
+    produced_by: experiments/utility_gate/two_stage_mask.py
