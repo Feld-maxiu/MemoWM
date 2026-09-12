@@ -2,7 +2,8 @@
 
 更新时间：2026-09-12。本手册讲解如何在 AMA-Bench WEB 子集上复现 residual-mem 的全部结果：
 latent memory/Q-Former 问答链路（最高 **38.33%**）与 Q-Former 码空间上的世界模型及任务效用门控
-（**3773.7 bits/transition**、两阶段门控 **34.4% keep 下近乎无损**）。所有命令均在本仓库实际执行过，
+（**3773.7 bits/transition**；两阶段门控 34.4% keep 下近乎无损，**门控后每观察平均残差码率
+1325.6 bit**，残差+anchor 计费见 §5.3）。所有命令均在本仓库实际执行过，
 产物路径与 sha256 见 §6 自检清单。
 
 复现有两条主线，相互独立、可分别复现：
@@ -425,6 +426,21 @@ stage-1 曲线（100 val 官方问题；\|ΔNLL\| 为答案 NLL 变化，bit）�
 未决：两阶段 gate 的对照臂（random / displacement / rate，约 2 GPU·h）未跑；stage-1 曲线中
 displacement 臂在 34% 预算处出现 0.372 → 0.024 的异常悬崖，且等预算下 \|ΔNLL\| 0.024 优于两阶段
 gate 的 0.047，悬崖成因与该臂可部署性待查。
+
+**残差 + anchor 计费**（部署口径 latent+anchor / element / k=8；anchor 存储成本 = element 行文本
+UTF-8×8 bit，"Retrieved screen (step N)" 标头由注入时生成、不计存储）：
+
+| 口径 | 残差 gate | anchor 均值 | 残差 + anchor |
+|---|---:|---:|---:|
+| 质量轴（100 官方问题观察，同上表 1325.6） | 1325.6 | **0.0** | **1325.6** |
+| 码率轴（1,203 val 状态） | 1445.3 | 888.9 | **2334.2**（gzip-9 1945.1） |
+
+- 官方问题的 100 行全部为 alfworld(46) / babaisai(12) / minihack(12) / gaia(21) / crafter(9) 类文本
+  观察，无 AXTree → element anchor 内容为空，anchor 机制在该集合上不增加存储位（残差+anchor 仍为
+  1325.6）。若把部署 prompt 实际注入的 8 行标头也计费：+1.9k bit raw / +0.6k bit gzip-9 →
+  3217.7 / 1936.7。
+- 码率轴的 anchor 全部来自 3.9% 的 webarena AXTree 状态（非空者均值 23.2k bit，p90 29.7k），
+  摊到全体后平均 888.9 bit/状态。
 
 ### 5.4 边界与声明
 
