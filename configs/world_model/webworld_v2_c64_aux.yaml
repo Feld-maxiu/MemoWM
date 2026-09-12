@@ -1,0 +1,67 @@
+# webworld_v2_c64.yaml + the persistence-auxiliary head (方案2, 2026-09-09).
+#
+# Motivation chain, one line each:
+#   * post-mortem: trained copy gate collapses to the corpus base rate
+#     (14.4% persist on WebWorld) and misprices AMA's 36.9% persist axes
+#     (3.49 bits/axis vs copy's ~0) -> the 673-bit gap to the copy baseline;
+#   * 方案0 calibration (calibrate_gate.py) proved the gate is already
+#     globally optimal on AMA (best delta +0.00) -> the gap is purely
+#     per-axis misassignment, unreachable by any global knob;
+#   * so teach the assignment directly: a per-axis binary head predicts
+#     "does this axis keep its code", trained with a per-batch balanced BCE
+#     (pos_weight 0.5/rate), and its logit is fused into the gate as
+#     copy_logit += persistence_gate_scale * keep_logit.  Zero-init keeps
+#     the step-0 model identical to webworld_v2_c64.yaml.
+# The head's input is [pieces, source-code embedding], so "keep this axis"
+# is directly expressible instead of re-derived from context.
+
+protocol: residualmem_web_discrete_wm_v1
+
+model:
+  max_history: 8
+  num_latent_tokens: 32
+  num_observation_slots: 32
+  num_subspaces: 32
+  num_categories: 64
+  code_embedding_dim: 8
+  d_model: 256
+  num_layers: 12
+  num_heads: 8
+  mlp_dim: 4096
+  dropout: 0.3
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  use_coordinate_channel: true
+  num_action_types: 17
+  coordinate_bins: 64
+  use_copy_gate: true
+  use_persistence_aux: true
+  aux_persistence_weight: 1.0
+  use_target_channel: false
+  max_payload_bytes: 40
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  max_steps: 100000
+  min_steps: 100000
+  eval_every: 2500
+  patience_steps: 300000
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  payload_bytes: 40
+  coordinate_bits: 10
+  structural_bill_bits: 20.45
+  full_bill_bits: 73.86
+  task_bill_bits_per_episode: 0

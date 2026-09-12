@@ -29,7 +29,9 @@ def _make_rollout_step(variant, config):
             history_present=batch["history_present"], train=False,
         )
         rates = codelength_bits(
-            mask_logits, code_logits, batch["target_valid"], batch["target_codes"]
+            mask_logits, code_logits, batch["target_valid"],
+            batch["target_codes"],
+            code_log_probs=getattr(config.model, "output_smoothing", 0) > 0,
         )
         mask = mask_logits >= 0
         codes = jnp.argmax(code_logits, axis=-1).astype(jnp.uint8)

@@ -427,6 +427,30 @@ class FrozenCache:
                  max_history: int | None = None):
         self.max_history = max_history
         self.root = Path(root)
+        if self.root.is_file() and self.root.suffix == ".npz":
+            # Single-file merged dataset (see build_amabench_wm_train.py):
+            # one npz holding codes/valid/global_indices, the transition
+            # arrays under a "t_" prefix, and the manifest as a JSON string.
+            archive = np.load(self.root, allow_pickle=False)
+            self.manifest = json.loads(str(archive["manifest_json"].item()))
+            if self.manifest.get("protocol") not in ACCEPTED_PROTOCOLS:
+                raise ValueError(
+                    f"unsupported cache protocol {self.manifest.get('protocol')!r}"
+                )
+            self.codes = archive["codes"]
+            self.valid = archive["valid"]
+            self.global_indices = archive["global_indices"]
+            self.transitions = {
+                name[2:]: archive[name]
+                for name in archive.files if name.startswith("t_")
+            }
+            self._validate_arrays()
+            if verify_hashes:
+                digest = sha256_file(self.root)
+                expected = self.manifest.get("artifact_sha256", {}).get("bundle")
+                if expected and digest != expected:
+                    raise ValueError(f"cache hash mismatch: {digest} != {expected}")
+            return
         manifest_path = self.root / CACHE_FILES["manifest"]
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if self.manifest.get("protocol") not in ACCEPTED_PROTOCOLS:
@@ -514,11 +538,29 @@ class FrozenCache:
         if not authorized:
             raise PermissionError("test freeze manifest does not authorize this cache")
 
-    def batch(self, transition_indices: np.ndarray) -> dict[str, np.ndarray]:
+    def batch(
+        self,
+        transition_indices: np.ndarray,
+        *,
+        window_rng: np.random.Generator | None = None,
+    ) -> dict[str, np.ndarray]:
         rows = np.asarray(transition_indices, np.int64)
         history = self.transitions["history_indices"][rows]
         keep = self.max_history
         present = history >= 0
+        if window_rng is not None:
+            # Random window sampling: keep only a random suffix of each row's
+            # history (right-aligned layout, so columns >= width - w), with
+            # w drawn uniformly from 1..depth.  Training-time regulariser that
+            # exposes the model to every context length, not just full windows.
+            depth = present.sum(-1)
+            width = history.shape[1]
+            w = np.minimum(
+                window_rng.integers(1, np.maximum(depth, 1) + 1), depth
+            )
+            present = present & (
+                np.arange(width)[None, :] >= (width - w)[:, None]
+            )
         safe = np.maximum(history, 0)
         target = self.transitions["target_indices"][rows]
         batch = {
@@ -548,9 +590,31 @@ class FrozenCache:
         if keep is not None:
             width = int(history.shape[1])
             if keep > width:
-                raise ValueError(
-                    f"max_history {keep} exceeds the cache's window of {width}"
-                )
+                # Cross-cache eval (e.g. an h4 selection cache under an h8
+                # training config): left-pad with invalid history slots so the
+                # batch width matches; present=False makes padding invisible.
+                pad = keep - width
+                for name in self.HISTORY_COLUMNS:
+                    value = batch.get(name)
+                    if value is None:
+                        continue
+                    if name == "history_codes":
+                        shape = value.shape[2:]
+                        batch[name] = np.concatenate(
+                            [np.zeros((len(value), pad) + shape, value.dtype),
+                             value], axis=1)
+                    elif value.dtype == np.bool_:
+                        batch[name] = np.concatenate(
+                            [np.zeros((len(value), pad) + value.shape[2:], bool),
+                             value], axis=1)
+                    elif value.dtype.kind in "iu":
+                        batch[name] = np.concatenate(
+                            [np.full((len(value), pad) + value.shape[2:], -1,
+                                     value.dtype), value], axis=1)
+                    else:
+                        batch[name] = np.concatenate(
+                            [np.zeros((len(value), pad) + value.shape[2:],
+                                      value.dtype), value], axis=1)
             if keep < width:
                 for name in self.HISTORY_COLUMNS:
                     value = batch.get(name)

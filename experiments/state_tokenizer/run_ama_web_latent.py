@@ -15,8 +15,9 @@ import os
 import re
 import time
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -140,6 +141,23 @@ def web_episodes(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def episodes_in_domains(path: Path, domains: Sequence[str]) -> list[dict[str, Any]]:
+    """Every episode whose domain is in ``domains``, in episode order.
+
+    The memory study needs the whole benchmark, not just the web arm: the
+    official questions of every episode are the only distribution the bridge and
+    reader were trained on, so utility fitted on a web-only caches would not
+    cover the corpus the gate is applied to.
+    """
+    wanted = {str(domain).upper() for domain in domains}
+    rows = [row for row in _jsonl(path)
+            if str(row.get("domain", "")).upper() in wanted]
+    rows.sort(key=lambda row: int(row["episode_id"]))
+    if not rows:
+        raise ValueError(f"AMA test file contains no episodes in {sorted(wanted)}")
+    return rows
+
+
 def shard_episodes(rows: list[dict[str, Any]], index: int, count: int):
     if count < 1 or index < 0 or index >= count:
         raise ValueError("shard-index must satisfy 0 <= index < shard-count")
@@ -172,6 +190,29 @@ def _atomic_torch_save(payload: dict[str, Any], target: Path) -> None:
     os.replace(temporary, target)
 
 
+EMPTY_STEP_TEXT = "(empty observation)"
+
+
+def _fill_empty_steps(trajectory: Any) -> list[Any]:
+    """Give turns that carry neither action nor observation a placeholder.
+
+    51 episodes (mostly spider2) contain such turns. ``adapt_ama_step`` rejects
+    them, which would leave those episodes without a cache and silently drop
+    them from the utility corpus. The world-model builder already substitutes
+    this exact placeholder, so the reader cache stays consistent with the state
+    texts the gate is fitted on.
+    """
+    filled = []
+    for turn in trajectory:
+        if isinstance(turn, Mapping):
+            action = str(turn.get("action", "") or "").strip()
+            observation = str(turn.get("observation", "") or "").strip()
+            if not action and not observation:
+                turn = {**turn, "observation": EMPTY_STEP_TEXT}
+        filled.append(turn)
+    return filled
+
+
 def cache_shard(args: argparse.Namespace) -> None:
     test_path = Path(args.test_file).resolve()
     qformer_path = Path(args.qformer).resolve()
@@ -200,7 +241,7 @@ def cache_shard(args: argparse.Namespace) -> None:
     skipped = _episode_ids(args.skip_episode_ids)
     clean_mode = args.clean_axtree
     cache_protocol = CLEAN_CACHE_PROTOCOL if clean_mode != "none" else CACHE_PROTOCOL
-    eligible = [row for row in web_episodes(test_path)
+    eligible = [row for row in episodes_in_domains(test_path, args.domains)
                 if int(row["episode_id"]) not in skipped]
     rows = shard_episodes(eligible, args.shard_index, args.shard_count)
     print(json.dumps({
@@ -226,7 +267,7 @@ def cache_shard(args: argparse.Namespace) -> None:
                 print(json.dumps({"event": "cache_skip", "episode_id": episode_id}), flush=True)
                 continue
             raise ValueError(f"stale cache exists: {target}")
-        trajectory = episode["trajectory"]
+        trajectory = _fill_empty_steps(episode["trajectory"])
         clean_audit = None
         if clean_mode != "none":
             trajectory, clean_audit = clean_trajectory(episode, clean_mode)
@@ -244,7 +285,7 @@ def cache_shard(args: argparse.Namespace) -> None:
             "protocol": cache_protocol,
             "metadata": {
                 "episode_id": episode_id,
-                "domain": "WEB",
+                "domain": str(episode.get("domain", "")),
                 "test_sha256": test_hash,
                 "qformer_sha256": qformer_hash,
                 "retrieval_head_sha256": head_hash,
@@ -705,6 +746,9 @@ def main() -> None:
     cache.add_argument("--shard-index", type=int, required=True)
     cache.add_argument("--shard-count", type=int, required=True)
     cache.add_argument("--max-length", type=int, default=8192)
+    cache.add_argument("--domains", nargs="+", default=["WEB"],
+                       help="AMA domains to build caches for; the default keeps "
+                            "the original web-only behaviour")
     cache.add_argument("--overwrite", action="store_true")
     cache.add_argument("--skip-episode-ids", default="")
     cache.add_argument(

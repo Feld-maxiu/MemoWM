@@ -1,0 +1,65 @@
+# webworld_v2_c64_aux.yaml + per-action-type copy-gate bias (17 params).
+#
+# Why this exists (2026-09-09 probe, probe_persistence_predictability.py):
+#   * the persistence-aux head alone plateaued: source-code features carry
+#     little mutual information about per-axis persistence, while the action
+#     type is the dominant signal (CLICK vs WAIT vs TYPE have very different
+#     keep rates between WebWorld and AMA);
+#   * fix: one learned scalar per action type added to every axis of the
+#     copy logit: copy_logit += copy_action_bias[action_type].
+#     17 free parameters, zero-init -> step-0 model identical to the aux run;
+#   * combined with the persistence-aux head (kept on): aux handles per-axis
+#     assignment from source code, action bias handles the per-transition
+#     prior the aux head cannot see.
+
+protocol: residualmem_web_discrete_wm_v1
+
+model:
+  max_history: 8
+  num_latent_tokens: 32
+  num_observation_slots: 32
+  num_subspaces: 32
+  num_categories: 64
+  code_embedding_dim: 8
+  d_model: 256
+  num_layers: 12
+  num_heads: 8
+  mlp_dim: 4096
+  dropout: 0.3
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  use_coordinate_channel: true
+  num_action_types: 17
+  coordinate_bins: 64
+  use_copy_gate: true
+  use_persistence_aux: true
+  aux_persistence_weight: 1.0
+  use_action_gate_bias: true
+  use_target_channel: false
+  max_payload_bytes: 40
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  max_steps: 100000
+  min_steps: 100000
+  eval_every: 2500
+  patience_steps: 300000
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  payload_bytes: 40
+  coordinate_bits: 10
+  structural_bill_bits: 20.45
+  full_bill_bits: 73.86
+  task_bill_bits_per_episode: 0
