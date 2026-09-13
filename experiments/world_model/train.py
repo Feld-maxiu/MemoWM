@@ -61,6 +61,21 @@ class DeterministicSampler:
         self.cursor = 0
         self.epochs = 0
 
+    def next_n(self, count: int) -> np.ndarray:
+        chunks = []
+        needed = int(count)
+        while needed:
+            available = len(self.order) - self.cursor
+            take = min(needed, available)
+            chunks.append(self.order[self.cursor:self.cursor + take])
+            self.cursor += take
+            needed -= take
+            if self.cursor == len(self.order):
+                self.order = self.rng.permutation(self.rows)
+                self.cursor = 0
+                self.epochs += 1
+        return np.concatenate(chunks)
+
     def next(self) -> np.ndarray:
         chunks = []
         needed = self.batch_size
@@ -94,6 +109,48 @@ class DeterministicSampler:
         value.cursor = int(state["cursor"])
         value.epochs = int(state["epochs"])
         return value
+
+
+class MixSampler:
+    """Per-batch corpus mixing over one merged cache at a fixed ratio.
+
+    The two samplers cover the train rows of the two corpora (see
+    `t_corpus_ids` in the merged dataset); `next()` returns the
+    concatenated row indices for a single `cache.batch` call.
+    """
+
+    def __init__(self, primary: DeterministicSampler, mix: DeterministicSampler,
+                 ratio: float):
+        self.primary = primary
+        self.mix = mix
+        self.batch_size = primary.batch_size
+        self.mix_ratio = float(ratio)
+        if not 0.0 < self.mix_ratio < 1.0:
+            raise ValueError("mix ratio must lie in (0,1)")
+        self.last_split = 0
+
+    def next(self) -> np.ndarray:
+        n_mix = max(1, min(self.batch_size - 1,
+                           int(round(self.batch_size * self.mix_ratio))))
+        n_primary = self.batch_size - n_mix
+        self.last_split = n_primary
+        return np.concatenate([
+            self.primary.next_n(n_primary), self.mix.next_n(n_mix)
+        ])
+
+    def state_dict(self) -> dict:
+        return {
+            "kind": "mix",
+            "mix_ratio": self.mix_ratio,
+            "primary": self.primary.state_dict(),
+            "mix": self.mix.state_dict(),
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> "MixSampler":
+        primary = DeterministicSampler.from_state(state["primary"])
+        mix = DeterministicSampler.from_state(state["mix"])
+        return cls(primary, mix, float(state["mix_ratio"]))
 
 
 def _atomic_pickle(path: Path, value) -> None:
@@ -193,6 +250,9 @@ def make_update(optimizer, variant: str, config: ModelConfig, *, overfit: bool):
                 "mask_accuracy": metrics["mask_accuracy"],
                 "code_accuracy": metrics["code_accuracy"],
             }
+            for extra in ("aux_loss", "persistence_accuracy", "persistence_rate"):
+                if extra in metrics:
+                    compact[extra] = metrics[extra]
             return loss, compact
 
         (loss, metrics), grads = jax.value_and_grad(objective, has_aux=True)(params)
@@ -467,7 +527,19 @@ def run(args: argparse.Namespace) -> dict:
             args.eval_cache, verify_hashes=args.verify_cache_hashes
         )
         eval_cache.max_history = config.model.max_history
+    selection_cache = None
+    if args.selection_cache:
+        if args.eval_cache:
+            raise ValueError("--selection-cache and --eval-cache are exclusive")
+        if args.dev_fraction:
+            raise ValueError("--selection-cache and --dev-fraction are exclusive")
+        selection_cache = FrozenCache(
+            args.selection_cache, verify_hashes=args.verify_cache_hashes
+        )
+        selection_cache.max_history = config.model.max_history
     sel_cache = cache if eval_cache is None else eval_cache
+    if selection_cache is not None:
+        sel_cache = selection_cache
     training = _apply_training_overrides(config.training, args)
     config = dataclasses.replace(config, training=training)
     jax.config.update("jax_default_matmul_precision", training.matmul_precision)
@@ -486,7 +558,9 @@ def run(args: argparse.Namespace) -> dict:
     )
     resolved_path = output / "resolved.yaml"
     resolved_path.write_text(yaml.safe_dump(resolved, sort_keys=True), encoding="utf-8")
-    cache_manifest_path = Path(args.cache) / CACHE_FILES["manifest"]
+    cache_arg = Path(args.cache)
+    cache_manifest_path = (cache_arg if cache_arg.is_file()
+                           else cache_arg / CACHE_FILES["manifest"])
     metadata = {
         "variant": variant,
         "seed": args.seed,
@@ -496,7 +570,15 @@ def run(args: argparse.Namespace) -> dict:
 
     train_rows = _training_rows(cache, args)
     overfit = bool(args.overfit_transitions)
-    if eval_cache is not None:
+    reference_rows = None
+    if selection_cache is not None:
+        reference_rows = cache.indices_for_split(
+            "validation", test_freeze_manifest=None
+        )
+        selection_rows = selection_cache.indices_for_split(
+            "validation", test_freeze_manifest=None
+        )
+    elif eval_cache is not None:
         selection_rows = eval_cache.indices_for_split(
             "validation", test_freeze_manifest=None
         )
@@ -515,9 +597,30 @@ def run(args: argparse.Namespace) -> dict:
             "validation", test_freeze_manifest=None
         )
     params = jax.device_put(initialize_params(config.model, args.seed), device)
+    if getattr(args, "init_from", None):
+        with open(args.init_from, "rb") as _warm_handle:
+            _warm = pickle.load(_warm_handle)
+        params = jax.device_put(_warm["params"], device)
     optimizer, schedule = build_optimizer(params, training, overfit=overfit)
     opt_state = optimizer.init(params)
     sampler = DeterministicSampler(train_rows, training.batch_size, args.seed)
+    corpus_mix = False
+    corpus_ids = cache.transitions.get("corpus_ids")
+    mix_ratio = float(getattr(args, "mix_ratio", 0.5))
+    if corpus_ids is not None and 0.0 < mix_ratio < 1.0:
+        train_corpus = corpus_ids[train_rows]
+        corpora = np.unique(train_corpus)
+        if len(corpora) > 1:
+            corpus_mix = True
+            sampler = MixSampler(
+                DeterministicSampler(
+                    train_rows[train_corpus == corpora[0]],
+                    training.batch_size, args.seed + 2),
+                DeterministicSampler(
+                    train_rows[train_corpus == corpora[1]],
+                    training.batch_size, args.seed + 3),
+                mix_ratio,
+            )
     key = jax.random.PRNGKey(args.seed + 1)
     step = 0
     best_metric = float("inf")
@@ -536,9 +639,23 @@ def run(args: argparse.Namespace) -> dict:
         evals_without_improvement = int(checkpoint["evals_without_improvement"])
 
     update = make_update(optimizer, variant, config.model, overfit=overfit)
+    # Training-only history-window sampling (see FrozenCache.batch); eval always
+    # sees full windows.  RNG state is deliberately not checkpointed -- resumed
+    # runs replay a different window draw sequence, which is acceptable for a
+    # data-level regulariser.
+    window_rng = (
+        np.random.default_rng(int(args.seed) + 1)
+        if getattr(args, "window_sampling", False)
+        else None
+    )
     initial, _ = evaluate_model(
         sel_cache, selection_rows, params, variant, config, keep_per_transition=False
     )
+    initial_reference = None
+    if reference_rows is not None:
+        initial_reference, _ = evaluate_model(
+            cache, reference_rows, params, variant, config, keep_per_transition=False
+        )
     if not args.resume:
         best_metric = initial["total_bits_per_transition"]
         _save_checkpoint(
@@ -554,7 +671,10 @@ def run(args: argparse.Namespace) -> dict:
     with history_path.open("a", encoding="utf-8") as history:
         while step < training.max_steps:
             selected = sampler.next()
-            batch = _device_batch(cache.batch(selected), model_batch_keys(config.model))
+            batch = _device_batch(
+                cache.batch(selected, window_rng=window_rng),
+                model_batch_keys(config.model),
+            )
             key, update_key = jax.random.split(key)
             params, opt_state, _loss, train_metrics = update(
                 params, opt_state, batch, update_key
@@ -566,6 +686,12 @@ def run(args: argparse.Namespace) -> dict:
                 sel_cache, selection_rows, params, variant, config,
                 keep_per_transition=False,
             )
+            reference = None
+            if reference_rows is not None:
+                reference, _ = evaluate_model(
+                    cache, reference_rows, params, variant, config,
+                    keep_per_transition=False,
+                )
             metric = validation["total_bits_per_transition"]
             record = {
                 "step": step,
@@ -574,6 +700,8 @@ def run(args: argparse.Namespace) -> dict:
                 "selection": validation,
                 "wall_seconds": time.time() - start_time,
             }
+            if reference is not None:
+                record["reference"] = reference
             history.write(json.dumps(record, sort_keys=True) + "\n")
             history.flush()
             improved = metric < best_metric
@@ -617,6 +745,12 @@ def run(args: argparse.Namespace) -> dict:
         sel_cache, selection_rows, best_params, variant, config,
         keep_per_transition=True,
     )
+    final_reference = None
+    if reference_rows is not None:
+        final_reference, _ = evaluate_model(
+            cache, reference_rows, best_params, variant, config,
+            keep_per_transition=False,
+        )
     transition_path = output / "per_transition.npz"
     np.savez_compressed(transition_path, **per_transition)
     _write_per_episode(output / "per_episode.jsonl", sel_cache, per_transition)
@@ -671,12 +805,22 @@ def run(args: argparse.Namespace) -> dict:
             "cache": str(Path(args.cache).resolve()),
             "cache_manifest_sha256": metadata["cache_manifest_sha256"],
             "train_transitions": len(train_rows),
-            "selection": ("eval_cache_validation" if args.eval_cache else
+            "selection": ("selection_cache_validation" if args.selection_cache else
+                          "eval_cache_validation" if args.eval_cache else
                           "train_dev_split" if args.dev_fraction else
                           "overfit_train" if overfit else "validation"),
+            "mix_ratio": (mix_ratio if corpus_mix else None),
+            "init_from": (str(Path(args.init_from).resolve())
+                          if getattr(args, "init_from", None) else None),
             "selection_transitions": len(selection_rows),
             "eval_cache": (str(Path(args.eval_cache).resolve())
                            if args.eval_cache else None),
+            "selection_cache": (str(Path(args.selection_cache).resolve())
+                                if args.selection_cache else None),
+            "reference_cache": (str(Path(args.cache).resolve())
+                                if args.selection_cache else None),
+            "reference_transitions": (len(reference_rows)
+                                      if reference_rows is not None else None),
             "subset": args.subset_name,
             "test_evaluated": False,
             "dev_run": allow_dev or bool(args.dev_fraction),
@@ -691,7 +835,9 @@ def run(args: argparse.Namespace) -> dict:
             "wall_seconds": time.time() - start_time,
         },
         "initial": initial,
+        "initial_reference": initial_reference,
         "best_selection": final,
+        "best_selection_reference": final_reference,
         "last_selection": last_final,
         "relative_nll_drop": relative_drop,
         "gates": gates,
@@ -750,6 +896,11 @@ def build_parser() -> argparse.ArgumentParser:
         "state_only", "struct_no_history", "semantic_action",
     ), required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--window-sampling", action="store_true",
+        help="train with a random suffix of each row's history (uniform 1..depth); "
+             "eval always uses full windows",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--platform", default="gpu")
     parser.add_argument("--device-index", type=int, default=0)
@@ -774,6 +925,19 @@ def build_parser() -> argparse.ArgumentParser:
                         help="evaluate the selection metric on this external "
                              "cache's validation split at every eval point; "
                              "exclusive with --dev-fraction")
+    parser.add_argument("--mix-ratio", type=float, default=0.5,
+                        help="fraction of each batch drawn from the second "
+                             "corpus of a merged dataset (t_corpus_ids); "
+                             "0 or 1 disables mixing")
+    parser.add_argument("--init-from",
+                        help="warm-start model params from this checkpoint")
+    parser.add_argument("--selection-cache",
+                        help="select best checkpoints (and judge the C1 point "
+                             "gate) on this cache's validation split instead "
+                             "of the training cache's; the training cache's "
+                             "own validation split is then still evaluated at "
+                             "every eval point and reported as 'reference'. "
+                             "Exclusive with --eval-cache and --dev-fraction")
     parser.add_argument("--baseline-json")
     parser.add_argument("--enforce-c1-point-gate", action="store_true")
     parser.add_argument("--verify-cache-hashes", action="store_true")

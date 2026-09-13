@@ -45,6 +45,11 @@ class ModelConfig:
     payload_hidden_dim: int = 64
     use_target_channel: bool = False
     use_copy_gate: bool = False
+    use_persistence_aux: bool = False
+    aux_persistence_weight: float = 1.0
+    use_action_gate_bias: bool = False
+    output_smoothing: float = 0.0
+    exclude_source_in_change: bool = False
     max_payload_bytes: int = MAX_PAYLOAD_BYTES
     use_coordinate_channel: bool = False
     num_action_types: int = len(ACTION_TYPE_IDS)
@@ -72,6 +77,8 @@ class ModelConfig:
             raise ValueError("d_model must be divisible by num_heads")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie in [0,1)")
+        if not 0.0 <= self.output_smoothing < 1.0:
+            raise ValueError("output_smoothing must lie in [0,1)")
         for name in ("num_action_types", "num_model_tags", "num_model_refs",
                      "coordinate_bins"):
             if getattr(self, name) < 1:
@@ -183,6 +190,19 @@ def initialize_params(config: ModelConfig, seed: int = 0) -> dict:
         params["copy_head/b"] = jnp.zeros((
             config.num_latent_tokens, config.num_subspaces
         ), jnp.float32)
+        if config.use_persistence_aux:
+            params["persistence_head/w"] = jnp.zeros((
+                config.num_latent_tokens, config.num_subspaces,
+                2 * config.code_embedding_dim,
+            ), jnp.float32)
+            params["persistence_head/b"] = jnp.zeros((
+                config.num_latent_tokens, config.num_subspaces,
+            ), jnp.float32)
+            params["persistence_gate_scale"] = jnp.ones((), jnp.float32)
+        if config.use_action_gate_bias:
+            params["copy_action_bias"] = jnp.zeros(
+                (config.num_action_types,), jnp.float32
+            )
     return params
 
 
@@ -463,6 +483,7 @@ def predict(
     rng=None,
     train: bool = False,
     source_log_prior=None,
+    return_aux: bool = False,
 ):
     history_codes = jnp.asarray(history_codes, jnp.int32)
     if history_present is None:
@@ -496,29 +517,85 @@ def predict(
     ) + params["code_head/b"]
     if source_log_prior is not None:
         code_logits = code_logits + source_log_prior
+    aux_keep_logit = None
     if "copy_head/w" in params:
         source_codes = jnp.asarray(history_codes, jnp.int32)[:, -1]
         copy_logit = jnp.einsum(
             "bige,ige->big", pieces, params["copy_head/w"]
         ) + params["copy_head/b"]
+        aux_keep_logit = None
+        if (
+            getattr(config, "use_persistence_aux", False)
+            and "persistence_head/w" in params
+        ):
+            # code_embedding is the tied (i, g, C, e) head weight, so the
+            # per-axis source embedding is a gather over the category axis.
+            one_hot_source = jax.nn.one_hot(
+                source_codes, config.num_categories,
+                dtype=code_logits.dtype,
+            )
+            source_embedding = jnp.einsum(
+                "bigc,igce->bige", one_hot_source, params["code_embedding"]
+            )
+            features = jnp.concatenate([pieces, source_embedding], axis=-1)
+            aux_keep_logit = jnp.einsum(
+                "bige,ige->big", features, params["persistence_head/w"]
+            ) + params["persistence_head/b"]
+            copy_logit = (
+                copy_logit + params["persistence_gate_scale"] * aux_keep_logit
+            )
+        if getattr(config, "use_action_gate_bias", False) and (
+            "copy_action_bias" in params
+        ):
+            # The last action drives the source -> target transition, so its
+            # type shifts the per-axis keep/change prior of the copy gate.
+            action_type = jnp.asarray(actions["types"], jnp.int32)[:, -1]
+            copy_logit = copy_logit + params["copy_action_bias"][action_type][
+                :, None, None
+            ]
         log_keep = jax.nn.log_sigmoid(copy_logit)[..., None]
         log_change = jax.nn.log_sigmoid(-copy_logit)[..., None]
-        residual = jax.nn.log_softmax(code_logits, axis=-1)
         on_source = jax.nn.one_hot(
             source_codes, config.num_categories, dtype=code_logits.dtype
         )
+        if config.exclude_source_in_change:
+            # The keep path already covers the source code; the change path
+            # answers "where does the code move to" and therefore
+            # renormalizes over the non-source codes only (mirroring the
+            # copy baseline's destination distribution, which also excludes
+            # the source).  Without this the residual head wastes much of
+            # its mass re-predicting "no change" on changed axes.
+            residual = jax.nn.log_softmax(
+                jnp.where(on_source > 0, -1e30, code_logits), axis=-1
+            )
+        else:
+            residual = jax.nn.log_softmax(code_logits, axis=-1)
         keep_term = jnp.where(on_source > 0, log_keep, -1e30)
         code_logits = jnp.logaddexp(keep_term, log_change + residual)
+    if config.output_smoothing > 0:
+        # Fixed epsilon floor on the output distribution (no fitted
+        # parameters): P = (1-eps) softmax + eps/C, returned as log-probs.
+        log_probs = jax.nn.log_softmax(code_logits, axis=-1)
+        code_logits = jnp.logaddexp(
+            math.log1p(-config.output_smoothing) + log_probs,
+            math.log(config.output_smoothing / config.num_categories),
+        )
+    if return_aux:
+        return mask_logits, code_logits, aux_keep_logit
     return mask_logits, code_logits
 
 
-def codelength_bits(mask_logits, code_logits, target_valid, target_codes):
+def codelength_bits(mask_logits, code_logits, target_valid, target_codes, *,
+                    code_log_probs=False):
     target_valid = jnp.asarray(target_valid, jnp.float32)
     target_codes = jnp.asarray(target_codes, jnp.int32)
     mask_matrix = (
         jax.nn.softplus(mask_logits) - target_valid * mask_logits
     ) / LN2
-    log_probability = jax.nn.log_softmax(code_logits, axis=-1)
+    if code_log_probs:
+        log_probability = code_logits
+    else:
+        log_probability = jax.nn.log_softmax(code_logits, axis=-1)
     selected = jnp.take_along_axis(
         log_probability, target_codes[..., None], axis=-1
     )[..., 0]
@@ -538,14 +615,16 @@ def loss_and_metrics(
     params, batch, variant: str, config: ModelConfig, *, rng=None, train=False
 ):
     actions = actions_from_batch(batch, config)
-    mask_logits, code_logits = predict(
+    mask_logits, code_logits, aux_keep_logit = predict(
         params,
         batch["history_codes"], batch["history_valid"], actions,
         batch["task_ids"], variant, config,
         history_present=batch.get("history_present"), rng=rng, train=train,
+        return_aux=True,
     )
     rates = codelength_bits(
-        mask_logits, code_logits, batch["target_valid"], batch["target_codes"]
+        mask_logits, code_logits, batch["target_valid"], batch["target_codes"],
+        code_log_probs=config.output_smoothing > 0,
     )
     mask_prediction = mask_logits >= 0
     code_prediction = jnp.argmax(code_logits, axis=-1)
@@ -560,4 +639,44 @@ def loss_and_metrics(
             code_prediction == jnp.asarray(batch["target_codes"], jnp.int32)
         ),
     }
+    if aux_keep_logit is not None:
+        history_present = batch.get("history_present")
+        if history_present is None:
+            history_present = jnp.any(
+                jnp.asarray(batch["history_valid"], jnp.bool_), axis=-1
+            )
+        has_history = jnp.asarray(history_present, jnp.bool_)[:, -1]
+        source_codes = jnp.asarray(batch["history_codes"], jnp.int32)[:, -1]
+        label = (
+            jnp.asarray(batch["target_codes"], jnp.int32)
+            == source_codes
+        ).astype(jnp.float32)
+        valid = jnp.broadcast_to(
+            has_history[:, None, None], label.shape
+        ).astype(jnp.float32)
+        positives = label * valid
+        persistence_rate = (
+            jnp.sum(positives) / jnp.maximum(jnp.sum(valid), 1.0)
+        )
+        rate = jnp.clip(persistence_rate, 0.01, 0.99)
+        weight_positive = 0.5 / rate
+        weight_negative = 0.5 / (1.0 - rate)
+        logits = aux_keep_logit
+        bce = -(
+            weight_positive * positives * jax.nn.log_sigmoid(logits)
+            + weight_negative * (valid - positives)
+            * jax.nn.log_sigmoid(-logits)
+        )
+        aux_loss = jnp.sum(bce) / jnp.maximum(jnp.sum(valid), 1.0)
+        predicted_keep = (jax.nn.sigmoid(logits) >= 0.5).astype(jnp.float32)
+        metrics["persistence_rate"] = persistence_rate
+        metrics["persistence_accuracy"] = jnp.sum(
+            (predicted_keep == label) * valid
+        ) / jnp.maximum(jnp.sum(valid), 1.0)
+        metrics["aux_loss"] = aux_loss
+        total_loss = (
+            metrics["loss"]
+            + getattr(config, "aux_persistence_weight", 1.0) * aux_loss
+        )
+        return total_loss, (metrics, rates, mask_logits, code_logits)
     return metrics["loss"], (metrics, rates, mask_logits, code_logits)

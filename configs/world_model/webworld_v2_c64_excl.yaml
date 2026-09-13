@@ -1,0 +1,70 @@
+# World model for the full-scale WebWorld corpus (webworld-v2), over Q-Former
+# codes and pixel-coordinate actions.
+#
+# Same architecture as web_discrete_c64.yaml (which is itself the WMA-era
+# web_discrete.yaml with C=64). Changes driven by the v1 post-mortem and the
+# distribution-shift audit (2026-09-09):
+#   * training corpus 19k -> 256k transitions (12x), the condition the WMA
+#     result shows this architecture actually needs (495k there);
+#   * max_history 32 -> 8: WebWorldData episodes are uniformly short (mean 3.0
+#     actions/row in the source, p90=6, max 31 over 84k episodes), so a 32-wide
+#     window bought 7x slower steps and 93% padding for no real context.  The
+#     AMA selection cache is rebuilt at h4 so eval stays inside the training
+#     context regime; copy/source/marginal baselines are history-free and
+#     therefore unchanged by this choice.
+#   * --window-sampling (train.py) draws a uniform random history suffix
+#     w in 1..depth per training row, so every context length gets gradient.
+# Everything else is intentionally untouched so the comparison stays clean.
+protocol: residualmem_web_discrete_wm_v1
+
+model:
+  max_history: 8
+  num_latent_tokens: 32
+  num_observation_slots: 32
+  num_subspaces: 32
+  num_categories: 64
+  code_embedding_dim: 8
+  d_model: 256
+  num_layers: 12
+  num_heads: 8
+  mlp_dim: 4096
+  dropout: 0.3
+  action_embedding_dim: 32
+  byte_embedding_dim: 16
+  payload_hidden_dim: 64
+  use_coordinate_channel: true
+  num_action_types: 17
+  coordinate_bins: 64
+  use_copy_gate: true
+  use_target_channel: false
+  max_payload_bytes: 40
+  # The copy-gate keep path covers the source code, so the change path
+  # renormalizes over non-source codes only.  Fixes the change-path
+  # pathology where ~35% of residual mass is wasted re-predicting the
+  # source on AMA's changed axes (64.5% of axes).  No fitted parameters.
+  exclude_source_in_change: true
+
+training:
+  batch_size: 32
+  learning_rate: 0.0003
+  warmup_steps: 1000
+  max_steps: 100000
+  min_steps: 100000
+  eval_every: 2500
+  patience_steps: 300000
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  matmul_precision: highest
+
+evaluation:
+  batch_size: 32
+  bootstrap_replicates: 10000
+  rollout_horizons: [1, 2, 3, 4, 5, 6, 7]
+
+action:
+  exclude_policy: true
+  payload_bytes: 40
+  coordinate_bits: 10
+  structural_bill_bits: 20.45
+  full_bill_bits: 73.86
+  task_bill_bits_per_episode: 0

@@ -25,3 +25,6 @@ miniconda*
 qwen3-32b*.log
 switch_qwen32b_to_xet.sh
 .trae/
+
+# ad-hoc download logs
+dl_*.log

@@ -27,7 +27,7 @@ ResidualMem 将长期记忆表示为相对于世界模型预测的任务相关�
 
 检索侧使用 full/gated 双视图训练独立检索头。在完全冻结 Q-Former、OPQ、世界模型和 utility artifact 的条件下，选定模型在 gated validation 上达到 R@1 0.2274、R@10 0.6560、MRR 0.3697；相同数据上的旧检索头分别为 0.2226、0.6488、0.3622。该损失用于约束压缩前后的检索接口一致性。
 
-本文只描述方法、实际实现、实验协议、结果与产物接口。WMA 全链路的运行命令和环境配置统一维护在 `WMA_RESIDUAL_复现手册.md`；效用门控和 AMA-WEB 的补充资源分别见 `UTILITY_GATE.md` 和 `AMA测评实验资源与环境说明.md`。
+本文只描述方法、实际实现、实验协议、结果与产物接口。WMA 全链路的运行命令和环境配置统一维护在 `WMA_RESIDUAL_复现手册.md`；效用门控见 `UTILITY_GATE.md`，AMA-WEB 的复现环境与命令见 `AMA_Bench_复现手册.md`。
 
 ---
 
