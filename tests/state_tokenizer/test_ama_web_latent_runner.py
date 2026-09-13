@@ -95,7 +95,7 @@ class TestCachePayloadLoading(unittest.TestCase):
                     qformer_hash="x" * 64, head_hash="h" * 64, needs_texts=False)
 
     def test_text_modes_and_protocols(self):
-        self.assertEqual(TEXT_MEMORY_MODES, ("text-only", "matched", "shuffled"))
+        self.assertEqual(TEXT_MEMORY_MODES, ("text-only", "matched", "shuffled", "latent+anchor"))
         self.assertNotEqual(CACHE_PROTOCOL, CACHE_PROTOCOL_V1)
 
 
