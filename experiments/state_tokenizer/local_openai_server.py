@@ -128,8 +128,8 @@ class Replica:
         results = []
         for index, job in enumerate(jobs):
             completion = output[index, width:]
-            # Trim at the first pad/eos so a short answer in a batch with a long
-            # one does not report the whole batch's completion length.
+                                                                                
+                                                                      
             ids = completion.tolist()
             if tokenizer.eos_token_id in ids:
                 ids = ids[: ids.index(tokenizer.eos_token_id)]
@@ -234,7 +234,7 @@ class Pool:
         batch = [first]
         if first.has_image or first.temperature > 0:
             return batch
-        # A brief wait turns a trickle of arrivals into a batch worth decoding.
+                                                                               
         deadline = self.wait_seconds
         while len(batch) < self.max_batch:
             try:
@@ -242,7 +242,7 @@ class Pool:
             except queue.Empty:
                 break
             if job.has_image or job.temperature > 0:
-                # Cannot join this batch; put it back for the next round.
+                                                                         
                 self.queue.put(job)
                 break
             batch.append(job)
@@ -263,7 +263,7 @@ class Pool:
                         results = self.replica.generate_batch(batch)
                 for job, result in zip(batch, results):
                     job.result = result
-            except Exception as error:  # hand the failure to every waiter
+            except Exception as error:                                    
                 for job in batch:
                     job.error = error
             finally:
@@ -275,7 +275,7 @@ def make_handler(pool: Pool, model_name: str, cap: int = 1536):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, *_args):  # quiet; the evaluator is chatty enough
+        def log_message(self, *_args):                                         
             pass
 
         def _send(self, status: int, payload: dict):
@@ -283,13 +283,13 @@ def make_handler(pool: Pool, model_name: str, cap: int = 1536):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            # One request per connection, deliberately. SO_REUSEPORT balances
-            # *connections*, not requests, and the OpenAI SDK holds a keep-alive
-            # pool -- so a connection sticks to whichever worker accepted it and
-            # queues behind that worker's generations while others sit idle.
-            # Measured as client-side APITimeoutError against server-side
-            # BrokenPipeError. Closing here costs a localhost handshake per
-            # request and lets the kernel rebalance every time.
+                                                                             
+                                                                                
+                                                                                
+                                                                            
+                                                                         
+                                                                           
+                                                               
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
@@ -317,24 +317,24 @@ def make_handler(pool: Pool, model_name: str, cap: int = 1536):
                 max_tokens = int(
                     request.get("max_tokens") or request.get("max_completion_tokens") or 1024
                 )
-                # The evaluator asks for llm.max_tokens (16384) on every call,
-                # but a judge's JSON verdict runs ~135 tokens and the p90 is 205.
-                # The budget only ever gets spent when the model fails to emit
-                # EOS and loops -- measured at 2018->16384 tokens in 519 s, which
-                # pins one worker for eight minutes and pushes everything queued
-                # behind it past the client's 300 s timeout. Capping bounds the
-                # blast radius; truncated JSON is repaired downstream by
-                # json_repair_utils, an unbounded runaway is not recoverable.
+                                                                              
+                                                                                 
+                                                                              
+                                                                                 
+                                                                                
+                                                                               
+                                                                        
+                                                                             
                 if max_tokens > cap:
                     max_tokens = cap
                 temperature = float(request.get("temperature") or 0.0)
                 seed = int(request.get("seed") or 0)
-                # Qwen3.5 reasons before answering unless the chat template is
-                # told not to, and a judge asked for a JSON label will spend its
-                # whole budget on the preamble and return nothing parseable.
-                # The framework already does this for DeepSeek judges -- see
-                # _common_params, "saves tokens, faster" -- so off is the
-                # matching default; ask for the "-think" alias to get it back.
+                                                                              
+                                                                                
+                                                                            
+                                                                            
+                                                                         
+                                                                              
                 requested = str(request.get("model") or model_name)
                 thinking = requested.endswith("-think")
                 started = time.time()
@@ -362,7 +362,7 @@ def make_handler(pool: Pool, model_name: str, cap: int = 1536):
                         "total_tokens": prompt_tokens + completion_tokens,
                     },
                 })
-            except Exception as error:  # surface as a 500 the SDK will retry
+            except Exception as error:                                       
                 with pool.counter_lock:
                     pool.failed += 1
                 traceback.print_exc()
@@ -378,11 +378,11 @@ def serve_one(model_path: str, device: str, host: str, port: int, name: str,
     pool = Pool(Replica(model_path, device), max_batch=batch)
 
     class Reusing(ThreadingHTTPServer):
-        # SO_REUSEPORT is what makes the multi-process design work: every child
-        # binds the same port and the kernel spreads connections across them.
-        # Threads alone do not, because generate()'s autoregressive loop is
-        # Python-level and contends on the GIL -- measured flat at 0.71 req/s
-        # from 4 to 20 concurrent requests with 12 threaded replicas.
+                                                                               
+                                                                             
+                                                                           
+                                                                             
+                                                                     
         def server_bind(self):
             import socket
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
