@@ -7,7 +7,6 @@ ResidualMem 是一个面向 GUI/Web 与交互轨迹的外部记忆方法原型�
 - `WMA_RESIDUAL_复现手册.md`（**从这里开始**：整条链路怎么跑、产物在哪）
 - `技术报告_ResidualMem.md`（方法、全部实测、必须声明的事项）
 - `UTILITY_GATE.md`（效用门控与闭环）
-- `QFORMER_实验手册.md` / `WM_MIXED_复现手册.md`（分段细节与坑）
 
 `WORLD_MODEL_WORKLOG.md`（v8/MiniWoB 线，语料已废弃）与 `WMA_RAG_WORKLOG.md`
 （检索线，2026-08-22 冻结）已于 2026-09-02 移除，内容见
@@ -27,7 +26,7 @@ test 未打开，且不存在 test freeze manifest。
 
 ## 当前方法状态
 
-**冻结状态：v8 / AXTree / `(32,16,16,0)` / 10 万状态。** 该状态属于已作废的固定池化路线；其过程与判据随 `STATE_TOKENIZER_WORKLOG.md` 于 2026-08-27 移出，全文见 `git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md`。当前路线见 `QFORMER_实验手册.md`。
+**冻结状态：v8 / AXTree / `(32,16,16,0)` / 10 万状态。** 该状态属于已作废的固定池化路线；其过程与判据随 `STATE_TOKENIZER_WORKLOG.md` 于 2026-08-27 移出，全文见 `git show aa9e5a7:STATE_TOKENIZER_WORKLOG.md`。当前 Q-Former 路线见 `WMA_RESIDUAL_复现手册.md` §4.1。
 
 Qwen 的输入是**三个模态**：
 
@@ -132,8 +131,6 @@ $R/browsergym-venv/bin/python -m experiments.state_tokenizer.collect_browsergym 
 
 `--num-workers` **不得为 5 的倍数**（脚本会拒绝）：episode 索引是 `worker_id + k·num_workers`，划分按 `index % 10` 分桶，5 的倍数会让整个任务落进单一划分。
 
-生产采集用自愈脚本 `scripts_v8_collect.sh <worker_id>`，它按**退出码**而非清单文件判断完成。
-
 > `miniwob-plusplus/.venv`（Selenium 路线）仅供 v7 及更早复现，v8 起不再使用。
 
 ### 2. Qwen 抽取与池化
@@ -178,7 +175,7 @@ collect → merge_records（写 global_index = 合并清单行号）
 `experiments.state_tokenizer.modality_lengths --prompt-mode instruct` 生成只含
 `modality-lengths.npy` 的轻量 shard，再把它传给 `extract_fixed_prompt --source-features`。
 该预扫描只加载 processor/config、不加载 9B 权重；正式抽取仍会逐条重算长度并在不一致时
-立即失败，因此它不降低协议校验强度。可直接使用 `scripts_v9_instruct.sh modality-lengths`。
+立即失败，因此它不降低协议校验强度。
 
 ### 3. A1 / A2 瓶颈（JAX）
 

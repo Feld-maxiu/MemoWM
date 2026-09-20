@@ -1,78 +1,126 @@
 # WMA-ResidualMem 复现手册
 
-> 一条链路：**观察 → Q-Former → OPQ 量化 → 世界模型条件编码 → 效用门控**，在
-> WorldMemArena 上把每状态 6144 bit 的定宽记忆压到 4323.8 bit。
->
-> 本文只讲**怎么跑**和**东西在哪**。方法与结论见 `技术报告_ResidualMem.md`，
-> 门控的推导与全部声明见 `UTILITY_GATE.md`。
->
-> 取代了 `WMA_RAG_WORKLOG.md`（检索线，2026-08-22 冻结）与
-> `WORLD_MODEL_WORKLOG.md`（v8/MiniWoB 线，语料已废弃）。两者均无可运行命令，
-> 完整内容在 git：`git show d91aaa3:WMA_RAG_WORKLOG.md`。
+> 链路：**观察 → Q-Former → OPQ 量化 → 世界模型条件编码 → e·V 效用门控
+> → 闭环重建 → 检索 → Reader**。在 WorldMemArena Web 上，codec 把每状态
+> 6144 bit 的定宽记忆压到 4333.4 bit；端到端 Reader 评测为
+> **QA-C 0.6018（878/1459）**。方法与结论见 `技术报告_ResidualMem.md`。
 
 ---
 
-## 0. 先决定你要哪一种复现
+## 1. 部署目录与环境
 
-| | 做什么 | 耗时 |
-|---|---|---|
-| **A. 只要数字** | 从已冻结的产物重算主表全部数值 | **约 1 分钟** |
-| **B. 从原始数据重建** | 抽特征 → 拟合码本 → 训世界模型 → 打标 → 门控 | **数天**（含 3.8 h 八卡编码 + 60k 步训练） |
+把 ResidualMem 与带有 ResidualMem adapter 的 WMA 评测器放在同一目录：
 
-绝大多数情况要的是 A。B 只在换语料或换 Q-Former 时才需要。
+```text
+workspace/
+├── residual-mem/       # 本仓库、发布产物、codec 与评测脚本
+└── WorldMemArena/      # 发布页指定的 ResidualMem-compatible WMA checkout
+    └── WorldMemArena/  # Hugging Face 下载的官方数据集
+```
 
----
-
-## 1. 环境
-
-☠️ **两个解释器互相看不见**，这不是配置疏忽而是刻意的：`.venv-jax` 关掉了
-`include-system-site-packages`，所以 `conda activate qwen-vl && python` 里没有 jax。
-任何跨环节的编排**只能用 subprocess**，不能 import。
+WMA 评测器必须是发布页锁定的兼容版本：以官方 WorldMemArena 为基础，额外注册
+`ResidualMem-Instruct-Xbar-Input-RAG` adapter 并支持 `--subcategory`。未经适配的
+upstream checkout 不包含该 baseline，不能直接执行本文命令。
 
 ```bash
-REPO=/mnt/data/users/luzheng/workspace/iclr/czs/residual-mem && cd $REPO
-JX=$REPO/.venv-jax/bin/python                                    # jax 0.4.33 + GPU
-PY=/mnt/data/public_tools/miniconda3/envs/qwen-vl/bin/python     # torch
-export PYTHONPATH="$REPO" TOKENIZERS_PARALLELISM=false
+WORK=/path/to/workspace
+REPO=$WORK/residual-mem
+WMA=$WORK/WorldMemArena
+
+cd "$WMA"
+cp .env.example .env
+```
+
+ResidualMem 使用两个隔离环境：
+
+```bash
+cd "$REPO"
+
+# codec / world model
+python -m venv .venv-jax
+.venv-jax/bin/python -m pip install -r requirements.txt
+
+# Q-Former / retrieval / Reader / WMA
+conda create -n residualmem-wma python=3.10 -y
+conda activate residualmem-wma
+python -m pip install -r "$WMA/requirements.txt" tenacity
+# 再安装发布页锁定的 PyTorch、Transformers 与 Qwen3.5 依赖版本
+```
+
+本文结果验证过的 Torch 环境为 PyTorch 2.7.1、Transformers 5.14.1、
+SentenceTransformers 6.0.0、`qwen-vl-utils` 0.0.14；正式发布的 environment lock
+优先于这里的版本摘要。
+
+统一变量：
+
+```bash
+cd "$REPO"
+JX=$REPO/.venv-jax/bin/python
+PY=/path/to/miniconda/envs/residualmem-wma/bin/python
+D=$REPO/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar
+DATA=/path/to/residualmem-artifacts/molmoweb-pilot
+export RESIDUALMEM_DATA="$DATA"
+export PYTHONPATH="$REPO:$WMA" TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8
-export TRITON_CACHE_DIR=/mnt/data/users/luzheng/.cache/triton
+export TRITON_CACHE_DIR=/path/to/a/writable/triton-cache
+```
+
+在 Torch 环境中下载官方 WMA 数据并检查兼容 evaluator：
+
+```bash
+cd "$WMA"
+huggingface-cli download LCZZZZ/WorldMemArena --repo-type dataset \
+  --local-dir ./WorldMemArena
+
+"$PY" -c "from eval_framework.memory_adapters.residualmem_instruct_adapter import ResidualMemInstructAdapter"
+"$PY" -m eval_framework.cli --help | rg -- '--subcategory'
+test "$(find WorldMemArena/agent/gui/web -maxdepth 1 -name '*.json' | wc -l)" -eq 27
 ```
 
 | 谁用哪个 | |
 |---|---|
-| `$JX` | 世界模型（train/evaluate/cache）、OPQ、后验、门控码率、manifest |
-| `$PY` | Q-Former、reader、打标、检索头 |
+| `$JX` | 世界模型（cache）、OPQ、门控码率、manifest |
+| `$PY` | Q-Former、reader、检索头 |
 
-☠️ **OMP 线程必须限制。** 这台机器 250 核，不限的话线程自旋会把 CPU 抢光，
-GPU 推理**慢 5 倍**。
-☠️ **`TRITON_CACHE_DIR` 不能留在 `/tmp`**（已 95% 满），torch 会在 import 期
-炸 `Errno 28`，报错位置离原因很远。
+☠️ 两个解释器互相看不见是预期行为；不要在一个解释器中同时 import 两套运行时。
+☠️ **OMP 线程必须限制**，否则 GPU 推理慢 5 倍。☠️ `TRITON_CACHE_DIR` 必须指向
+空间充足的可写目录。
 
 ---
 
-## 2. 产物在哪
+## 2. 发布产物
 
-**全部由 `configs/system.lock.yaml` 管辖，加载时校验 sha256。** 先跑这个：
+从 Hugging Face 下载（`feldmatthew/WMA-ResidualMem`）并按下列位置摆放：
 
 ```bash
-$JX -m residualmem.manifest        # 六项全 ok 才继续
+cd "$REPO"
+huggingface-cli download feldmatthew/WMA-ResidualMem --local-dir hf
+mkdir -p "$D"
+cp hf/weights/qformer-K32e-obs0.5.gapbest.pt \
+   hf/weights/head-K32e-obs0.5-gapbest-utility-gated.pt "$D/"
+cp hf/weights/world_model-best.pkl "$REPO/run/best.pkl"
+cp hf/codec/opq-shared-mix10-M32-C64.npz "$DATA/pq-full/"
+cp hf/codec/ev-vectors.npz "$REPO/gate/"
+cp hf/configs/web_h16_C64_full.yaml "$REPO/configs/world_model/"
+
+# 哈希校验：所有 runtime 项均为 ok 才继续
+"$JX" -m residualmem.manifest
 ```
 
 | 角色 | 路径 |
 |---|---|
 | Q-Former | `$D/qformer-K32e-obs0.5.gapbest.pt`（step 6000） |
-| 检索头 | `$D/head-K32e-obs0.5-gapbest-utility-gated.pt`（$\alpha=0.1$，step 1750） |
-| 检索训练 cache | `$D/cache-K32e-obs0.5-gapbest-utility-gated.npz` |
-| 码本 C=64 | `$DATA/pq-full/opq-shared-mix10-M32-C64.npz` |
-| 世界模型 | `run/best.pkl`（60k 步；`last.pkl` 是它的硬链接，两者字节相同） |
-| 效用掩码 | `gate/mask-lambda0.0010.npz` |
+| 检索头 | `$D/head-K32e-obs0.5-gapbest-utility-gated.pt` |
+| OPQ 码本 C=64 | `$DATA/pq-full/opq-shared-mix10-M32-C64.npz` |
+| 世界模型 | `run/best.pkl`（60k 步） |
+| e·V 效用门控 | `gate/ev-vectors.npz`（判决规则 `e_{t,j}·V_j ≥ λ·H_{t,j}`，λ=5.798041e-03） |
 
-```
-D=$REPO/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar
-DATA=/mnt/data/users/luzheng/workspace/iclr/czs/data/molmoweb-pilot
-```
-`$DATA` 在仓库外。`/home/luzheng/...`、`/mnt/data/users/luzheng/...`、
-`/mnt/workspace/users/luzheng/...` 是**同一块盘**，脚本里混用是正常的，别去「修正」。
+全流程评测生成两个派生产物：
+
+| 角色 | 路径 |
+|---|---|
+| 闭环门控重建 | `testset/wma-web-closedloop-ev-v1.npz` |
+| 端到端 QA aggregate | `../WorldMemArena/exp_results/repro-ev-20260919-final/aggregate_metrics.json` |
 
 ☠️ **这个仓库最危险的一处**：`pq/` 与 `pq-full/` 下有**完全同名**的
 `opq-shared-mix10-M32-C64.npz`，是同一配置拟合的两次。只有 `pq-full/` 那本与世界模型
@@ -80,212 +128,185 @@ DATA=/mnt/data/users/luzheng/workspace/iclr/czs/data/molmoweb-pilot
 模型能打分——**只是所有数字差约 972 bit，且全程无任何报错**。
 **只有 manifest 的哈希校验能拦住**——改名字或删文件都不行，因为出问题的正是「同名」这件事。
 
-（C=16 码本已于 2026-09-02 删除，全线只用 C=64。技术报告 §5.1 的 C=16 行与 `UTILITY_GATE.md` §4.4 的
-可证伪实验若要重做，需先用 `$DATA/encoded` 重新拟合。）
+---
 
-被删掉的 30 个历史 checkpoint 的指纹与元信息留在 `CHECKPOINT_INVENTORY.json`。
+## 3. 复现评测
+
+数据流（从官方 WMA Web JSON 开始，不依赖预生成的 `testset/`）：
+
+```text
+WMA Web JSON
+  → Q-Former xbar → 冻结 OPQ code → WM + e·V 门控闭环重建
+  → WMA session memory → 检索 top-10 → soft-token Reader → WMA Judge
+```
+
+### 3.1 配置 Reader 与 Judge
+
+Reader 与 Judge 均为本地 Qwen3.5-9B（`$REPO/models/Qwen3.5-9B`），不需要任何
+OpenAI API。Reader 由评测命令里的 `QWEN35_MODEL` 指定；Judge 用仓库自带的
+OpenAI-compatible 本地 server（占用 4 张 GPU 做双副本，示例用 2/3 两卡，避开
+评测要用的 0/1）：
+
+```bash
+cd "$REPO"
+QWEN_PY="$PY" MODEL="$REPO/models/Qwen3.5-9B" GPUS=2,2,3,3 PORT=8017 \
+  bash scripts_local_llm_server.sh start
+curl -fsS http://127.0.0.1:8017/v1/models
+```
+
+然后编辑 `$WMA/.env`，把 Judge 指向该 server：
+
+```bash
+OPENAI_API_KEY_JUDGE=local
+OPENAI_BASE_URL_JUDGE=http://127.0.0.1:8017/v1
+OPENAI_MODEL_JUDGE=<`/v1/models` 返回的第一项>
+```
+
+### 3.2 从官方 WMA Web 数据构建 codec 输入
+
+```bash
+cd "$REPO"
+CUDA_VISIBLE_DEVICES=0 "$JX" scripts_build_wm_testset.py \
+  --dataset-repo "$WMA/WorldMemArena" \
+  --checkpoint "$D/qformer-K32e-obs0.5.gapbest.pt" \
+  --codebook "$DATA/pq-full/opq-shared-mix10-M32-C64.npz" \
+  --output testset --jax-python "$JX" --torch-python "$PY" --device cuda:0
+```
+
+该命令顺序执行 `convert_wma → Q-Former encode → OPQ apply → cache_web`。完成后检查：
+
+```bash
+$PY - <<'PY'
+import json
+p = json.load(open("testset/provenance.json"))
+assert p["dataset_repo"]["samples"] == 27
+assert p["counts"] == {"states": 956, "transitions": 817, "episodes": 139}
+print(p["counts"])
+PY
+```
+
+### 3.3 物化闭环 WM + e·V 门控重建
+
+```bash
+CODEC=$REPO/testset/wma-web-closedloop-ev-v1.npz
+CUDA_VISIBLE_DEVICES=0 "$JX" -m \
+  experiments.state_tokenizer.materialize_wma_codec_reconstructions \
+  --cache testset/cache --states testset/states.npz --records testset/records.jsonl \
+  --codebook "$DATA/pq-full/opq-shared-mix10-M32-C64.npz" \
+  --config configs/world_model/web_h16_C64_full.yaml \
+  --checkpoint run/best.pkl --mask gate/ev-vectors.npz \
+  --split validation --platform gpu --device-index 0 --output "$CODEC"
+```
+
+episode 初态发送完整 OPQ 码；后续状态以已经重建的历史计算 WM posterior，满足
+`e_{t,j}·V_j < λ·H_{t,j}` 的位置由 posterior argmax 填充，并把新重建继续写入下一步
+历史。metadata 必须为 956 个状态、817 条转移、139 个 all-send 初态、
+`lambda=5.798040571718835e-03`、闭环码率 `4333.363682216191` bit、keep fraction
+`0.8356960488`、R² `0.7636862392`。
+
+### 3.4 先跑一条 WMA smoke
+
+```bash
+cd "$REPO"
+CODEC=$REPO/testset/wma-web-closedloop-ev-v1.npz
+unset ANCHOR_RECORDS RESIDUALMEM_WMA_ANCHOR_RECORDS
+QFORMER_PYTHON="$PY" \
+WMA_ROOT="$WMA" QFORMER_BRIDGE_DIR="$D" \
+QWEN35_MODEL="$REPO/models/Qwen3.5-9B" \
+CODEC_RECONSTRUCTIONS="$CODEC" \
+RETRIEVAL_HEAD_ARM=K32e-obs0.5-gapbest-utility-gated \
+OUTPUT_ARM=K32e-obs0.5-gapbest-closedloop-smoke \
+WORKERS=4 SMOKE=1 \
+bash scripts_qformer_official_eval.sh \
+  K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
+```
+
+确认输出中 baseline 为 `ResidualMem-Instruct-Xbar-Input-RAG`，codec 路径非空，且每条
+eval 都没有 `error`。若 QA-C 异常接近 1.0，先检查 Judge 配置，不要继续正式运行。
+
+### 3.5 正式评测：双卡分片
+
+正式冻结结果使用两张 GPU 对 27 个 Web 样本做奇偶分片。先在两个终端共享以下环境：
+
+```bash
+CODEC=$REPO/testset/wma-web-closedloop-ev-v1.npz
+export PYTHONPATH="$REPO:$WMA"
+export RESIDUALMEM_ROOT="$REPO"
+export RESIDUALMEM_QWEN35_MODEL="$REPO/models/Qwen3.5-9B"
+export RESIDUALMEM_QFORMER="$D/qformer-K32e-obs0.5.gapbest.pt"
+export RESIDUALMEM_QFORMER_QUERIES=32 RESIDUALMEM_QFORMER_LAYERS=4
+export RESIDUALMEM_RETRIEVAL_HEAD="$D/head-K32e-obs0.5-gapbest-utility-gated.pt"
+export RESIDUALMEM_CODEC_RECONSTRUCTIONS="$CODEC"
+export QWEN_VL_EMBED_LOCAL=1 LLM_MAX_CONCURRENT=24
+unset RESIDUALMEM_WMA_ANCHOR_RECORDS
+```
+
+两个终端分别执行：
+
+```bash
+# GPU 0：web_01, web_03, ..., web_27
+QWEN_EMBED_DEVICE=cuda:0 RESIDUALMEM_DEVICE=cuda:0 RESIDUALMEM_HEAD_DEVICE=cuda:0 \
+"$PY" -u -m experiments.state_tokenizer.run_wma_codec_eval_shard \
+  --wma-root "$WMA" --shard-index 0 --num-shards 2 --workers 24 \
+  --output "$WMA/exp_results/repro-ev-20260919-shard0"
+
+# GPU 1：web_02, web_04, ..., web_26
+QWEN_EMBED_DEVICE=cuda:1 RESIDUALMEM_DEVICE=cuda:1 RESIDUALMEM_HEAD_DEVICE=cuda:1 \
+"$PY" -u -m experiments.state_tokenizer.run_wma_codec_eval_shard \
+  --wma-root "$WMA" --shard-index 1 --num-shards 2 --workers 24 \
+  --output "$WMA/exp_results/repro-ev-20260919-shard1"
+```
+
+两路完成后合并：
+
+```bash
+"$PY" -u -m experiments.state_tokenizer.merge_wma_eval_shards \
+  --wma-root "$WMA" \
+  --input "$WMA/exp_results/repro-ev-20260919-shard0" \
+  --input "$WMA/exp_results/repro-ev-20260919-shard1" \
+  --output "$WMA/exp_results/repro-ev-20260919-final"
+```
+
+合并器硬校验两片不重叠、样本数为 27、有效 QA 数为 1459，且每条 eval 无 error。
+最终读取 `repro-ev-20260919-final/aggregate_metrics.json`。
 
 ---
 
-## 3. 路径 A：一条命令重算主表
+## 4. 要复现出的结果
 
-```bash
-$JX scripts_run_system.py --gpu 1
-```
+| 指标 | 目标值 |
+|---|---:|
+| **QA-C** | **0.6018**（878/1459） |
+| QA-H（幻觉） | 0.1892（276/1459） |
+| QA-O（遗漏） | 0.2090（305/1459） |
+| RC hit rate | 0.6764（3486/4914） |
+| Recall@1 / @5 / @10 | 0.2242 / 0.5328 / 0.6988 |
+| 闭环码率 / keep fraction | 4333.36 bit / 0.8357（压缩比 1.418×） |
 
-依次做：校验六个产物 → 重新导出掩码（自检码率）→ 闭环空对照 → 门控/随机/对抗三臂
-→ 写 `system_results.json`。约 53 秒。
-
-**应当得到**：
-
-| 臂 | 码率 | 压缩比 | 答案代价 |
-|---|---:|---:|---:|
-| 定宽全发 | 6144.00 | 1.000× | — |
-| + 世界模型条件编码 | **5182.83** | 1.185× | 0.148 bit（量化自身） |
-| + 效用门控 λ=0.0010（开环） | **4311.96** | 1.425× | 0.103 bit |
-| + 闭环修正 | **4323.84** | 1.421× | — |
-
-☠️ **5182.83 是硬闸**。它必须复现 `run/run.json` 的
-`best_selection.code_bits_per_transition = 5182.83124384419`（容差 1e-3；`code_bits`
-存 float32，逐位比对会失败，早稿写「逐位一致」是错的）。对不上说明产物之间已经漂移，
-后面的数一个都不能信。
+该结果使用 OPQ 重建的初态和「已重建历史 → WM 后验 → e·V 门控 → WM argmax
+填充」的递归后续状态，再经双视图检索头与 soft-token Reader（Qwen3.5-9B）。
+`CODEC_RECONSTRUCTIONS` 使 adapter 按官方 `image_id/state_id` 读取 `gated_xbar`，
+路径 fail-closed：键缺失、shape 不匹配或记录重复时直接报错，不会静默退回 full-xbar。
 
 ---
 
-## 4. 路径 B：从原始数据重建
-
-四段，**严格按序**。每段的详细坑见括号里的手册。
-
-### 4.1 Q-Former（`$PY`，见 `QFORMER_实验手册.md`）
-
-```bash
-bash scripts_qformer_train_arm.sh 0.5 0                 # 约 13 h，单卡 25 GB
-bash scripts_qformer_downstream.sh K32e-obs0.5-gapbest qformer-K32e-obs0.5.gapbest.pt 0
-```
-下游四步一条命令：抽状态缓存 → 训检索头 → 检索闸 → 48 条观察 gap，两臂并行约 26 分钟。
-
-☠️ `--queries` 默认 16，**必须显式传 32**，没有任何代码校验它与 checkpoint 是否匹配。
-☠️ 一次训练写**两个** checkpoint：`X.pt` 按 val CE 选，`X.gapbest.pt` 按留出探针 gap 选。
-交付的是后者。
-
-### 4.2 量化 + 世界模型（`$JX`，见 `WM_MIXED_复现手册.md`）
-
-```bash
-$JX scripts_wm_dataset.py unpack --dataset worldmemarena_wm_train.npz --output ./cache
-# 核对：transitions 495527 / validation 0 / fixed_width_bits 6144 / max_history 32
-
-CUDA_VISIBLE_DEVICES=0 $JX -m experiments.world_model.train \
-  --cache ./cache --config configs/world_model/web_h16_C64_full.yaml \
-  --variant full --seed 0 --output ./run --platform gpu --device-index 0 \
-  --dev-fraction 0.05 --max-steps 60000 --min-steps 5000 \
-  --eval-every 2500 --patience-steps 12500
-
-CUDA_VISIBLE_DEVICES=2 $JX scripts_build_wm_testset.py \
-  --dataset-repo <WorldMemArena>/WorldMemArena \
-  --checkpoint $D/qformer-K32e-obs0.5.gapbest.pt \
-  --codebook $DATA/pq-full/opq-shared-mix10-M32-C64.npz \
-  --output ./testset --jax-python "$JX" --torch-python "$PY" --device cuda:0
-
-CUDA_VISIBLE_DEVICES=2 $JX -m experiments.world_model.evaluate \
-  --cache ./testset/cache --checkpoint ./run/best.pkl \
-  --split validation --output ./testset/eval
-```
-
-☠️ `--output` 目录必须不存在或为空（`train.py:500`），别提前 mkdir 子目录。
-☠️ `--resume` 校验 `config_sha256`，改了预算再 resume 会被拒——要换预算就重跑。
-☠️ `CUDA_VISIBLE_DEVICES=k` 必须配 `--device-index 0`，jax 只枚举可见设备。
-☠️ cache 是 32 步窗口、模型是 16 步，**任何读 cache 的代码都要设
-`cache.max_history = config.model.max_history`**，否则 shape 错误的报错位置离原因很远。
-
-### 4.3 效用门控（见 `UTILITY_GATE.md` §9）
-
-建 gate cache → 后验 → 打标 → 导出掩码。命令在那份文档里，此处不复制以免两处漂移。
-
-### 4.4 闭环
-
-```bash
-# ☠️ 先跑空对照，gap 必须为 0 才能信后面的数
-$JX -m experiments.utility_gate.closed_loop_rate \
-  --cache testset/cache --config configs/world_model/web_h16_C64_full.yaml \
-  --checkpoint run/best.pkl --mask gate/mask-lambda0.0010.npz \
-  --all-send --split validation --output gate/closedloop-null.json
-```
-全发（$m\equiv1$）时解码端状态等于编码端状态，两趟**必须逐位相同**。这条对照抓到过
-一个真错：`history_indices` 是 32 列而 batch 只取最近 16 列，按 32 列索引会把每个状态的
-码写进别的状态的时间槽。
-
----
-
-## 5. 实验结果
-
-全部为一手实测。口径不同的表**不可横向相加**——码率在 817 条转移上、QA 在 1,459 道题上。
-
-### 5.1 码率：世界模型 vs 统计基线（817 条外部转移）
-
-| | bit/转移 | 相对定宽 |
-|---|---:|---:|
-| 定宽全发 | 6144.00 | 1.000× |
-| 任务边缘分布（marginal） | 6381.99 | 0.963× |
-| copy-aware | 6051.42 | 1.015× |
-| source-conditioned Markov（最强统计基线） | 5420.84 | 1.133× |
-| **世界模型（60k 步）** | **5182.83** | **1.185×** |
-| **+ 效用门控 λ=0.0010（开环）** | **4311.96** | **1.425×** |
-| **+ 闭环修正** | **4323.84** | **1.421×** |
-
-基线由 `baselines/baseline.json` 逐位复现。定宽审计：码 6144 + mask 32 = 6176。
-☠️ marginal **劣于**定宽（0.963×）不是 bug——它按任务边缘分布编码，比均匀更差。
-
-### 5.2 码本大小的率失真取舍（pilot 语料）
-
-| C | 定宽 | 最强基线 | 世界模型 | 压缩比 | 重建 R² | 持久率 |
-|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 4096 | 3395.0 | 3039.2 | **1.348×** | 0.9767 | 25.1% |
-| **64** | 6144 | 5431.7 | **5027.1** | 1.222× | 0.9881 | 13.7% |
-| 256 | 8192 | 7605.5 | 7052.7 | 1.162× | 0.9909 | 10.1% |
-
-两 seed 均值，seed 间差 20.3 / 30.3 / 53.4 bit。☠️ 运行间噪声底 **≥31 bit**，
-小于此的差值不得当作结论。
-
-### 5.3 效用门控
-
-| λ=0.0010 | fit-corpus（3,756 状态） | **WMA web（817，官方评测集）** |
-|---|---:|---:|
-| 全发 → 门控 | 4631.3 → **3931.4** | 5182.8 → **4312.0** |
-| 省下 | 15.1% | **16.8%** |
-| 答案 \|ΔNLL\| | 0.078 bit | **0.103 bit** |
-| 占量化自身代价（0.148）的 | 53% | **70%** |
-| 压缩比 | 1.33× → 1.56× | 1.19× → **1.42×** |
-
-配对检验（同一行、同一 forward）：web 上 vs random **t = −25.5**、vs 位移 −21.4、
-vs 码长 −19.6。掩码在 fit-corpus 上拟合、在 web 上评测，**跨域**。
-
-**闭环**（去掉「历史全发」假设）：漂移 +11.88 bit，省 16.80% → **16.57%**。上界是紧的。
-☠️ 但等预算随机掩码漂移 11.0–12.5 bit，门控的 11.88 落在其中——**这份稳健不是门控挣来的**。
-
-### 5.4 Q-Former 各臂（27/27 样本，1,459 题）
-
-| | 槽数 | QA-C | 保真 gap |
-|---|---:|---:|---:|
-| v6 官方 Raw-Fused | — | 0.5415 | — |
-| v9 Q-Former | 16 | 0.5949 | +0.0976 |
-| v10 固定池化 | 64 | **0.5984** | +0.1610 |
-| **★ K32e obs0.5 gapbest** | 32 | 0.5953 | **+0.1744** |
-| K32e obs1.0 gapbest | 32 | 0.5977 | +0.1408 |
-
-★ = 选定臂。唯一站得住的主张是：**K=32 的学习式 resampler 用固定池化一半的存储，
-在屏幕保真上超过 64 槽固定池化，QA-C 不劣化**。
-
-### 5.5 检索臂官方三臂对比（agent/arena/web，judge 零失败）
-
-| | Raw-Fused | ResMem-现役 | ResMem-并集 |
-|---|---:|---:|---:|
-| QA-C | 0.5408 | **0.5778** | 0.5668 |
-| QA-H（幻觉） | 0.2132 | **0.1720** | 0.1727 |
-| RC (hit_rate) | 0.6536 | **0.6914** | 0.6867 |
-| Recall@1 / @10 | **0.2414** / 0.6960 | 0.2221 / 0.7002 | 0.2242 / **0.7012** |
-| answer tok/题 | 3,228 | 2,252 | **2,205** |
-
-☠️ **两个混淆，引用时必须标注**：
-
-1. **QA 一栏不是同类比较**——`mm_mode` 让 Raw-Fused 最多收到 5 张截图，
-   ResidualMem 只有文本（3,228 vs 2,252 tok/题）。**我们 QA-C 更高不能读作方法更好。**
-2. **token 少 32% 是同一配置的副产物**，不是表示更紧凑。
-
-**复现可信度**：我们跑出的 Raw-Fused 是 QA-C **54.08** / RC **65.36**，论文 Table 2 报
-**51.86** / **73.44**。回答与 judge 模型不同、且只跑了较难的 Agentic 一半，量级站得住。
-☠️ 早期试点的 **79.25 是假象**（n=53 + 图片 bug），补图跑满 1,459 题后自行回落。
-
----
-
-## 6. 反复踩到的坑
+## 5. 复现硬约束
 
 | | |
 |---|---|
-| **zsh 不做词分割** | `L="--lambdas 0.0009 0.0010"` 后 `$L` 会被当成**单个参数**；进程静默失败、日志为空。`kill $PIDS` 同理。参数写死，或走 `xargs` |
+| **Web 评测集不进训练** | 27 个 `agent/gui/web` 样本不得进入任何组件的梯度训练；WM 只用它们选点 |
+| **Q-Former shape 必须一致** | 编码、gap 与 QA 都使用 32 queries / 4 layers；多个 CLI 默认是 16 queries |
+| **先做单样本 QA smoke** | Judge 配置缺失时，历史评测路径曾回退到 gold answer，QA-C 接近 1.0 应立即停止检查 |
+| **OPQ 码本哈希** | 只能使用 `pq-full/` 下 sha256 为 `bcc4c393…` 的码本；`pq/` 下同名文件属于另一次拟合 |
+| **WM cache 历史长度** | cache 保存 32 步，模型只用 16 步；评测必须将 `cache.max_history` 设为 config 中的 16 |
+| **zsh 不做词分割** | `L="--lambdas 0.0009 0.0010"` 后 `$L` 会被当成**单个参数**；参数写死，或走 `xargs` |
 | **`nohup` 扛不住 SIGTERM** | 工具超时会杀掉整个进程组，长任务用 `setsid` |
-| **打分必须 fp32** | bf16 的噪声底 0.186 bit 超过信号中位数的一半，且 delta 与 fp32**符号相反**。历史 bf16 数字不可与本结果并列 |
-| **`baselines --output` 是目录** | 且码率嵌在 `bits_per_transition` 下，不在顶层 |
-| **别用公共 robotwin 环境** | torch 2.4 在本机 sm_120 上跑不了 |
 
 ---
 
-## 7. 这份复现测不到什么
-
-有判别力的质量轴是 **\|ΔNLL\|（bit）**，已测、配对 t = −25.5。
-裁判标签那条路也算过：2,248 配对下 McNemar 最小可检 1.32 pp，而门控效应约
-0.0118 pp，**低 112 倍**，故未采用（`gate/judge-power.json`）。
-
-☠️ **闭环下的稳健不是门控的功劳。** 等预算随机掩码漂移 11.0–12.5 bit，门控的
-11.88 落在其中。详见 `UTILITY_GATE.md` §7.2。
-
----
-
-## 8. 相关文档
+## 6. 相关文档
 
 | | |
 |---|---|
-| `技术报告_ResidualMem.md` | 方法、全部实测结果、21 条必须声明的事项 |
-| `UTILITY_GATE.md` | 效用门控：推导、闭环、被推翻的判断 |
-| `QFORMER_实验手册.md` | Q-Former 训练/评测细节与坑 |
-| `WM_MIXED_复现手册.md` | 世界模型训练/评测细节与坑 |
-| `CHECKPOINT_INVENTORY.json` | 全部 56 个历史 checkpoint 的指纹（含已删除的 30 个） |
+| `技术报告_ResidualMem.md` | 方法、全部实测结果 |
+| `UTILITY_GATE.md` | e·V 效用门控：推导、闭环 |

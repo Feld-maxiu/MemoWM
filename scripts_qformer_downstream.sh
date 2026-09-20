@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Steps 1-4 of the downstream chain for one Q-Former arm.
-# See QFORMER_实验手册.md §3.4.
+# See WMA_RESIDUAL_复现手册.md §4.1 and §4.5.
 #
 #   scripts_qformer_downstream.sh <ARM> <CHECKPOINT_BASENAME> <DEVICE_ORDINAL>
 #

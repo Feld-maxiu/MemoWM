@@ -80,6 +80,26 @@ def keep_mask(utility: np.ndarray, entropy: np.ndarray, lam: float) -> np.ndarra
     return utility[None, :] >= lam * entropy.reshape(len(entropy), -1)
 
 
+def ev_keep_mask(v: np.ndarray, edges: np.ndarray, rates: np.ndarray,
+                 entropy: np.ndarray, lam: float) -> np.ndarray:
+    """``keep j`` iff ``e(H_{t,j}) * V_j >= lambda * H_{t,j}`` -- the state-dependent gate.
+
+    ``e`` is the frozen empirical error-rate table over the carrier statistic
+    (posterior entropy, 0.25-bit bins) fitted by ``wmaexperiment.ev_gate_wma_fit``;
+    ``V_j`` is the per-position mean task damage conditioned on the world-model
+    argmax being wrong.  Decomposes the fixed vector exactly:
+    ``|U_j| = e_bar_j * V_j``.  Same shape contract as :func:`keep_mask`.
+    """
+    v = np.asarray(v, np.float64).reshape(-1)
+    entropy = np.asarray(entropy, np.float64)
+    edges = np.asarray(edges, np.float64)
+    rates = np.asarray(rates, np.float64)
+    flat = entropy.reshape(len(entropy), -1)
+    idx = np.clip(np.digitize(flat.ravel(), edges) - 1, 0, len(rates) - 1)
+    e = rates[idx].reshape(flat.shape)
+    return e * v >= lam * flat
+
+
 def per_state_rate(code_bits: np.ndarray, keep: np.ndarray | None = None) -> float:
     """Mean bits per state over the whole corpus, one count per state.
 

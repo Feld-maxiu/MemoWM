@@ -104,6 +104,18 @@ def test_pending_artifacts_do_not_fail_a_full_verify(lock, tmp_path: Path):
     assert strict["not_built_yet"].startswith("FAIL")
 
 
+def test_training_only_artifacts_are_optional_at_runtime(lock, tmp_path: Path):
+    tampered = copy.deepcopy(lock)
+    training = tampered["artifacts"]["retrieval_cache"]
+    training["path"] = str(tmp_path / "not-shipped.npz")
+
+    runtime = manifest.verify_all(tampered)
+    assert "retrieval_cache" not in runtime
+
+    full = manifest.verify_all(tampered, include_training=True)
+    assert full["retrieval_cache"].startswith("FAIL")
+
+
 def test_unknown_role_lists_what_is_available(lock):
     with pytest.raises(manifest.ArtifactMismatch) as caught:
         manifest.resolve("reader_head", lock=lock)

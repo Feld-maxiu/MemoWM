@@ -1,10 +1,11 @@
 """The one place that says which artifact is *the* artifact.
 
-Six components were built separately and each left a directory of near-identical
-files behind -- ten Q-Former arms, six retrieval heads, three connectors, and two
-codebooks that share a filename. Which of them constitutes the system was
-recorded only in prose, in a Chinese handbook, in a section header. Picking the
-wrong one does not raise; it returns a slightly different number.
+The runtime components and their training provenance were built separately and
+each left a directory of near-identical files behind -- ten Q-Former arms, six
+retrieval heads, three connectors, and two codebooks that share a filename.
+Which of them constitutes the system was recorded only in prose, in a Chinese
+handbook, in a section header. Picking the wrong one does not raise; it returns
+a slightly different number.
 
 This module makes that choice machine-checked. ``configs/system.lock.yaml`` names
 one file per role together with its sha256, and :func:`resolve` refuses to hand
@@ -138,7 +139,12 @@ def resolve(role: str, *, lock: dict | None = None, verify: bool = True) -> Path
         f"with it until this is explained")
 
 
-def verify_all(lock: dict | None = None, *, skip_pending: bool = True) -> dict[str, str]:
+def verify_all(
+    lock: dict | None = None,
+    *,
+    skip_pending: bool = True,
+    include_training: bool = False,
+) -> dict[str, str]:
     """Check every locked artifact at once and report, rather than dying on the first.
 
     A run that is going to fail on a missing codebook should say so before it
@@ -148,6 +154,8 @@ def verify_all(lock: dict | None = None, *, skip_pending: bool = True) -> dict[s
     lock = lock if lock is not None else load_lock()
     report: dict[str, str] = {}
     for role, entry in (lock.get("artifacts") or {}).items():
+        if entry.get("training_only") and not include_training:
+            continue
         if skip_pending and entry.get("pending"):
             report[role] = "pending"
             continue
@@ -169,6 +177,10 @@ def main() -> None:
     parser.add_argument("--rehash", action="store_true",
                         help="print the sha256 actually on disk for every role, "
                              "in lock-file form; use when minting a new lock")
+    parser.add_argument(
+        "--include-training", action="store_true",
+        help="also verify or rehash training-only provenance artifacts",
+    )
     args = parser.parse_args()
 
     lock = load_lock(args.lock)
@@ -177,12 +189,14 @@ def main() -> None:
         return
     if args.rehash:
         for role, entry in (lock.get("artifacts") or {}).items():
+            if entry.get("training_only") and not args.include_training:
+                continue
             path = _expand(str(entry["path"]), lock)
             marker = sha256_file(path) if path.exists() else "MISSING"
             print(f"{role}: {marker}")
         return
 
-    report = verify_all(lock)
+    report = verify_all(lock, include_training=args.include_training)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     raise SystemExit(any(v.startswith("FAIL") for v in report.values()))
 

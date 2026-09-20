@@ -15,7 +15,7 @@
 # a module built without it and every downstream number is then computed through
 # the wrong forward with nothing to raise on. The flag is therefore recorded in
 # the checkpoint metadata and read back from there, never re-specified
-# downstream. See QFORMER_实验手册.md §4.1.
+# downstream. See WMA_RESIDUAL_复现手册.md §4.1.
 #
 # --drop-microbatches must stay off: its threshold is the p99 of a randomly
 # initialised model, so it has no headroom from step 1 and corrupts the weights

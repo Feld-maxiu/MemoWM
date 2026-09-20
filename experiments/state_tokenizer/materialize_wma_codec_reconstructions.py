@@ -121,7 +121,16 @@ def main() -> None:
         raise ValueError(f"unexpected source xbar shape {source_xbar.shape}")
 
     with np.load(args.mask, allow_pickle=False) as mask:
-        utility = np.asarray(mask["utility"], dtype=np.float64)
+        if "v" in mask.files:                                    # e·V artifact
+            ev = {"v": np.asarray(mask["v"], dtype=np.float64),
+                  "edges": np.asarray(mask["h_edges"], dtype=np.float64),
+                  "rates": np.asarray(mask["h_rates"], dtype=np.float64)}
+            utility = np.asarray(mask["u"], dtype=np.float64)
+            arm = "ev"
+        else:
+            ev = None
+            utility = np.asarray(mask["utility"], dtype=np.float64)
+            arm = "gate"
         lam = float(np.asarray(mask["lam"]).item())
 
     config = load_config(args.config, num_tasks=len(cache.task_names))
@@ -137,7 +146,7 @@ def main() -> None:
 
     closed = run_pass(
         cache, params, variant, config, rows,
-        utility=utility, lam=lam, closed=True, arm="gate",
+        utility=utility, lam=lam, closed=True, arm=arm, ev=ev,
         batch_size=args.batch_size, collect_reconstructions=True,
     )
     reconstructed = closed["_reconstructed_codes"]

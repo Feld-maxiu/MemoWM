@@ -52,7 +52,7 @@ import jax
 import numpy as np
 
 from experiments.state_tokenizer.common import sha256_file
-from experiments.utility_gate.export_mask import keep_mask, per_state_rate
+from experiments.utility_gate.export_mask import ev_keep_mask, keep_mask, per_state_rate
 
 from ..world_model.cache import CACHE_FILES, FrozenCache
 from ..world_model.config import load_config
@@ -108,7 +108,8 @@ def _pad(block: np.ndarray, size: int) -> tuple[np.ndarray, int]:
 def run_pass(cache, params, variant, config, rows, *, utility, lam, closed: bool,
              batch_size: int, arm: str = "gate", seed: int = 35,
              log_every: int = 10,
-             collect_reconstructions: bool = False) -> dict:
+             collect_reconstructions: bool = False,
+             ev: dict | None = None) -> dict:
     """One sweep in ascending step order. ``closed`` decides whether to feed back."""
     rng = np.random.default_rng(seed)
 
@@ -141,7 +142,7 @@ def run_pass(cache, params, variant, config, rows, *, utility, lam, closed: bool
             truth = np.asarray(host["target_codes"], np.uint8)[:real]
             targets = np.asarray(host["target_indices"], np.int64)[:real]
 
-            keep = build_keep(arm, utility, entropy, lam, rng).reshape(truth.shape)
+            keep = build_keep(arm, utility, entropy, lam, rng, ev=ev).reshape(truth.shape)
             collected["code_bits"].append(code_bits)
             collected["keep"].append(keep)
             collected["target_indices"].append(targets)
@@ -186,7 +187,7 @@ def run_pass(cache, params, variant, config, rows, *, utility, lam, closed: bool
 
 
 def build_keep(arm: str, utility: np.ndarray, entropy: np.ndarray, lam: float,
-               rng: np.random.Generator) -> np.ndarray:
+               rng: np.random.Generator, ev: dict | None = None) -> np.ndarray:
     """The gate's mask, or a budget-matched control.
 
     ☠️ Budget matching is per state and exact, not approximate. An earlier
@@ -195,7 +196,10 @@ def build_keep(arm: str, utility: np.ndarray, entropy: np.ndarray, lam: float,
     Every control here drops the *same number of positions in the same state* as
     the gate does, so the only thing that varies is which ones.
 
-    * ``gate``   -- ``|U_j| >= lambda * H_j``.
+    * ``gate``   -- ``|U_j| >= lambda * H_j`` (the published fixed-vector rule).
+    * ``ev``     -- ``e(H_{t,j}) * V_j >= lambda * H_{t,j}``: the state-dependent
+      factorization of the same vector. Requires the ``ev`` artifact dict
+      (``v``/``edges``/``rates``) loaded from an ``ev-vectors.npz``.
     * ``random`` -- a uniformly chosen subset of the same size. The null: is the
       gate's choice of positions doing anything, or would any 16% do?
     * ``anti``   -- the complement of the gate's ranking: keep exactly the
@@ -204,6 +208,10 @@ def build_keep(arm: str, utility: np.ndarray, entropy: np.ndarray, lam: float,
     gate = keep_mask(utility, entropy, lam)
     if arm == "gate":
         return gate
+    if arm == "ev":
+        if ev is None:
+            raise ValueError("arm 'ev' needs the ev artifact (--mask ev-vectors.npz)")
+        return ev_keep_mask(ev["v"], ev["edges"], ev["rates"], entropy, lam)
 
     states, positions = gate.shape
     # Rank positions the way the gate does -- by how far |U| clears lambda * H --
@@ -269,7 +277,7 @@ def main() -> None:
     parser.add_argument("--platform", default="gpu")
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--arms", nargs="+", default=["gate"],
-                        choices=("gate", "random", "anti"),
+                        choices=("gate", "ev", "random", "anti"),
                         help="budget-matched controls. `random` answers whether "
                              "the gate's choice of positions matters or any "
                              "same-size subset would do")
@@ -278,9 +286,26 @@ def main() -> None:
     args = parser.parse_args()
 
     with np.load(args.mask, allow_pickle=True) as data:
-        utility = np.asarray(data["utility"], np.float64)
         mask_meta = json.loads(str(data["metadata"]))
-        default_lam = float(data["lam"])
+        if "v" in data.files:                                    # e·V artifact
+            ev = {"v": np.asarray(data["v"], np.float64),
+                  "edges": np.asarray(data["h_edges"], np.float64),
+                  "rates": np.asarray(data["h_rates"], np.float64)}
+            utility = np.asarray(data["u"], np.float64)
+            default_lam = float(data["lam"])
+            bad = [a for a in args.arms if a != "ev"]
+            if bad:
+                raise SystemExit(
+                    f"--mask is an e·V artifact; arms {bad} are the fixed-vector "
+                    f"rule and would silently measure something else. Use --arms ev.")
+        else:
+            ev = None
+            utility = np.asarray(data["utility"], np.float64)
+            default_lam = float(data["lam"])
+            if "ev" in args.arms:
+                raise SystemExit(
+                    "--arms ev needs an e·V artifact (wmaexperiment/ev_gate_wma_fit.py "
+                    "-> gate/ev-vectors.npz), not a fixed-vector mask")
 
     cache = FrozenCache(args.cache)
     config = load_config(args.config, num_tasks=len(cache.task_names))
@@ -306,10 +331,10 @@ def main() -> None:
     for lam, arm in [(l, a) for l in lambdas for a in args.arms]:
         openloop = run_pass(cache, params, variant, config, rows,
                             utility=utility, lam=lam, closed=False, arm=arm,
-                            batch_size=args.batch_size, seed=args.seed)
+                            batch_size=args.batch_size, seed=args.seed, ev=ev)
         closed = run_pass(cache, params, variant, config, rows,
                           utility=utility, lam=lam, closed=True, arm=arm,
-                          batch_size=args.batch_size, seed=args.seed)
+                          batch_size=args.batch_size, seed=args.seed, ev=ev)
         drift = closed["gated_rate_bits"] - openloop["gated_rate_bits"]
         depth = drift_by_depth(openloop, closed)
         summary = {name: {k: v for k, v in block.items() if not k.startswith("_")}

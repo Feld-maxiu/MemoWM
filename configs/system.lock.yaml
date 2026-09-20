@@ -1,7 +1,8 @@
 # Which artifact is *the* artifact.
 #
-# Six components were built separately; each left behind a directory of
-# near-identical files. This file names one per role. `residualmem/manifest.py`
+# Runtime artifacts and training provenance were built separately; each left
+# behind a directory of near-identical files. This file names one per role.
+# `residualmem/manifest.py`
 # refuses to hand back a path whose sha256 disagrees, so choosing wrong becomes
 # an exception instead of a slightly different number.
 #
@@ -9,7 +10,7 @@
 # copy hashes out of documentation into this file -- a transcription error makes
 # the manifest reject the *correct* artifact, and the symptom is indistinguishable
 # from a real mismatch. Regenerate with:
-#     python -m residualmem.manifest --rehash
+#     python -m residualmem.manifest --rehash --include-training
 
 protocol: residualmem_system_lock_v1
 minted: "2026-09-06"
@@ -24,7 +25,7 @@ artifacts:
   # Selected arm, step 6000, val answer-CE 1.7572. Chosen by the held-out
   # observation-fidelity gap, not by CE -- hence `.gapbest`, whose twin
   # `qformer-K32e-obs0.5.pt` is the CE-selected checkpoint and is NOT this.
-  # 技术报告 §4.2 / QFORMER_实验手册 §0.
+  # 技术报告 §4.2 / WMA_RESIDUAL_复现手册 §4.1.
   qformer:
     path: ${REPO}/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/qformer-K32e-obs0.5.gapbest.pt
     sha256: fb31e5ff454a8062053fa25d5bbbcdff725cbb548a1bd641f5315a7fa867d231
@@ -50,6 +51,7 @@ artifacts:
     path: ${REPO}/outputs/instruct_bridge/v9-instruct-pca20k-balanced-xbar/cache-K32e-obs0.5-gapbest-utility-gated.npz
     sha256: a6af36c55c9e0d01a6482e66bc82e943cc3b9160f82af18024a6729587ea7650
     produced_by: experiments/state_tokenizer/build_utility_retrieval_cache.py
+    training_only: true
 
   # The single most dangerous handoff in the system. Two fits share this
   # filename; only the pq-full/ one is bit-identical to the decoder embedded in
@@ -65,7 +67,7 @@ artifacts:
           Centroids differ from the training decoder by 0.40 on average
           (max 47.3). Per-position TV distance median 0.335 against the correct
           0.000. The model will train and score without complaint and every
-          number will be wrong by roughly 972 bits. See WM_MIXED_复现手册 §3.3.
+          number will be wrong by roughly 972 bits. See WMA_RESIDUAL_复现手册 §2 and §4.2.
 
   # REMOVED 2026-09-02, by request, so that only C=64 is on disk and no one can
   # reach for the wrong granularity by accident.

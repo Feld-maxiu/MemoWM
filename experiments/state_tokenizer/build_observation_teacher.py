@@ -121,7 +121,13 @@ def main() -> None:
 
     # Strided sharding, one process per GPU: the idiom this repo already uses
     # (extract_qwen.py:270). There is no torchrun anywhere here.
+    # WMA extraction stores trajectory files flat, while the standalone
+    # LongMemEval store keeps them under ``trajectories/``.  Accept both
+    # layouts so the observation teacher cannot silently see zero samples when
+    # called on the v4 WebChain store (the flat adapter remains optional).
     samples = sorted(Path(args.xbar_dir).glob("*.npz"))
+    if not samples:
+        samples = sorted((Path(args.xbar_dir) / "trajectories").glob("*.npz"))
     mine = samples[args.rank :: args.world_size]
     print(f"[teacher] rank {args.rank}/{args.world_size}: {len(mine)}/{len(samples)} samples, "
           f"probes {sorted(PROBES)}, top-{args.topk}", flush=True)

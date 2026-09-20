@@ -3,31 +3,23 @@
 **Scope, stated up front so the name does not overpromise.** This does not
 rebuild the system from raw data. Encoding 679,290 states is a 3.8-hour eight-GPU
 job, fitting the codebook and training the world model are longer still, and
-those procedures already have a home: ``scripts_build_wm_testset.py`` and
-``WM_MIXED_复现手册``. What is missing -- and what this is -- is a way to go from
+those procedures already have a home in ``WMA_RESIDUAL_复现手册`` §4.1–4.2.
+What is missing -- and what this is -- is a way to go from
 the artifacts those produce to the reported numbers, with every input hash-checked
 and every claim recomputed rather than quoted.
 
-The distinction matters because the six components were built separately and
-never verified together. Each stage below reproduces a number that was previously
+The distinction matters because the runtime components were built separately and
+were not originally verified together. Each stage below reproduces a number that was previously
 established in isolation, and the run fails if any of them has drifted:
 
 * the world model's rate on the external test set (``run.json``: 5182.83124384419)
 * the gate's keep fraction and gated rate at the operating point
 * the closed-loop correction, with its all-send null control
 
-☠️ **Not measured here: answer quality.** The gate's cost is 0.103 bits of
-gold-answer NLL, which is 0.07% of a ~150-bit answer, and the retrieval-free
-judge harness returns categorical labels over 2,248 pairs. Whether that can
-resolve 0.07% is a power question nobody has answered, so the honest table
-carries |ΔNLL| in bits -- already measured, paired t = −25.5 -- and leaves the
-judge column out rather than printing a null result that would be read as
-"lossless". See ``UTILITY_GATE.md`` §8.
-
-☠️ **Not measured here: anything downstream of retrieval.** Report §5.6: 90.3% of
-questions retrieve zero latent rows, so QA-C cannot observe a change to the
-latent. The existing QA-C is quoted, not recomputed, and quoting it is the point
--- recomputing would suggest it was responsive to something in this pipeline.
+☠️ **Not measured by this command: Reader quality.** This entry point only
+recomputes codec rate and the paired answer-NLL proxy. The separate closed-loop
+reconstruction → retrieval → Reader → Judge evaluation is documented in
+``WMA_RESIDUAL_复现手册`` §3 and reports QA-C 0.6018 over 1,459 questions.
 
 The two environments cannot import each other (torch in conda ``qwen-vl``, jax in
 ``.venv-jax`` with system site-packages off), so stages run as subprocesses with
